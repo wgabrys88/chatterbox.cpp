@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Dump S3TokenizerV2 inputs and outputs for numerical validation against
-the C++ port.
 
-Writes into --out:
-  wav_16k.npy      — (L,) float32 16 kHz wav (post-resample, no trimming)
-  log_mel.npy      — (128, T) log-mel spectrogram (after clamp + normalise)
-  tokens.npy       — (n_tokens,) int32, same length as Python produces
-"""
 
 from __future__ import annotations
 
@@ -32,7 +25,7 @@ def main() -> None:
     tok = tts.s3gen.tokenizer
     tok.eval()
 
-    # Load + resample to 16 kHz.
+
     wav, sr = torchaudio.load(str(args.wav))
     wav = wav.mean(dim=0) if wav.ndim == 2 and wav.shape[0] > 1 else wav.squeeze(0)
     if sr != 16000:
@@ -43,8 +36,8 @@ def main() -> None:
             np.ascontiguousarray(wav.numpy().astype(np.float32)))
 
     with torch.no_grad():
-        # log_mel is the post-clamp/normalise tensor the tokenizer consumes.
-        mel = tok.log_mel_spectrogram(wav.unsqueeze(0)).squeeze(0)  # (128, T)
+
+        mel = tok.log_mel_spectrogram(wav.unsqueeze(0)).squeeze(0)
         tokens, lens = tok.forward([wav], max_len=args.max_tokens)
 
     np.save(args.out / "log_mel.npy",

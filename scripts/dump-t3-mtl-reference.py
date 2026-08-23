@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Dump multilingual T3 reference intermediates for C++ parity validation.
 
-Mirrors scripts/reference-t3-turbo.py + dump-s3gen-reference.py style:
-runs ChatterboxMultilingualTTS in PyTorch with a fixed seed, captures the
-key tensors at each stage of the T3 forward path (cond_emb, text/speech
-embeddings with learned pos, selected hidden states, logits, sampled
-tokens) as .npy files under --out.
-
-Used by src/t3_mtl.cpp parity stages M1..M7.
-"""
 
 import argparse
 import json
@@ -24,7 +15,7 @@ ref_src = os.environ.get(
     str(Path(__file__).resolve().parent.parent.parent / "chatterbox-ref" / "src"),
 )
 sys.path.insert(0, ref_src)
-from chatterbox.mtl_tts import ChatterboxMultilingualTTS  # noqa: E402
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,8 +84,8 @@ def main() -> None:
     hooks.append(tts.t3.tfmr.norm.register_forward_hook(remember("final_norm_out", multi_call=True)))
     hooks.append(tts.t3.speech_head.register_forward_hook(remember("speech_logits", multi_call=True)))
 
-    # Capture the full `inputs_embeds` tensor that goes into the first T3
-    # forward call by wrapping patched_model.forward.
+
+
     orig_forward = None
     captured_inputs_embeds = []
 
@@ -105,8 +96,8 @@ def main() -> None:
         if ie is not None:
             captured_inputs_embeds.append(ie.detach().cpu().clone())
         return orig_forward(*a, **kw)
-    # Wrap after patched_model is created (on first call). Done in a monkey-patch
-    # below by replacing the inference() attribute access via a hook on tfmr.
+
+
     orig_tfmr_forward = tts.t3.tfmr.forward
 
     def tfmr_forward_spy(*a, **kw):
@@ -127,9 +118,9 @@ def main() -> None:
         return out
     tts.tokenizer.text_to_tokens = encode_spy
 
-    # text_emb forward hook captures the padded token tensor that actually
-    # reaches the embedding layer (post [START]/[STOP] padding + CFG batch
-    # duplication).  We keep both for completeness.
+
+
+
     text_tokens_padded_captured = []
     orig_text_emb = tts.t3.text_emb
 
@@ -153,8 +144,8 @@ def main() -> None:
 
     save(args.out / "text_tokens_raw.npy", text_tokens_saved[-1][0])
     if text_tokens_padded_captured:
-        # First call is the padded (SOT + raw + EOT, batch-2 for CFG) one
-        # that feeds text_emb in prepare_input_embeds. Save batch index 0.
+
+
         save(args.out / "text_tokens.npy", text_tokens_padded_captured[0][0].to(torch.int32))
     save(args.out / "spkr_enc_out.npy", captures["spkr_enc_out"])
     save(args.out / "perceiver_out.npy", captures["perceiver_out"])

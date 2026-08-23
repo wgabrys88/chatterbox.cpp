@@ -1,11 +1,5 @@
-// Parity test: C++ T3-MTL (Llama-520M) vs PyTorch reference dumps.
-//
-// Loads models/chatterbox-t3-mtl.gguf, runs one prompt-path forward pass
-// (both cond and uncond to exercise CFG), and compares:
-//   - C++ cond logits at last position vs speech_logits_call0.npy[0, -1, :]
-//   - C++ uncond logits at last position vs speech_logits_call0.npy[1, -1, :]
-//
-// The reference is produced by `python scripts/dump-t3-mtl-reference.py`.
+
+
 
 #include "chatterbox_t3_internal.h"
 #include "ggml.h"
@@ -20,11 +14,7 @@
 #include <thread>
 #include <vector>
 
-// Pull the implementation-detail symbols (`load_model_gguf`,
-// `chatterbox_model`, `eval_*_mtl`, sampling-params struct, etc.) into the
-// global scope so the test code can stay compact.  Fine for a test
-// executable: any rename inside the detail namespace would only break this
-// test's build, not the public Engine API.
+
 using namespace tts_cpp::chatterbox::detail;
 
 int main(int argc, char ** argv) {
@@ -53,7 +43,7 @@ int main(int argc, char ** argv) {
             model_path.c_str(), ref_dir.c_str(), n_threads, n_gpu_layers);
 
     chatterbox_model model;
-    if (!load_model_gguf(model_path, model, /*requested_ctx=*/0, n_gpu_layers)) {
+    if (!load_model_gguf(model_path, model, 0, n_gpu_layers)) {
         fprintf(stderr, "failed to load model\n");
         return 1;
     }

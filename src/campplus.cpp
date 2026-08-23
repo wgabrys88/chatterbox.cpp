@@ -16,15 +16,11 @@
 #include <omp.h>
 #endif
 
-// Forward declaration for the ggml-backed implementation lives in
-// campplus_forward.inc (included at the bottom of this file).
+
 static bool campplus_embed_ggml(const std::vector<float> & fbank_t_by_c, int T,
                                 const campplus_weights & w, ggml_backend_t backend,
                                 std::vector<float> & out);
 
-// =============================================================================
-// GGUF loader helpers
-// =============================================================================
 
 static bool copy_f32(ggml_context * ctx, const char * name,
                      std::vector<float> & out)
@@ -125,7 +121,7 @@ static bool load_cam_block(ggml_context * ctx,
         auto & L = blk.layers[i];
         if (!load_bn(ctx, p + "/nonlinear1/batchnorm", L.bn1)) return false;
         if (!load_conv1d(ctx, p + "/linear1/weight", "",
-                         /*k=*/1, /*C_in=*/C_in, /*C_out=*/bn_channels,
+                         1, C_in, bn_channels,
                          1, 0, 1, L.linear1)) return false;
         if (!load_bn(ctx, p + "/nonlinear2/batchnorm", L.bn2)) return false;
         const int pad = (kernel_size - 1) / 2 * dilation;
@@ -145,7 +141,7 @@ static bool load_cam_block(ggml_context * ctx,
 bool campplus_load(const std::string & path, campplus_weights & w)
 {
     ggml_context * tmp = nullptr;
-    gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp };
+    gguf_init_params gp = {  false,  &tmp };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) { fprintf(stderr, "campplus_load: cannot open %s\n", path.c_str()); return false; }
     if (gguf_find_key(g, "campplus.embedding_size") < 0) {
@@ -172,74 +168,61 @@ bool campplus_load(const std::string & path, campplus_weights & w)
     const int b3_dil        = (int)u32("campplus.block3_dilation", 2);
     const int k_size        = (int)u32("campplus.kernel_size",   3);
 
-    // FCM head.
+
     bool ok = true;
     ok &= load_conv2d(tmp, "campplus/head/conv1/weight", 3, 3, 1, 32, 1, 1, 1, 1, w.head.conv1);
     ok &= load_bn    (tmp, "campplus/head/bn1", w.head.bn1);
-    // layer1: 2 blocks, first stride=2 with shortcut; second stride=1 no shortcut (in==planes).
+
     w.head.layer1.resize(2);
-    ok &= load_res_block(tmp, "campplus/head/layer1/0", /*has_shortcut=*/true,  32, 32, 2, w.head.layer1[0]);
-    ok &= load_res_block(tmp, "campplus/head/layer1/1", /*has_shortcut=*/false, 32, 32, 1, w.head.layer1[1]);
+    ok &= load_res_block(tmp, "campplus/head/layer1/0", true,  32, 32, 2, w.head.layer1[0]);
+    ok &= load_res_block(tmp, "campplus/head/layer1/1", false, 32, 32, 1, w.head.layer1[1]);
     w.head.layer2.resize(2);
-    ok &= load_res_block(tmp, "campplus/head/layer2/0", /*has_shortcut=*/true,  32, 32, 2, w.head.layer2[0]);
-    ok &= load_res_block(tmp, "campplus/head/layer2/1", /*has_shortcut=*/false, 32, 32, 1, w.head.layer2[1]);
+    ok &= load_res_block(tmp, "campplus/head/layer2/0", true,  32, 32, 2, w.head.layer2[0]);
+    ok &= load_res_block(tmp, "campplus/head/layer2/1", false, 32, 32, 1, w.head.layer2[1]);
     ok &= load_conv2d(tmp, "campplus/head/conv2/weight", 3, 3, 32, 32, 2, 1, 1, 1, w.head.conv2);
     ok &= load_bn    (tmp, "campplus/head/bn2", w.head.bn2);
 
-    // FCM output channels: 32 * (80 / 8) = 320, then tdnn.
+
     const int fcm_out_ch = 32 * (w.feat_dim / 8);
     ok &= load_conv1d(tmp, "campplus/xvector/tdnn/linear/weight", "",
-                      /*k=*/5, fcm_out_ch, init_channels, /*s=*/2, /*p=*/2, /*d=*/1, w.tdnn_linear);
+                      5, fcm_out_ch, init_channels, 2, 2, 1, w.tdnn_linear);
     ok &= load_bn(tmp, "campplus/xvector/tdnn/nonlinear/batchnorm", w.tdnn_bn);
 
     ok &= load_cam_block(tmp, "campplus/xvector/block1", b1_layers, k_size, b1_dil,
-                         /*init_C_in=*/init_channels, growth_rate, bn_channels, w.block1);
-    const int after_b1_ch = init_channels + b1_layers * growth_rate;  // 128 + 12*32 = 512
+                         init_channels, growth_rate, bn_channels, w.block1);
+    const int after_b1_ch = init_channels + b1_layers * growth_rate;
     ok &= load_bn(tmp, "campplus/xvector/transit1/nonlinear/batchnorm", w.transit1.bn);
     ok &= load_conv1d(tmp, "campplus/xvector/transit1/linear/weight", "",
                       1, after_b1_ch, after_b1_ch / 2, 1, 0, 1, w.transit1.linear);
 
-    const int b2_in_ch = after_b1_ch / 2;  // 256
+    const int b2_in_ch = after_b1_ch / 2;
     ok &= load_cam_block(tmp, "campplus/xvector/block2", b2_layers, k_size, b2_dil,
                          b2_in_ch, growth_rate, bn_channels, w.block2);
-    const int after_b2_ch = b2_in_ch + b2_layers * growth_rate;  // 256 + 24*32 = 1024
+    const int after_b2_ch = b2_in_ch + b2_layers * growth_rate;
     ok &= load_bn(tmp, "campplus/xvector/transit2/nonlinear/batchnorm", w.transit2.bn);
     ok &= load_conv1d(tmp, "campplus/xvector/transit2/linear/weight", "",
                       1, after_b2_ch, after_b2_ch / 2, 1, 0, 1, w.transit2.linear);
 
-    const int b3_in_ch = after_b2_ch / 2;  // 512
+    const int b3_in_ch = after_b2_ch / 2;
     ok &= load_cam_block(tmp, "campplus/xvector/block3", b3_layers, k_size, b3_dil,
                          b3_in_ch, growth_rate, bn_channels, w.block3);
-    const int after_b3_ch = b3_in_ch + b3_layers * growth_rate;  // 512 + 16*32 = 1024
+    const int after_b3_ch = b3_in_ch + b3_layers * growth_rate;
     ok &= load_bn(tmp, "campplus/xvector/transit3/nonlinear/batchnorm", w.transit3.bn);
     ok &= load_conv1d(tmp, "campplus/xvector/transit3/linear/weight", "",
                       1, after_b3_ch, after_b3_ch / 2, 1, 0, 1, w.transit3.linear);
 
-    const int final_ch = after_b3_ch / 2;  // 512
+    const int final_ch = after_b3_ch / 2;
     ok &= load_bn(tmp, "campplus/xvector/out_nonlinear/batchnorm", w.out_nonlinear_bn);
 
     ok &= load_conv1d(tmp, "campplus/xvector/dense/linear/weight", "",
-                      1, /*C_in=*/final_ch * 2, /*C_out=*/w.embedding_size, 1, 0, 1, w.dense_linear);
+                      1, final_ch * 2, w.embedding_size, 1, 0, 1, w.dense_linear);
     ok &= load_bn(tmp, "campplus/xvector/dense/nonlinear/batchnorm", w.dense_bn);
 
     gguf_free(g); if (tmp) ggml_free(tmp);
     return ok;
 }
 
-// =============================================================================
-// Core ops
-// =============================================================================
-//
-// Memory layout convention for this file:
-//   1-D feature map x:   row-major (C, T)  -- channel-major, time innermost
-//                        access:  x[c * T + t]
-//   2-D feature map:     row-major (C, H, W)
-//                        access:  x[c * H * W + h * W + w]
-//
-// This differs from ggml's [W, H, C, B] but simplifies the C++ loops since
-// everything we touch is single-batch.
 
-// out[c, t] = x[c, t] * scale[c] + shift[c]
 static inline void bn_apply(float * x, const float * scale, const float * shift,
                             int C, int T)
 {
@@ -261,8 +244,7 @@ static inline void sigmoid_inplace(float * x, size_t n) {
     for (int64_t i = 0; i < (int64_t)n; ++i) x[i] = 1.0f / (1.0f + std::exp(-x[i]));
 }
 
-// Conv1d:  y[co, to] = bias[co] + sum_{ci, k} w[co, ci, k] * x[ci, to*stride + k*dilation - pad]
-// PyTorch weight layout (numpy order): w is (C_out, C_in, k), stored row-major.
+
 static void conv1d(const float * x, int C_in, int T_in,
                    const float * w, const float * bias,
                    int C_out, int k, int stride, int pad, int dilation,
@@ -289,8 +271,7 @@ static void conv1d(const float * x, int C_in, int T_in,
     }
 }
 
-// Conv2d: input (C_in, H, W), output (C_out, H_out, W_out).
-// Weight: (C_out, C_in, kH, kW) stored row-major.
+
 static void conv2d(const float * x, int C_in, int H, int W,
                    const float * w, const float * bias,
                    int C_out, int kH, int kW,
@@ -329,11 +310,6 @@ static inline int conv_out_len(int L_in, int k, int stride, int pad, int dilatio
     return (L_in + 2 * pad - dilation * (k - 1) - 1) / stride + 1;
 }
 
-// =============================================================================
-// High-level module forwards
-// =============================================================================
-
-// ---- FCM ----
 
 static void fcm_basic_resblock(const campplus_res_block & blk,
                                const std::vector<float> & x_in,
@@ -342,7 +318,7 @@ static void fcm_basic_resblock(const campplus_res_block & blk,
 {
     const int planes = blk.conv1.C_out;
     const int sH = blk.stride_h;
-    const int sW = 1;  // FCM always uses stride_w=1 (only H downsamples)
+    const int sW = 1;
     H_out = conv_out_len(H, 3, sH, 1, 1);
     W_out = conv_out_len(W, 3, sW, 1, 1);
 
@@ -361,7 +337,7 @@ static void fcm_basic_resblock(const campplus_res_block & blk,
            t2.data(), H_out, W_out);
     bn_apply(t2.data(), blk.bn2.scale.data(), blk.bn2.shift.data(), planes, H_out * W_out);
 
-    // Shortcut.
+
     std::vector<float> sc;
     if (!blk.shortcut_conv.w.empty()) {
         sc.resize((size_t)planes * H_out * W_out);
@@ -382,17 +358,17 @@ static void fcm_basic_resblock(const campplus_res_block & blk,
     relu_inplace(x_out.data(), x_out.size());
 }
 
-// FCM takes (80, T) fbank → outputs (320, T) after 3x H-downsample and reshape.
+
 static void fcm_forward(const campplus_fcm & fcm,
                         const float * fbank_80_T, int T,
                         std::vector<float> & out, int & T_out)
 {
     const int F = 80;
-    // conv1 input is (C=1, H=80, W=T), i.e. we add a channel dim of 1.
-    // Since C_in=1, the "channel-major" layout is just fbank_80_T.
+
+
     int H = F, W = T;
     int H2, W2;
-    // conv1: (1 → 32, k=3, s=1, p=1) → H=H, W=T
+
     H2 = conv_out_len(H, 3, 1, 1, 1);
     W2 = conv_out_len(W, 3, 1, 1, 1);
     std::vector<float> x((size_t)32 * H2 * W2);
@@ -411,10 +387,10 @@ static void fcm_forward(const campplus_fcm & fcm,
             H = Hn; W = Wn;
         }
     };
-    run_layer(fcm.layer1);  // H: 80 → 40
-    run_layer(fcm.layer2);  // H: 40 → 20
+    run_layer(fcm.layer1);
+    run_layer(fcm.layer2);
 
-    // conv2: (32 → 32, k=3, s=(2,1), p=1) → H: 20 → 10
+
     H2 = conv_out_len(H, 3, 2, 1, 1);
     W2 = conv_out_len(W, 3, 1, 1, 1);
     std::vector<float> y((size_t)32 * H2 * W2);
@@ -424,31 +400,16 @@ static void fcm_forward(const campplus_fcm & fcm,
     relu_inplace(y.data(), y.size());
     H = H2; W = W2;
 
-    // Reshape (32, 10, T) → (320, T) — channel-major layout means we just
-    // re-interpret 32 × 10 × T as 320 × T with data in place.
+
     out = std::move(y);
     T_out = W;
 }
 
-// ---- CAMDenseTDNNLayer ----
-//
-// Python forward:
-//     x_in   : (C_in, T)
-//     BN1 + ReLU → Conv1x1 (C_in → 128) → BN2 + ReLU → CAMLayer
-//     CAMLayer(y):
-//        y = linear_local(y)                              # (C_in → growth, k, dil)
-//        context = y.mean(-1, keepdim=True) + seg_pool(y) # over input y (post BN2+ReLU)
-//        context = relu(linear1(context))
-//        gate    = sigmoid(linear2(context))
-//        return  y * gate
-//     output = concat(x_in, CAMLayer output) along channel axis
 
-// seg_pool: average-pool with kernel=seg_len, stride=seg_len, ceil_mode=True,
-// then repeat-interleave each segment value `seg_len` times and truncate to T.
 static void seg_pool_expand(const float * x, int C, int T, int seg_len,
-                            float * out)  // out has shape (C, T)
+                            float * out)
 {
-    const int S = (T + seg_len - 1) / seg_len;  // ceil(T/seg_len)
+    const int S = (T + seg_len - 1) / seg_len;
     std::vector<float> pooled((size_t)C * S);
     #pragma omp parallel for
     for (int c = 0; c < C; ++c) {
@@ -456,20 +417,16 @@ static void seg_pool_expand(const float * x, int C, int T, int seg_len,
         for (int s = 0; s < S; ++s) {
             int t0 = s * seg_len;
             int t1 = std::min(T, t0 + seg_len);
-            int n  = t1 - t0;  // avg_pool1d with ceil_mode uses PyTorch semantics:
-                               // denominator = kernel_size regardless of truncation
-                               // (count_include_pad=True by default).  BUT for the
-                               // LAST ceil-mode bin, PyTorch divides by the actual
-                               // count of valid elements.  For voice-encoder lengths
-                               // (seg_len=100, T~500), this only matters when
-                               // T % 100 != 0, so use the true-count form.
+            int n  = t1 - t0;
+
+
             float acc = 0.0f;
             for (int t = t0; t < t1; ++t) acc += row[t];
             pooled[(size_t)c * S + s] = acc / std::max(n, 1);
         }
     }
-    // Expand: each pooled[c, s] is tiled across seg_len consecutive t's,
-    // then truncated at T.
+
+
     #pragma omp parallel for
     for (int c = 0; c < C; ++c) {
         float * dst = out + (size_t)c * T;
@@ -486,9 +443,9 @@ static void cam_layer_forward(const campplus_cam_dense_tdnn_layer & L,
                               const float * x_in, int C_bn, int T,
                               int growth, int kernel_size, int dilation,
                               int seg_pool_len,
-                              float * out /* (growth, T) */)
+                              float * out )
 {
-    // linear_local: (C_bn → growth, k, dilation)
+
     const int pad = (kernel_size - 1) / 2 * dilation;
     std::vector<float> y_local((size_t)growth * T);
     conv1d(x_in, C_bn, T,
@@ -496,7 +453,7 @@ static void cam_layer_forward(const campplus_cam_dense_tdnn_layer & L,
            growth, kernel_size, 1, pad, dilation,
            y_local.data(), T);
 
-    // Global mean over T (per channel).
+
     std::vector<float> mean_ctx(C_bn);
     #pragma omp parallel for
     for (int c = 0; c < C_bn; ++c) {
@@ -506,18 +463,18 @@ static void cam_layer_forward(const campplus_cam_dense_tdnn_layer & L,
         mean_ctx[c] = (float)(acc / T);
     }
 
-    // Segment pooling, expanded to (C_bn, T).
+
     std::vector<float> seg_ctx((size_t)C_bn * T);
     seg_pool_expand(x_in, C_bn, T, seg_pool_len, seg_ctx.data());
 
-    // context[c, t] = mean_ctx[c] + seg_ctx[c, t].
+
     for (int c = 0; c < C_bn; ++c) {
         float * row = seg_ctx.data() + (size_t)c * T;
         const float m = mean_ctx[c];
         for (int t = 0; t < T; ++t) row[t] += m;
     }
 
-    // linear1: (C_bn → C_bn/2) 1x1 + bias, then ReLU.
+
     const int mid = L.cam_linear1.C_out;
     std::vector<float> h1((size_t)mid * T);
     conv1d(seg_ctx.data(), C_bn, T,
@@ -525,53 +482,52 @@ static void cam_layer_forward(const campplus_cam_dense_tdnn_layer & L,
            mid, 1, 1, 0, 1, h1.data(), T);
     relu_inplace(h1.data(), h1.size());
 
-    // linear2: (C_bn/2 → growth) 1x1 + bias, then sigmoid.
+
     std::vector<float> gate((size_t)growth * T);
     conv1d(h1.data(), mid, T,
            L.cam_linear2.w.data(), L.cam_linear2.b.empty() ? nullptr : L.cam_linear2.b.data(),
            growth, 1, 1, 0, 1, gate.data(), T);
     sigmoid_inplace(gate.data(), gate.size());
 
-    // out = y_local * gate.
+
     for (size_t i = 0; i < y_local.size(); ++i) out[i] = y_local[i] * gate[i];
 }
 
-// Runs one CAMDenseTDNNLayer on x (C_in, T), appends the growth-d output to x,
-// and resizes it to (C_in + growth, T) in-place.  Returns new C_in.
+
 static int cam_dense_tdnn_layer_forward(const campplus_cam_dense_tdnn_layer & L,
                                         std::vector<float> & x, int C_in, int T,
                                         int growth, int bn_channels,
                                         int kernel_size, int dilation,
                                         int seg_pool_len)
 {
-    // nonlinear1 = BN + ReLU on (C_in, T).
+
     std::vector<float> y = x;
     bn_apply(y.data(), L.bn1.scale.data(), L.bn1.shift.data(), C_in, T);
     relu_inplace(y.data(), y.size());
 
-    // linear1: Conv1x1 C_in → bn_channels.
+
     std::vector<float> z((size_t)bn_channels * T);
     conv1d(y.data(), C_in, T,
            L.linear1.w.data(), nullptr,
            bn_channels, 1, 1, 0, 1, z.data(), T);
 
-    // nonlinear2 = BN + ReLU on (bn_channels, T).
+
     bn_apply(z.data(), L.bn2.scale.data(), L.bn2.shift.data(), bn_channels, T);
     relu_inplace(z.data(), z.size());
 
-    // cam_layer → (growth, T).
+
     std::vector<float> cam_out((size_t)growth * T);
     cam_layer_forward(L, z.data(), bn_channels, T, growth, kernel_size, dilation,
                       seg_pool_len, cam_out.data());
 
-    // Concat along channel axis: x_new = [x; cam_out].
+
     const int C_new = C_in + growth;
     x.resize((size_t)C_new * T);
     std::memcpy(x.data() + (size_t)C_in * T, cam_out.data(), cam_out.size() * sizeof(float));
     return C_new;
 }
 
-// Stats pooling: (C, T) → (2C,). Concatenates mean + unbiased std along channel.
+
 static void stats_pool(const float * x, int C, int T, float * out)
 {
     #pragma omp parallel for
@@ -584,19 +540,13 @@ static void stats_pool(const float * x, int C, int T, float * out)
             double d = row[t] - mean;
             sq += d * d;
         }
-        double var = sq / std::max(1, T - 1);   // unbiased=True
+        double var = sq / std::max(1, T - 1);
         out[c]     = (float)mean;
         out[C + c] = (float)std::sqrt(var);
     }
 }
 
-// =============================================================================
-// Top-level forward
-// =============================================================================
 
-// Legacy scalar CPU forward.  Kept for the CPU test harness and as a fallback
-// when the caller explicitly passes backend == nullptr.  The ggml-backed
-// public entry point follows it at the bottom of the file.
 static bool campplus_embed_cpu(const std::vector<float> & fbank_t_by_c, int T,
                                const campplus_weights & w, std::vector<float> & out)
 {
@@ -606,21 +556,21 @@ static bool campplus_embed_cpu(const std::vector<float> & fbank_t_by_c, int T,
         return false;
     }
 
-    // 1. Transpose (T, 80) → (80, T) (channel-major).
+
     std::vector<float> fbank_ct((size_t)w.feat_dim * T);
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < w.feat_dim; ++c)
             fbank_ct[(size_t)c * T + t] = fbank_t_by_c[(size_t)t * w.feat_dim + c];
 
-    // 2. FCM → (320, T).
+
     std::vector<float> x;
     int T_after_fcm = 0;
     fcm_forward(w.head, fbank_ct.data(), T, x, T_after_fcm);
 
-    const int fcm_out_ch = 32 * (w.feat_dim / 8);  // 320
+    const int fcm_out_ch = 32 * (w.feat_dim / 8);
 
-    // 3. tdnn: Conv1d(320, 128, k=5, s=2, p=2) + BN + ReLU.
-    const int init_C = w.tdnn_linear.C_out;  // 128
+
+    const int init_C = w.tdnn_linear.C_out;
     const int T_tdnn = conv_out_len(T_after_fcm, 5, 2, 2, 1);
     std::vector<float> y((size_t)init_C * T_tdnn);
     conv1d(x.data(), fcm_out_ch, T_after_fcm,
@@ -632,7 +582,7 @@ static bool campplus_embed_cpu(const std::vector<float> & fbank_t_by_c, int T,
     int C_cur = init_C;
     int T_cur = T_tdnn;
 
-    // 4. Helper that runs a block + transit.
+
     auto run_block = [&](const campplus_cam_block & blk,
                          const campplus_transit & trans,
                          int growth, int bn_channels, int seg_pool_len) {
@@ -642,7 +592,7 @@ static bool campplus_embed_cpu(const std::vector<float> & fbank_t_by_c, int T,
                                                  blk.kernel_size, blk.dilation,
                                                  seg_pool_len);
         }
-        // transit = BN + ReLU + Conv1x1 (halves channels).
+
         bn_apply(x.data(), trans.bn.scale.data(), trans.bn.shift.data(), C_cur, T_cur);
         relu_inplace(x.data(), x.size());
         const int C_out = trans.linear.C_out;
@@ -660,17 +610,16 @@ static bool campplus_embed_cpu(const std::vector<float> & fbank_t_by_c, int T,
     run_block(w.block2, w.transit2, growth, bn_channels, w.seg_pool_len);
     run_block(w.block3, w.transit3, growth, bn_channels, w.seg_pool_len);
 
-    // 5. out_nonlinear: BN + ReLU on (C_cur=512, T).
+
     bn_apply(x.data(), w.out_nonlinear_bn.scale.data(), w.out_nonlinear_bn.shift.data(),
              C_cur, T_cur);
     relu_inplace(x.data(), x.size());
 
-    // 6. stats_pool → (2*C_cur = 1024,).
+
     std::vector<float> stats(2 * (size_t)C_cur);
     stats_pool(x.data(), C_cur, T_cur, stats.data());
 
-    // 7. dense: Conv1x1 (1024 → 192) + BN(affine=False).
-    //    Input shape is (1024, 1) — single-frame; we can just do a matmul.
+
     const int E = w.embedding_size;
     std::vector<float> emb((size_t)E, 0.0f);
     conv1d(stats.data(), 2 * C_cur, 1,
@@ -682,10 +631,6 @@ static bool campplus_embed_cpu(const std::vector<float> & fbank_t_by_c, int T,
     return true;
 }
 
-// =============================================================================
-// Public API: route through ggml graph when a backend is supplied, fall back
-// to the scalar CPU path otherwise (test harnesses, legacy callers).
-// =============================================================================
 
 #include "campplus_forward.inc"
 

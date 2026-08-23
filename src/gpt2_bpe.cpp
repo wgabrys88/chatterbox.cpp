@@ -10,7 +10,6 @@
 #include <sstream>
 #include <unordered_set>
 
-// ---- byte-level encoding (GPT-2 convention) --------------------------------
 
 static std::unordered_map<uint8_t, std::string> build_byte_to_unicode() {
     std::unordered_map<uint8_t, std::string> m;
@@ -47,7 +46,6 @@ static std::string bytes_to_unicode_str(const std::string & raw) {
     return out;
 }
 
-// ---- load tokenizer from arrays embedded in GGUF metadata -----------------
 
 bool gpt2_bpe::load_from_arrays(const std::vector<std::string> & tokens,
                                 const std::vector<std::string> & merges) {
@@ -68,8 +66,6 @@ bool gpt2_bpe::load_from_arrays(const std::vector<std::string> & tokens,
     return true;
 }
 
-// ---- GPT-2 pre-tokenization regex ------------------------------------------
-// Pattern: 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
 
 static std::vector<std::string> gpt2_regex_split(const std::string & text) {
     static const std::regex re(
@@ -85,7 +81,6 @@ static std::vector<std::string> gpt2_regex_split(const std::string & text) {
     return words;
 }
 
-// ---- BPE merge algorithm ---------------------------------------------------
 
 static int find_rank(const std::unordered_map<std::string, int> & ranks,
                      const std::string & left, const std::string & right) {
@@ -95,7 +90,7 @@ static int find_rank(const std::unordered_map<std::string, int> & ranks,
 
 static std::vector<std::string> bpe_merge(const std::string & token,
                                           const std::unordered_map<std::string, int> & ranks) {
-    // split token into individual UTF-8 characters
+
     std::vector<std::string> parts;
     for (size_t i = 0; i < token.size(); ) {
         size_t len = 1;
@@ -121,17 +116,16 @@ static std::vector<std::string> bpe_merge(const std::string & token,
     return parts;
 }
 
-// ---- tokenize --------------------------------------------------------------
 
 std::vector<int32_t> gpt2_bpe::tokenize(const std::string & text) const {
     std::vector<int32_t> ids;
     if (text.empty()) return ids;
 
-    // check added tokens first (paralinguistic tags like [laugh])
+
     struct added_span { size_t start; size_t len; int32_t id; };
     std::vector<added_span> spans;
     for (auto & [tok, id] : token_to_id) {
-        if (id < 50257) continue; // only added tokens
+        if (id < 50257) continue;
         size_t pos = 0;
         while ((pos = text.find(tok, pos)) != std::string::npos) {
             spans.push_back({pos, tok.size(), id});
@@ -140,7 +134,7 @@ std::vector<int32_t> gpt2_bpe::tokenize(const std::string & text) const {
     }
     std::sort(spans.begin(), spans.end(), [](const added_span & a, const added_span & b) { return a.start < b.start; });
 
-    // remove overlapping spans (keep earliest)
+
     std::vector<added_span> clean;
     size_t last_end = 0;
     for (auto & sp : spans) {
@@ -178,17 +172,16 @@ std::vector<int32_t> gpt2_bpe::tokenize(const std::string & text) const {
     return ids;
 }
 
-// ---- punc_norm (matches Python tts_turbo.py) -------------------------------
 
 std::string gpt2_bpe::punc_norm(const std::string & text) {
     if (text.empty()) return "You need to add some text for me to talk.";
 
     std::string t = text;
 
-    // capitalize first letter
+
     if (t[0] >= 'a' && t[0] <= 'z') t[0] = t[0] - 'a' + 'A';
 
-    // collapse multiple spaces
+
     {
         std::string r;
         bool prev_space = false;
@@ -199,7 +192,7 @@ std::string gpt2_bpe::punc_norm(const std::string & text) {
         t = r;
     }
 
-    // replace uncommon punctuation
+
     auto replace_all = [](std::string & s, const std::string & from, const std::string & to) {
         size_t pos = 0;
         while ((pos = s.find(from, pos)) != std::string::npos) {
@@ -207,28 +200,24 @@ std::string gpt2_bpe::punc_norm(const std::string & text) {
             pos += to.size();
         }
     };
-    replace_all(t, "\xe2\x80\xa6", ", ");   // …
+    replace_all(t, "\xe2\x80\xa6", ", ");
     replace_all(t, ":", ",");
-    replace_all(t, "\xe2\x80\x94", "-");     // —
-    replace_all(t, "\xe2\x80\x93", "-");     // –
+    replace_all(t, "\xe2\x80\x94", "-");
+    replace_all(t, "\xe2\x80\x93", "-");
     replace_all(t, " ,", ",");
-    replace_all(t, "\xe2\x80\x9c", "\"");    // "
-    replace_all(t, "\xe2\x80\x9d", "\"");    // "
-    replace_all(t, "\xe2\x80\x98", "'");     // '
-    replace_all(t, "\xe2\x80\x99", "'");     // '
+    replace_all(t, "\xe2\x80\x9c", "\"");
+    replace_all(t, "\xe2\x80\x9d", "\"");
+    replace_all(t, "\xe2\x80\x98", "'");
+    replace_all(t, "\xe2\x80\x99", "'");
 
-    // strip trailing whitespace (spaces, tabs, newlines).  Sentences
-    // coming from the live tail-follow reader typically end in '\n' or
-    // ' ' because that's the terminator pop_sentence used; leaving that
-    // in place confuses the "add period if no ending punctuation" step
-    // below (it would append '.' after the newline, producing ".\n.").
+
     while (!t.empty()) {
         char b = t.back();
         if (b == ' ' || b == '\t' || b == '\n' || b == '\r') t.pop_back();
         else break;
     }
 
-    // add period if no ending punctuation
+
     if (!t.empty()) {
         char last = t.back();
         if (last != '.' && last != '!' && last != '?' && last != '-' && last != ',')

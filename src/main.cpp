@@ -85,9 +85,7 @@ bool validate_reference_audio(const std::string & path) {
     return true;
 }
 
-// Load REF.wav, resample to 24 kHz if needed, pull the 80-ch mel filterbank out
-// of the s3gen GGUF, and compute prompt_feat (log-mel) in C++.  out_rows is the
-// number of mel frames (= T_mel in the row-major (T_mel, 80) layout).
+
 bool compute_prompt_feat_native(const std::string & wav_path,
                                        const std::string & s3gen_gguf_path,
                                        std::vector<float> & out_feat,
@@ -104,26 +102,18 @@ bool compute_prompt_feat_native(const std::string & wav_path,
         wav = resample_sinc(wav, sr, 24000);
     }
 
-    // Loudness-normalise to -27 LUFS (matches tts_turbo.norm_loudness).  A
-    // quiet reference wav (e.g. -44 LUFS) would otherwise produce mel values
-    // 15–20 dB lower than what S3Gen was trained on, and the conditioning
-    // would pull the output towards the default voice.
+
     double pre  = measure_lufs(wav, 24000);
     normalise_lufs(wav, 24000, -27.0);
     if (verbose) fprintf(stderr, "voice:   loudness %.2f LUFS → -27 LUFS (+%.2f dB)\n", pre, -27.0 - pre);
 
-    // Match Python's tts_turbo.prepare_conditionals:
-    //   s3gen_ref_wav = s3gen_ref_wav[:DEC_COND_LEN]  # 10 * S3GEN_SR = 240000
-    //   s3gen.embed_ref(s3gen_ref_wav, 24000)  # → prompt_feat/embedding/prompt_token
-    // Trim to the first 10 s at 24 kHz before computing anything, otherwise
-    // prompt_feat comes out (~787, 80) instead of the (500, 80) S3Gen was
-    // trained on, and conditioning suffers.
+
     const int dec_cond_samples = 10 * 24000;
     if ((int)wav.size() > dec_cond_samples) wav.resize(dec_cond_samples);
 
-    // Pull the precomputed mel filterbank out of chatterbox-s3gen.gguf.
+
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params gp = {  false,  &tmp_ctx };
     gguf_context * g = gguf_init_from_file(s3gen_gguf_path.c_str(), gp);
     if (!g) {
         fprintf(stderr, "voice: failed to open %s\n", s3gen_gguf_path.c_str());
@@ -147,9 +137,7 @@ bool compute_prompt_feat_native(const std::string & wav_path,
     return true;
 }
 
-// Compute the 192-d `embedding` tensor natively by running the reference wav
-// through the C++ Kaldi fbank → mean-subtract → CAMPPlus pipeline.  Returns
-// false silently if the s3gen GGUF predates Phase 2d-a (no CAMPPlus tensors).
+
 bool compute_embedding_native(const std::string & wav_path,
                                      const std::string & s3gen_gguf_path,
                                      std::vector<float> & out_emb,
@@ -163,10 +151,9 @@ bool compute_embedding_native(const std::string & wav_path,
         return false;
     }
 
-    // Mel filterbank for the Kaldi-style fbank lives alongside CAMPPlus in
-    // the s3gen GGUF (baked in by the converter).
+
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params gp = {  false,  &tmp_ctx };
     gguf_context * g = gguf_init_from_file(s3gen_gguf_path.c_str(), gp);
     if (!g) return false;
     ggml_tensor * fb_t = ggml_get_tensor(tmp_ctx, "campplus/mel_fb_kaldi_80");
@@ -182,15 +169,12 @@ bool compute_embedding_native(const std::string & wav_path,
     std::vector<float> wav;
     int sr = 0;
     if (!wav_load(wav_path, wav, sr)) return false;
-    // Python normalises loudness at the ORIGINAL sample rate, before any
-    // resampling.  Do the same so the gain matches exactly.
+
+
     normalise_lufs(wav, sr, -27.0);
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
 
-    // Match Python's s3gen.embed_ref: the reference wav has been trimmed to
-    // DEC_COND_LEN = 10 s @ 24 kHz before being passed in, then internally
-    // resampled to 16 kHz.  Trimming to the equivalent 10 s @ 16 kHz after
-    // resampling gets us the same slice for CAMPPlus (fbank + speaker encoder).
+
     const int dec_cond_samples_16k = 10 * 16000;
     if ((int)wav.size() > dec_cond_samples_16k) wav.resize(dec_cond_samples_16k);
 
@@ -198,7 +182,7 @@ bool compute_embedding_native(const std::string & wav_path,
     if (fbank.empty()) return false;
     const int T = (int)(fbank.size() / 80);
 
-    // Per-utterance mean subtraction over T (matches extract_feature()).
+
     std::vector<float> col_mean(80, 0.0f);
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < 80; ++c) col_mean[c] += fbank[(size_t)t * 80 + c];
@@ -206,28 +190,15 @@ bool compute_embedding_native(const std::string & wav_path,
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < 80; ++c) fbank[(size_t)t * 80 + c] -= col_mean[c];
 
-    // Force the scalar C++ CAMPPlus path for now.  The ggml-graph variant
-    // (campplus_embed_ggml) produces an antipodal embedding vs the
-    // scalar/Python reference on real voice inputs (cos_sim ~ -0.19 vs
-    // Python, while the scalar path matches at ~0.9999).  The bug is in
-    // the graph construction and isn't exercised by test-campplus because
-    // that harness passes backend=nullptr too.  CAMPPlus only runs once
-    // per voice-bake, ~500 ms on CPU, so the ggml speed-up isn't critical
-    // for user-visible latency — we pay a small one-time cost in exchange
-    // for a correct speaker embedding.
+
     (void)backend;
-    if (!campplus_embed(fbank, T, w, /*backend=*/nullptr, out_emb)) return false;
+    if (!campplus_embed(fbank, T, w, nullptr, out_emb)) return false;
     if (verbose) fprintf(stderr, "voice: embedding shape=(%zu,) via CAMPPlus (%d fbank frames)\n",
             out_emb.size(), T);
     return true;
 }
 
-// Tokenize a reference wav with S3TokenizerV2 (the C++ port of the 25 Hz
-// speech-token encoder).  Produces both the S3Gen-side prompt_token stream
-// (first 10 s → up to 250 tokens) and the T3-side cond_prompt_speech_tokens
-// stream (first 15 s → up to max_cond_tokens tokens).
-//
-// Returns false if the s3gen GGUF pre-dates Phase 2e (no s3tokv2.* tensors).
+
 bool compute_speech_tokens_native(const std::string & wav_path,
                                          const std::string & s3gen_gguf_path,
                                          int max_cond_tokens,
@@ -250,12 +221,12 @@ bool compute_speech_tokens_native(const std::string & wav_path,
     normalise_lufs(wav, sr, -27.0);
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
 
-    // prompt_token: first 10 s of the reference → up to 250 tokens (S3Gen side).
+
     const int dec_cond_samples = 10 * 16000;
     std::vector<float> prompt_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), dec_cond_samples));
-    if (!s3tokv2_tokenize(prompt_wav, w, /*max_tokens=*/-1, out_prompt_tokens, n_threads, backend)) return false;
+    if (!s3tokv2_tokenize(prompt_wav, w, -1, out_prompt_tokens, n_threads, backend)) return false;
 
-    // cond_prompt_speech_tokens: first 15 s → up to max_cond_tokens (T3 side).
+
     const int enc_cond_samples = 15 * 16000;
     std::vector<float> cond_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), enc_cond_samples));
     if (!s3tokv2_tokenize(cond_wav, w, max_cond_tokens, out_cond_tokens, n_threads, backend)) return false;
@@ -265,7 +236,6 @@ bool compute_speech_tokens_native(const std::string & wav_path,
     return true;
 }
 
-// --------------------------------------------------------------------------
 
 static int64_t require_key(const gguf_context * ctx, const char * key) {
     int64_t id = gguf_find_key(ctx, key);
@@ -279,14 +249,7 @@ static ggml_tensor * require_tensor(const chatterbox_model & m, const char * nam
     return it->second;
 }
 
-// --------------------------------------------------------------------------
-// Backend init
-// --------------------------------------------------------------------------
 
-// Verbose flag: set once in main() before any ggml init so helpers
-// below (init_backend, load_model_gguf) can gate their startup prints on it.
-// 0 = quiet, 1 = --verbose mode.  Declared extern in chatterbox_t3_internal.h
-// so chatterbox_engine.cpp can flip it from its Engine ctor without a copy.
 int g_log_verbose = 0;
 
 ggml_backend_t init_backend(int n_gpu_layers) {
@@ -343,13 +306,10 @@ ggml_backend_t init_backend(int n_gpu_layers) {
     return b;
 }
 
-// --------------------------------------------------------------------------
-// Model loading
-// --------------------------------------------------------------------------
 
 bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
     {
-        gguf_init_params peek_params = { /*.no_alloc=*/ true, /*.ctx=*/ nullptr };
+        gguf_init_params peek_params = {  true,  nullptr };
         gguf_context * peek_ctx = gguf_init_from_file(path.c_str(), peek_params);
         if (peek_ctx) {
             std::string variant = "t3_turbo";
@@ -370,7 +330,7 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
         }
     }
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gguf_params = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params gguf_params = {  false,  &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
     if (!gguf_ctx) { fprintf(stderr, "%s: failed to open '%s'\n", __func__, path.c_str()); return false; }
 
@@ -454,7 +414,7 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
                 ggml_backend_buffer_get_size(model.buffer_w) / (1024.0*1024.0),
                 ggml_backend_buffer_get_size(model.buffer_kv) / (1024.0*1024.0));
 
-        // Read embedded tokenizer arrays if present (added by converter-v2).
+
         {
             const int64_t tok_kid = gguf_find_key(gguf_ctx, "tokenizer.ggml.tokens");
             const int64_t mer_kid = gguf_find_key(gguf_ctx, "tokenizer.ggml.merges");
@@ -486,9 +446,6 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
     return true;
 }
 
-// --------------------------------------------------------------------------
-// GPT-2 transformer core (shared by prompt and step graphs)
-// --------------------------------------------------------------------------
 
 static ggml_tensor * build_transformer_core(
     ggml_context * ctx, ggml_cgraph * gf,
@@ -501,20 +458,12 @@ static ggml_tensor * build_transformer_core(
     const int HD = n_embd / n_head;
     const int64_t L = n_past + N;
 
-    // KV cache layout: each layer is interpreted as [HD, n_ctx, n_head] instead
-    // of the older [n_embd, n_ctx].  The total size is unchanged (HD*n_ctx*n_head
-    // == n_embd*n_ctx), but new-in-[seq, head] stride lets ggml_flash_attn_ext
-    // read the K/V slice as a [HD, L, n_head] view without a per-step
-    // permute+cont — which was the main reason an earlier FA attempt regressed
-    // on the T3 step path.
-    const size_t kv_layer_elems  = (size_t) HD * n_ctx * n_head;  // same as n_embd * n_ctx
+
+    const size_t kv_layer_elems  = (size_t) HD * n_ctx * n_head;
     const size_t kv_head_stride  = (size_t) HD * n_ctx * sizeof(float);
     const size_t kv_pos_stride   = (size_t) HD * sizeof(float);
 
-    // Causal attention mask for flash_attn_ext.  Shape [n_kv, N] broadcast
-    // over heads, F16 (Metal FA requires F16 masks; CPU / CUDA / Vulkan all
-    // accept that too).  For the single-step path (N=1) every KV position is
-    // allowed, so no mask is needed and we pass nullptr to FA.
+
     ggml_tensor * kq_mask = nullptr;
     if (N > 1) {
         kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, L, N);
@@ -528,30 +477,24 @@ static ggml_tensor * build_transformer_core(
         cur = ggml_add(ctx, ggml_mul(ctx, cur, model.layers[il].ln_1_g), model.layers[il].ln_1_b);
         cur = ggml_add(ctx, ggml_mul_mat(ctx, model.layers[il].c_attn_attn_w, cur), model.layers[il].c_attn_attn_b);
 
-        // View Q / K / V directly inside the fused QKV projection output as
-        // [HD, N, n_head] with explicit strides.  FA consumes this non-contig
-        // view directly: nb0=4 (fast HD axis), nb1=3*n_embd*4 (stride between
-        // columns of the original cur), nb2=HD*4 (stride between heads within
-        // a column).  No cont_3d + permute + cont sequence per layer.
-        const size_t qkv_col_stride  = cur->nb[1];                // 3 * n_embd * sizeof(float)
+
+        const size_t qkv_col_stride  = cur->nb[1];
         const size_t qkv_head_stride = (size_t) HD * sizeof(float);
 
         ggml_tensor * Q = ggml_view_3d(ctx, cur, HD, N, n_head,
             qkv_col_stride,
             qkv_head_stride,
-            0);  // Qcur slot
+            0);
         ggml_tensor * Kcur_QNH = ggml_view_3d(ctx, cur, HD, N, n_head,
             qkv_col_stride,
             qkv_head_stride,
-            (size_t) n_embd * sizeof(float));  // Kcur slot
+            (size_t) n_embd * sizeof(float));
         ggml_tensor * Vcur_QNH = ggml_view_3d(ctx, cur, HD, N, n_head,
             qkv_col_stride,
             qkv_head_stride,
-            (size_t) 2 * n_embd * sizeof(float));  // Vcur slot
+            (size_t) 2 * n_embd * sizeof(float));
 
-        // KV cache append: write the [HD, N, n_head] source into a strided
-        // [HD, N, n_head] view of the cache starting at position n_past.
-        // One kernel launch per tensor.
+
         const size_t layer_off = (size_t) il * kv_layer_elems * sizeof(float);
         {
             ggml_tensor * k_dst = ggml_view_3d(ctx, model.memory_k,
@@ -582,7 +525,7 @@ static ggml_tensor * build_transformer_core(
 
         ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, kq_mask,
             1.0f / std::sqrt((float) HD), 0.0f, 0.0f);
-        // attn: [HD, n_head, N, 1] contiguous -> [n_embd, N]
+
         cur = ggml_reshape_2d(ctx, attn, n_embd, N);
         cur = ggml_add(ctx, ggml_add(ctx, ggml_mul_mat(ctx, model.layers[il].c_attn_proj_w, cur), model.layers[il].c_attn_proj_b), inpL);
 
@@ -605,9 +548,6 @@ static ggml_tensor * build_transformer_core(
     return logits;
 }
 
-// --------------------------------------------------------------------------
-// Graph builders
-// --------------------------------------------------------------------------
 
 static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_text_tokens) {
     const int N = 1 + model.hparams.cond_prompt_len + n_text_tokens + 1;
@@ -660,9 +600,6 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
     return gf;
 }
 
-// --------------------------------------------------------------------------
-// Evaluation
-// --------------------------------------------------------------------------
 
 bool eval_prompt(
     const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
@@ -688,7 +625,7 @@ bool eval_prompt(
         const int N = prompt_len;
         ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "kq_mask");
         if (kq_mask) {
-            // Metal FA requires F16 masks; other backends accept F16 too.
+
             const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
             const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
             std::vector<ggml_fp16_t> mask((size_t)N * N, zero_h);
@@ -733,20 +670,7 @@ bool eval_step(
     return true;
 }
 
-// --------------------------------------------------------------------------
-// Sampling
-// --------------------------------------------------------------------------
 
-// Matches HuggingFace LogitsProcessorList order used in inference_turbo:
-//   1. TemperatureLogitsWarper   (if temp > 0 and temp != 1)
-//   2. TopKLogitsWarper          (if top_k > 0)
-//   3. TopPLogitsWarper          (if top_p < 1)
-//   4. RepetitionPenaltyLogitsProcessor (if penalty != 1)
-// Then softmax + multinomial.
-//
-// The chatterbox_sampling_params-taking version is the canonical one and is
-// also used from src/chatterbox_engine.cpp.  The cli_params-taking wrapper
-// below is preserved so the existing CLI call sites keep working unchanged.
 int32_t sample_next_token_ex(
     const std::vector<float> & logits,
     const std::vector<int32_t> & generated,
@@ -824,22 +748,20 @@ int32_t sample_next_token_ex(
     return dist(rng);
 }
 
-// Log filter: when --verbose is off, drop ggml kernel spam.  Always keep
-// ERROR and the Vulkan device banner (fp16 / warp / matrix cores).
-// (g_log_verbose is declared near init_backend; see above.)
-void chatterbox_log_cb(ggml_log_level level, const char * text, void * /*ud*/) {
+
+void chatterbox_log_cb(ggml_log_level level, const char * text, void * ) {
     if (g_log_verbose || level >= GGML_LOG_LEVEL_ERROR) {
         fputs(text, stderr);
         return;
     }
     if (!text) return;
-    // Keep the Vulkan device banner (fp16=0 / warp / matrix cores) without
-    // per-kernel compile spam.
+
+
     if (std::strstr(text, "ggml_vulkan: Found") || std::strstr(text, "ggml_vulkan: 0 =") ||
         std::strstr(text, "ggml_vulkan: 1 =")) {
         fputs(text, stderr);
     }
 }
 
-} // namespace tts_cpp::chatterbox::detail
+}
 

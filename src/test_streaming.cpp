@@ -1,19 +1,5 @@
-// Validation harness for the streaming port (PROGRESS.md B1).
-//
-// Reads Python's streaming dumps produced by
-// `scripts/dump-streaming-reference.py`, runs the C++ pipeline once per
-// chunk with the matching `finalize` flag and token prefix, and compares
-// per-chunk mel output against Python's `chunk_{k}_mels_new.npy`.
-//
-// Phase 3 additions: carries `hift_cache_source` across chunks, applies
-// `apply_trim_fade` only to chunk 0, concatenates the per-chunk wavs into
-// `streamed_wav_cpp.npy`, and reports RMS error vs Python's
-// `streamed_wav.npy` — HiFT sinegen uses a different RNG than Python's
-// torch.randn so bit-exact parity is not expected, but the streamed RMS
-// should be close to Python's streamed-vs-batch gap (≈3%).
-//
-// Usage:
-//   ./build/test-streaming  models/chatterbox-s3gen.gguf  /tmp/streaming_ref/
+
+
 
 #include "tts-cpp/chatterbox/s3gen_pipeline.h"
 #include "npy.h"
@@ -28,7 +14,7 @@
 #include <vector>
 #include <sys/stat.h>
 
-// Minimal .npy writer (float32 1-D / 2-D only; matches the harness needs).
+
 static void npy_write_f32(const std::string & path, const std::vector<float> & v,
                           const std::vector<int64_t> & shape) {
     std::ofstream f(path, std::ios::binary);
@@ -39,7 +25,7 @@ static void npy_write_f32(const std::string & path, const std::vector<float> & v
         if (shape.size() == 1 || i + 1 < shape.size()) hdr += ", ";
     }
     hdr += "), }";
-    // pad so total header length (10 bytes preamble + hdr + newline) is % 64.
+
     size_t total = 10 + hdr.size() + 1;
     size_t pad = (64 - (total % 64)) % 64;
     hdr.append(pad, ' ');
@@ -94,8 +80,8 @@ int main(int argc, char ** argv) {
     int prev_mels_emitted = 0;
     double max_rel = 0;
     double total_rms = 0;
-    std::vector<float> hift_cache_source;   // tail of prev chunk's post-SineGen source
-    std::vector<float> streamed_wav_cpp;    // accumulated across chunks
+    std::vector<float> hift_cache_source;
+    std::vector<float> streamed_wav_cpp;
     double wav_max_rel = 0, wav_total_rms = 0; int wav_chunks = 0;
     while (true) {
         char kbuf[16];
@@ -113,7 +99,7 @@ int main(int argc, char ** argv) {
                         "prev_mels_emitted=%d\n",
                 k + 1, n_cum, is_last ? "true" : "false", prev_mels_emitted);
 
-        // Sanity-check the cumulative token prefix matches the global sequence.
+
         for (int i = 0; i < n_cum; ++i) {
             if (cp[i] != tok_ptr[i]) {
                 fprintf(stderr, "error: chunk tokens diverge from global sequence at i=%d\n", i);
@@ -130,34 +116,21 @@ int main(int argc, char ** argv) {
         opts.out_wav_path              = ref + "/cpp_chunk_" + kbuf + ".wav";
         opts.ref_dir                   = ref;
         opts.seed                      = 42;
-        // Streaming semantics mirrored from scripts/dump-streaming-reference.py:
-        //   * the Python loop appends 3 silence tokens ONCE at the top,
-        //     before chunking, so per-chunk calls don't re-append.  We match
-        //     that with append_lookahead_silence=false.
-        //   * `finalize` only controls the tail 6-frame trim.
-        //   * `skip_mel_frames` drops the frames already emitted by earlier
-        //     chunks, leaving only what's new this chunk.
+
+
         opts.append_lookahead_silence  = false;
         opts.finalize                  = is_last;
         opts.skip_mel_frames           = prev_mels_emitted;
         opts.dump_mel_path             = dump_path;
 
-        // HiFT streaming: carry source tail across chunks, fade-in only on
-        // chunk 0 (matches Python dump-streaming-reference.py).
+
         opts.hift_cache_source         = hift_cache_source;
         opts.apply_trim_fade           = (k == 0);
         std::vector<float> source_tail_out;
         opts.hift_source_tail_out      = &source_tail_out;
-        opts.source_tail_samples       = 480;   // 1 mel hop at 24 kHz = 20 ms
+        opts.source_tail_samples       = 480;
 
-        // Inject Python's exact per-chunk CFM noise so the two pipelines
-        // become bit-exact comparable (bypasses the torch.randn vs
-        // std::mt19937 divergence).
-        // Use chunk_KK_step0_x_in.npy (the ACTUAL z passed into estimator.forward
-        // at step 0 — includes the `noised_mels` overlay from flow_inference).
-        // The older chunk_KK_cfm_z.npy only captured the first torch.randn_like
-        // call and missed the meanflow-specific speech-region overwrite, which
-        // caused post-prompt divergence.
+
         const std::string z_path = ref + "/chunk_" + kbuf + "_step0_x_in.npy";
         if (path_exists(z_path)) {
             npy_array z = npy_load(z_path);
@@ -173,7 +146,7 @@ int main(int argc, char ** argv) {
             return rc;
         }
 
-        // Compare mel against Python.
+
         npy_array py_mel  = npy_load(mel_path);
         npy_array cpp_mel = npy_load(dump_path);
         const float * py  = (const float *)py_mel.data.data();
@@ -195,22 +168,18 @@ int main(int argc, char ** argv) {
         total_rms += s.rms;
         prev_mels_emitted += (int)cpp_rows;
 
-        // Carry cache_source over to the next chunk.
+
         hift_cache_source = std::move(source_tail_out);
 
-        // Read the per-chunk C++ wav (just written to disk) and splice into
-        // the running streamed wav.  Compare to Python's chunk_KK_wav.npy:
-        // C++ SineGen RNG differs from torch.randn so bit-exact parity is
-        // not achievable here — we just report RMS as an informational
-        // sanity signal.
+
         const std::string cpp_wav_path = opts.out_wav_path;
-        // Minimal WAV reader (mono 16-bit PCM from write_wav()).
+
         std::vector<float> cpp_wav;
         {
             std::ifstream wf(cpp_wav_path, std::ios::binary);
             if (wf) {
                 char hdr[44]; wf.read(hdr, 44);
-                // Read 16-bit PCM samples
+
                 std::vector<int16_t> pcm;
                 int16_t s16;
                 while (wf.read((char*)&s16, 2)) pcm.push_back(s16);
@@ -241,7 +210,7 @@ int main(int argc, char ** argv) {
                 wav_max_rel, wav_total_rms / wav_chunks);
     }
 
-    // Save streamed_wav_cpp for offline comparison vs Python's streamed_wav.
+
     if (!streamed_wav_cpp.empty()) {
         npy_write_f32(ref + "/streamed_wav_cpp.npy",
                       streamed_wav_cpp, {(int64_t)streamed_wav_cpp.size()});

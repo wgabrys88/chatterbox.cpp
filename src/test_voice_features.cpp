@@ -1,11 +1,5 @@
-// Validation harness for the C++ voice-cloning preprocessing primitives:
-//   wav_load + resample_sinc + mel_extract_24k_80
-// Compares the C++ 80-channel log-mel at 24 kHz against a Python-dumped
-// prompt_feat.npy (produced by scripts/dump-s3gen-reference.py or any
-// other path that calls chatterbox.models.s3gen.utils.mel.mel_spectrogram).
-//
-// Usage:
-//   ./build/test-voice-features S3GEN.gguf REF.wav PROMPT_FEAT.npy
+
+
 
 #include "voice_features.h"
 
@@ -28,10 +22,10 @@ int main(int argc, char ** argv) {
     const std::string wav_path  = argv[2];
     const std::string ref_path  = argv[3];
 
-    // Load the mel filterbank (80, 961) from the GGUF.
+
     fprintf(stderr, "[1/4] loading mel filterbank from %s\n", gguf_path.c_str());
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params gp = {  false,  &tmp_ctx };
     gguf_context * g = gguf_init_from_file(gguf_path.c_str(), gp);
     if (!g) { fprintf(stderr, "gguf_init_from_file failed\n"); return 1; }
 
@@ -45,7 +39,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "      filterbank shape=[%lld, %lld]\n",
             (long long)fb_t->ne[0], (long long)fb_t->ne[1]);
 
-    // Load the wav and resample to 24 kHz if needed.
+
     fprintf(stderr, "[2/4] loading %s\n", wav_path.c_str());
     std::vector<float> wav;
     int sr = 0;
@@ -58,14 +52,14 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "      resampled samples=%zu (%.2f s)\n", wav.size(), (double)wav.size() / 24000.0);
     }
 
-    // Compute the C++ prompt_feat.
+
     fprintf(stderr, "[3/4] computing 80-channel log-mel at 24 kHz\n");
     std::vector<float> feat = mel_extract_24k_80(wav, mel_fb);
     const int n_mels = 80;
     const int T = (int)(feat.size() / n_mels);
     fprintf(stderr, "      C++ prompt_feat shape=(%d, %d)  n=%zu\n", T, n_mels, feat.size());
 
-    // Load the Python reference.
+
     fprintf(stderr, "[4/4] loading reference %s\n", ref_path.c_str());
     npy_array ref = npy_load(ref_path);
     fprintf(stderr, "      Python prompt_feat shape=(%lld, %lld)  n=%zu\n",

@@ -1,11 +1,5 @@
-// End-to-end voice-embedding validation harness.
-//
-// Pipeline:
-//   wav_16k (float32) → fbank_kaldi_80 → mean-subtract over T
-//   → campplus_embed → 192-d speaker embedding
-//
-// Usage:
-//   ./build/test-voice-embedding S3GEN.gguf WAV_16K.npy EMBEDDING.npy
+
+
 
 #include "campplus.h"
 #include "voice_features.h"
@@ -30,10 +24,10 @@ int main(int argc, char ** argv) {
     const std::string wav_path  = argv[2];
     const std::string ref_path  = argv[3];
 
-    // Load the Kaldi mel filterbank from the GGUF.
+
     fprintf(stderr, "[1/5] loading mel filterbank from %s\n", gguf_path.c_str());
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params gp = {  false,  &tmp_ctx };
     gguf_context * g = gguf_init_from_file(gguf_path.c_str(), gp);
     if (!g) { fprintf(stderr, "cannot open gguf\n"); return 1; }
     ggml_tensor * fb_t = ggml_get_tensor(tmp_ctx, "campplus/mel_fb_kaldi_80");
@@ -60,7 +54,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "      fbank (T=%d, 80)  %.1f ms\n", T,
             std::chrono::duration<double, std::milli>(t1 - t0).count());
 
-    // Mean-subtract over T (per channel) — matches extract_feature().
+
     std::vector<float> col_mean(80, 0.0f);
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < 80; ++c) col_mean[c] += fb_cpp[(size_t)t * 80 + c];
@@ -70,7 +64,7 @@ int main(int argc, char ** argv) {
 
     std::vector<float> emb;
     auto t2 = std::chrono::steady_clock::now();
-    if (!campplus_embed(fb_cpp, T, w, /*backend=*/nullptr, emb)) return 1;
+    if (!campplus_embed(fb_cpp, T, w, nullptr, emb)) return 1;
     auto t3 = std::chrono::steady_clock::now();
     fprintf(stderr, "      CAMPPlus  %.1f ms  → %zu dims\n",
             std::chrono::duration<double, std::milli>(t3 - t2).count(), emb.size());

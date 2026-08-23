@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""Generate NFKD + lowercase + canonical-combining-class tables for
-src/mtl_unicode_tables.inc.
 
-NFKD = Normalization Form KD (Compatibility Decomposition): the Unicode
-normalization that splits each character into its compatibility-equivalent
-sequence of base letter + combining marks, then orders the marks by
-canonical combining class.  For example "ñ" (U+00F1) decomposes to
-"n" (U+006E) + "˜" (U+0303), and the ligature "ﬁ" (U+FB01) decomposes to
-"f" (U+0066) + "i" (U+0069).  The MTL grapheme tokenizer uses NFKD so
-accented or precomposed characters in the input always tokenize to the
-same underlying letter sequence the model was trained on, regardless of
-how the source text encoded them.  See Unicode Annex #15 for the full
-definition.
-
-Run once and commit the output. Covers tier-1 language characters:
-Latin-1 Supplement, Latin Extended A/B/Additional, IPA Extensions,
-Spacing Modifier Letters, Combining Diacritics, Greek, Greek Extended,
-Cyrillic, Arabic Presentation Forms, Hangul compatibility jamo,
-Halfwidth/Fullwidth, General Punctuation, Superscripts/Subscripts.
-
-Hangul syllables (U+AC00..U+D7A3) are decomposed algorithmically at runtime.
-
-The CCC table covers the entire Unicode codepoint space (it's only ~900
-entries because most codepoints have ccc=0) so canonical_reorder() in the
-C++ tokenizer matches `unicodedata.combining(...)` exactly.
-"""
 import unicodedata
 import sys
 from pathlib import Path
@@ -56,13 +31,13 @@ RANGES = [
 
 
 def main():
-    nfkd_entries = []  # list of (cp, [cp_decomp...])
-    lower_entries = []  # list of (cp, [cp_lower...])
+    nfkd_entries = []
+    lower_entries = []
 
     for lo, hi in RANGES:
         for cp in range(lo, hi + 1):
             ch = chr(cp)
-            # Skip surrogates, unassigned
+
             try:
                 cat = unicodedata.category(ch)
             except Exception:
@@ -78,10 +53,10 @@ def main():
             if low != ch:
                 lower_entries.append((cp, [ord(c) for c in low]))
 
-    # Canonical Combining Class — sweep all codepoints, keep only ccc != 0.
-    # Sweep is exhaustive (0..0x10FFFF) but the result is small (~900 entries
-    # in Unicode 16) because most codepoints are ccc=0.  Skip surrogates.
-    ccc_entries = []  # list of (cp, ccc)
+
+
+
+    ccc_entries = []
     for cp in range(0, 0x110000):
         if 0xD800 <= cp <= 0xDFFF:
             continue
@@ -89,9 +64,9 @@ def main():
         if ccc != 0:
             ccc_entries.append((cp, ccc))
 
-    # Flatten decomposition data into a single codepoint array with (offset, len).
+
     nfkd_data = []
-    nfkd_table = []  # (cp, offset, len)
+    nfkd_table = []
     for cp, decomp in nfkd_entries:
         off = len(nfkd_data)
         nfkd_data.extend(decomp)

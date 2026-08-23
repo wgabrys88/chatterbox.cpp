@@ -1,26 +1,4 @@
 #!/usr/bin/env bash
-# scripts/bench-m4-validation.sh
-#
-# Self-contained bench + parity harness for the §3.24–§3.30 Metal portfolio.
-# Intended to run on M4 Air / M4 Pro / iPad Pro or any Apple-silicon Mac.
-# The §3.27 / §3.28 / §3.30 kernel work is predicted to be proportionally
-# larger win on M4 vs the M3 Ultra reference (neutral on M3U due to the
-# chip's very low per-dispatch overhead + high core count).  This script
-# lets you either confirm or falsify that prediction with one command.
-#
-# Usage:
-#
-#   # From a fresh clone of chatterbox.cpp @ multilingual_merged:
-#   cd chatterbox.cpp
-#   # Grab the voice fixture (any 16 kHz WAV; jfk.wav is the reference):
-#   scp <m3u>:/tmp/jfk.wav /tmp/jfk.wav
-#   # Make sure you have the model GGUFs (14 GB total):
-#   #   models/chatterbox-t3-mtl-q4_0.gguf
-#   #   models/chatterbox-s3gen-mtl-q4_0_hift_f16_v2.gguf
-#   bash scripts/bench-m4-validation.sh 2>&1 | tee m4-bench.log
-#
-# Compares current hardware results to the M3 Ultra reference
-# captured in PROGRESS §3.30.  Writes JSON to artifacts/bench/ for archiving.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,7 +13,6 @@ REF_WAV="${REF_WAV:-/tmp/jfk.wav}"
 OUT_DIR="${OUT_DIR:-artifacts/bench}"
 RUNS="${RUNS:-5}"
 
-# M3 Ultra reference numbers (post-§3.30, 5 invocations averaged)
 M3U_CFM_MS=534.0
 M3U_S3GEN_MS=706.6
 M3U_T3_MS=432.6
@@ -86,7 +63,6 @@ fi
 echo ""
 echo "=== Bench: ${RUNS} invocations (Q4_0 + HiFT F16 v2, ES prompt, seed 42) ==="
 
-# Collect per-invocation stats
 CFM_MS=()
 S3GEN_MS=()
 T3_MS=()
@@ -125,7 +101,6 @@ for i in $(seq 1 "$RUNS"); do
         "$i" "${cfm:-?}" "${s3gen:-?}" "${t3:-?}" "${hift:-?}" "${md5:0:12}"
 done
 
-# Compute means (awk — no bash floats)
 mean() {
     printf '%s\n' "$@" | awk 'BEGIN{s=0;n=0} {s+=$1; n++} END{if (n>0) printf "%.1f", s/n; else print "?"}'
 }
@@ -143,8 +118,6 @@ printf "%-20s %15.1f %15s %15s\n" "S3GEN_INFER_MS"  "$M3U_S3GEN_MS" "$S3GEN_MEAN
 printf "%-20s %15.1f %15s %15s\n" "T3_INFER_MS"     "$M3U_T3_MS"    "$T3_MEAN"    "$(awk -v a=$T3_MEAN    -v b=$M3U_T3_MS    'BEGIN{d=a-b; r=(d/b)*100; printf "%+.1f (%+.1f%%)", d, r}')"
 printf "%-20s %15.1f %15s %15s\n" "[hift_decode] ms" "$M3U_HIFT_MS"  "$HIFT_MEAN"  "$(awk -v a=$HIFT_MEAN  -v b=$M3U_HIFT_MS  'BEGIN{d=a-b; r=(d/b)*100; printf "%+.1f (%+.1f%%)", d, r}')"
 
-# MD5 comparison: all runs must produce identical output (determinism) and
-# the value must match the M3 Ultra reference (byte-exactness across chips).
 UNIQUE_MD5=$(printf '%s\n' "${MD5S[@]}" | sort -u | wc -l | tr -d ' ')
 FIRST_MD5="${MD5S[0]}"
 
@@ -166,7 +139,6 @@ else
     echo "   listen to /tmp/cb_m4_1.wav to verify audio sounds correct)"
 fi
 
-# Write JSON summary
 JSON="$OUT_DIR/m4-validation.json"
 cat > "$JSON" <<EOF
 {

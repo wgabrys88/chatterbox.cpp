@@ -1,11 +1,5 @@
-// Validation harness for the MTL tokenizer C++ port.
-//
-// Usage:
-//   ./build/test-mtl-tokenizer <tokenizer.json> <golden.json>
-//
-// The golden JSON is produced by scripts/compare-mtl-tokenizer.py. If it is
-// missing, the test is skipped (returns 0) so CI can land the binary before
-// the fixtures arrive.
+
+
 
 #include "mtl_tokenizer.h"
 
@@ -226,7 +220,7 @@ static std::string format_ids(const std::vector<int32_t> & ids) {
     return s;
 }
 
-} // namespace
+}
 
 int main(int argc, char ** argv) {
     if (argc < 3) {

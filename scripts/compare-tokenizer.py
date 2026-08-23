@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare C++ GPT-2 BPE tokenizer output against Python reference."""
+
 
 import argparse
 import subprocess
@@ -25,8 +25,6 @@ TEST_CASES = [
 
 
 def c_tokenize(binary: Path, gguf_model: Path, text: str) -> list[int]:
-    """Call the tts-cli binary with --dump-tokens-only to get C++ tokens.
-    The GGUF must embed the tokenizer (standard tokenizer.ggml.* metadata)."""
     result = subprocess.run(
         [str(binary), "--model", str(gguf_model),
          "--text", text, "--dump-tokens-only"],

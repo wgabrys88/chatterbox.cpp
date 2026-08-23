@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-Convert the multilingual Chatterbox T3 (t3_mtl23ls_v2) weights to GGUF.
 
-Parallels scripts/convert-t3-turbo-to-gguf.py, adapted to:
- - Llama 520M backbone (30 layers, RoPE llama3 scaling) instead of GPT-2 medium
- - Tokenizer: grapheme_mtl_merged_expanded_v1 (embedded as raw JSON blob)
- - T3 cond enc with perceiver resampler + emotion_adv projection
- - VoiceEncoder weights from ve.pt (torch state_dict)
-"""
 
 import argparse
 import importlib.util
@@ -25,10 +17,6 @@ from safetensors.torch import load_file
 
 
 def _load_requantize_policy():
-    """Load should_quantize + _QUANT_TYPE from requantize-gguf.py (single
-    source of truth shared with convert-s3gen-to-gguf.py and the offline
-    requantize tool).  Keeps the deny-list in one place so adding a new
-    tensor name to T3 doesn't accidentally leak into a quantised slot."""
     path = Path(__file__).resolve().parent / "requantize-gguf.py"
     spec = importlib.util.spec_from_file_location("_chatterbox_requantize_policy", path)
     if spec is None or spec.loader is None:
@@ -52,11 +40,11 @@ ALLOW_PATTERNS = [
     "Cangjie5_TC.json",
 ]
 
-# All language codes the *Python reference tokenizer* accepts. The C++
-# tokenizer in src/mtl_tokenizer.cpp only honors the tier-1 subset (18
-# of these); the other 5 (ja, he, ru, zh, hi) need external preprocessing
-# (pykakasi / dicta / russian_text_stresser / Cangjie) and hard-error at
-# runtime. See mtl_tokenizer::supported_languages() for the runtime list.
+
+
+
+
+
 ALL_KNOWN_LANGUAGES = [
     "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi",
     "it", "ja", "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv",
@@ -122,28 +110,6 @@ def as_numpy(tensor: torch.Tensor, *, dtype=None, transpose: bool = False) -> np
 
 
 def add_maybe_quantized(writer: "gguf.GGUFWriter", name: str, array: np.ndarray, quant: str) -> str:
-    """Write a tensor; quantise eligible big 2-D float weights when
-    quant != f16.  Eligibility is decided by `should_quantize()` in
-    scripts/requantize-gguf.py — single source of truth shared with
-    convert-s3gen-to-gguf.py and the offline requantize tool.
-
-    Concretely, for the T3 MTL tensor set this means q8_0/q5_0/q4_0
-    quantises:
-      - model/h{i}/attn/{q,k,v,o}/w
-      - model/h{i}/mlp/{gate,up,down}/w
-      - chatterbox/{text,speech}_head
-      - chatterbox/cond_spkr/w
-      - chatterbox/perceiver/pre_attention_query
-      - chatterbox/perceiver/attn/{to_q,to_k,to_v,proj_out}/w
-    and keeps full precision on:
-      - all norms / biases (matched by `/g`, `/b`, `/norm/`, `/ln_`)
-      - text/speech token embedding tables (`text_emb`, `speech_emb`)
-      - text/speech positional embedding tables (`pos_emb`)
-      - voice_encoder/* and chatterbox/builtin/* (whole subtrees)
-      - chatterbox/emotion_adv_fc/w (fails the rank/alignment gate; ne[0]=1)
-
-    Returns the storage dtype as a short string for the BENCH log.
-    """
     if quant == "f16":
         writer.add_tensor(name, array)
         return str(array.dtype)
@@ -160,16 +126,15 @@ def add_maybe_quantized(writer: "gguf.GGUFWriter", name: str, array: np.ndarray,
 
 
 def map_llama_layer(name: str):
-    """Return (gguf_name, dtype, transpose) for a Llama backbone tensor, or None."""
     m = LAYER_RE.match(name)
     if not m:
         return None
     idx = int(m.group(1))
     suffix = m.group(2)
-    # Llama uses nn.Linear everywhere. PyTorch stores those as (out, in);
-    # ggml's axis reversal (numpy.shape[0] <-> ne[1]) already gives us (in, out)
-    # for free, so no explicit transpose is needed and the assertion
-    # ggml_can_mul_mat(weight, x) (ne[0] must match) lines up correctly.
+
+
+
+
     table = {
         "input_layernorm.weight":          ("model/h{}/ln_attn/g", torch.float32, False),
         "post_attention_layernorm.weight": ("model/h{}/ln_mlp/g",  torch.float32, False),
@@ -188,7 +153,6 @@ def map_llama_layer(name: str):
 
 
 def map_tensor(name: str):
-    """Map any T3 state dict key to (gguf_name, dtype, transpose) or None to skip."""
     mapped = map_llama_layer(name)
     if mapped is not None:
         return mapped
@@ -240,10 +204,10 @@ def write_metadata(writer: gguf.GGUFWriter, quant: str) -> None:
     writer.add_embedding_length(N_EMBD)
     writer.add_block_count(N_LAYER)
     writer.add_head_count(N_HEAD)
-    # Note: vocab size goes through `chatterbox.text_vocab_size` only (read
-    # by the C++ loader as KEY_TEXT_VOCAB_SIZE).  Skipping the GGUF-standard
-    # `general.vocab_size` keeps a single canonical source so a future
-    # converter can't have the two metadata entries drift.
+
+
+
+
 
     writer.add_string("chatterbox.variant", "t3_mtl")
     writer.add_string("chatterbox.backbone", "llama_520m")

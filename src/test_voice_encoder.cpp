@@ -1,7 +1,5 @@
-// Validation harness for the C++ VoiceEncoder port.
-//
-// Usage:
-//   ./build/test-voice-encoder T3.gguf REF.wav SPEAKER_EMB.npy
+
+
 
 #include "voice_encoder.h"
 #include "voice_features.h"
@@ -45,7 +43,7 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "[3/3] running VoiceEncoder\n");
     std::vector<float> emb;
-    if (!voice_encoder_embed(wav, w, /*backend=*/ nullptr, emb)) return 1;
+    if (!voice_encoder_embed(wav, w,  nullptr, emb)) return 1;
     fprintf(stderr, "      C++ speaker_emb size=%zu\n", emb.size());
 
     npy_array ref = npy_load(ref_path);

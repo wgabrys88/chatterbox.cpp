@@ -1,16 +1,5 @@
-// CLI entry point + CLI-specific helpers for the tts-cpp executable.
-//
-// This file is part of the tts-cpp static library build, but none of its
-// symbols are referenced by the Engine API in
-// `include/tts-cpp/chatterbox/engine.h`.  Consumers that link libtts-cpp.a
-// purely for `tts_cpp::chatterbox::Engine` pay nothing for the CLI code:
-// the object file produced from this translation unit is left out of the
-// final link by the linker's standard static-archive dead-code rule.
-//
-// Split out of src/main.cpp so the Engine-only TUs
-// (chatterbox_engine.cpp + the T3 helpers still in main.cpp) stay lean
-// and don't drag in the CLI's argv parser, signal handlers, live-input
-// reader, save-voice dumper, multi-segment crossfade logic, etc.
+
+
 
 #include "gpt2_bpe.h"
 #include "mtl_tokenizer.h"
@@ -78,14 +67,7 @@ static bool file_exists(const std::string & path) {
     return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
-// Sanity-check a --reference-audio file before we kick off the full voice-
-// cloning pipeline.  The Python reference asserts `len(ref) / sr > 5.0` and
-// fails hard otherwise; we silently accept any length, but produce undersized
-// conditioning tensors (prompt_token=125 instead of 250, etc.) which falls
-// back on whatever is in the built-in voice slots.  That's misleading — give
-// a clear error instead.  Recommended length is 10–15 seconds.
-// Minimal 16-bit PCM WAV writer; matches the one in chatterbox_tts.cpp / mel2wav.cpp.
-// Used by the streaming synthesis path to write the final concatenated wav.
+
 static void stream_write_wav(const std::string & path, const std::vector<float> & wav, int sr) {
     std::ofstream f(path, std::ios::binary);
     if (!f) { fprintf(stderr, "error: cannot write %s\n", path.c_str()); return; }
@@ -103,11 +85,7 @@ static void stream_write_wav(const std::string & path, const std::vector<float> 
     }
 }
 
-// Emit a chunk of float samples to stdout as raw 16-bit little-endian PCM
-// and flush so downstream players hear it immediately (stdio buffers would
-// otherwise hold up to 4-8 KB, stalling real-time playback at chunk
-// boundaries).  Used by `--out -` streaming mode; callers pipe into e.g.
-// `ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -`.
+
 static void stream_emit_pcm_stdout(const std::vector<float> & wav) {
     for (float v : wav) {
         int s = (int)std::lround(v * 32767.0f);
@@ -118,32 +96,14 @@ static void stream_emit_pcm_stdout(const std::vector<float> & wav) {
     std::fflush(stdout);
 }
 
-// Split `text` into TTS-friendly segments of at most `max_chars` characters.
-//
-// Motivation: Chatterbox Turbo's T3 was trained on utterances of 5–15 s and
-// degrades (prosody drift, hallucinated phonemes, timbre wandering) on much
-// longer autoregressive outputs.  Reproducible on every backend (ggml / ONNX
-// / upstream Python).  The only reliable fix is sentence-level segmentation
-// above the model.
-//
-// The splitter does three passes:
-//   1. Break at `. ? !` followed by whitespace / EOF.
-//   2. For any sentence longer than `max_chars`, break further at `, : ;`
-//      (preferring boundaries past max_chars/2 so we don't fragment into
-//      unpronouncable stubs).  Last-resort: hard-break every max_chars.
-//   3. Greedily merge consecutive short fragments forward while their
-//      combined length stays <= max_chars, so very short sentences ride
-//      with their neighbours rather than stand alone.
-//
-// Abbreviations like "e.g." are not treated specially; in practice the
-// greedy merge pass absorbs false splits on them back into the next segment.
+
 static std::vector<std::string> split_text_for_tts(const std::string & text, int max_chars) {
     std::vector<std::string> out;
     if (text.empty() || max_chars <= 0) { out.push_back(text); return out; }
 
     auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
 
-    // Pass 1: sentence split.
+
     std::vector<std::string> sentences;
     {
         std::string cur;
@@ -166,7 +126,7 @@ static std::vector<std::string> split_text_for_tts(const std::string & text, int
         if (!cur.empty()) sentences.push_back(cur);
     }
 
-    // Pass 2: refine any sentence longer than max_chars.
+
     std::vector<std::string> refined;
     refined.reserve(sentences.size());
     for (auto & s : sentences) {
@@ -188,8 +148,8 @@ static std::vector<std::string> split_text_for_tts(const std::string & text, int
                 continue;
             }
             if ((int)acc.size() >= max_chars) {
-                // Last-resort hard break at a space if we can find one in the
-                // tail quarter; otherwise just cut.
+
+
                 size_t back = acc.size();
                 while (back > (size_t)(max_chars * 3 / 4) && !is_ws((unsigned char)acc[back - 1])) --back;
                 if (back <= (size_t)(max_chars / 2)) back = acc.size();
@@ -201,7 +161,7 @@ static std::vector<std::string> split_text_for_tts(const std::string & text, int
         if (!acc.empty()) refined.push_back(acc);
     }
 
-    // Pass 3: greedy forward merge of short fragments.
+
     for (auto & s : refined) {
         if (!out.empty() && (int)(out.back().size() + s.size()) <= max_chars) {
             out.back() += s;
@@ -210,11 +170,11 @@ static std::vector<std::string> split_text_for_tts(const std::string & text, int
         }
     }
 
-    // Strip trailing whitespace per segment.
+
     for (auto & s : out) {
         while (!s.empty() && is_ws((unsigned char)s.back())) s.pop_back();
     }
-    // Drop empty segments (paranoia).
+
     out.erase(std::remove_if(out.begin(), out.end(),
                              [](const std::string & s) { return s.empty(); }),
               out.end());
@@ -222,9 +182,7 @@ static std::vector<std::string> split_text_for_tts(const std::string & text, int
     return out;
 }
 
-// Append `src` PCM to `dst`, crossfading the last `fade_ms` of `dst` with the
-// leading `fade_ms` of `src` via a raised-cosine ramp.  Removes clicks at
-// segment seams in auto-split mode.
+
 static void append_pcm_crossfade(std::vector<float> & dst, const std::vector<float> & src,
                                  int sr, int fade_ms) {
     if (src.empty()) return;
@@ -240,26 +198,20 @@ static void append_pcm_crossfade(std::vector<float> & dst, const std::vector<flo
     const size_t ofs = dst.size() - fade_n;
     for (int i = 0; i < fade_n; ++i) {
         const float t = (float)(i + 1) / (float)(fade_n + 1);
-        const float w = 0.5f * (1.0f - std::cos((float)M_PI * t));  // 0 → 1 cosine ramp
+        const float w = 0.5f * (1.0f - std::cos((float)M_PI * t));
         dst[ofs + i] = dst[ofs + i] * (1.0f - w) + src[i] * w;
     }
     dst.insert(dst.end(), src.begin() + fade_n, src.end());
 }
 
-// Save the five voice-conditioning tensors to a directory as .npy so later
-// runs can reuse them via --ref-dir (no --reference-audio needed), skipping
-// VoiceEncoder / CAMPPlus / S3TokenizerV2 / mel-extract entirely.
-//
-// Any of the five buffers may be empty; missing ones are silently skipped
-// (we emit whatever we have and let the reuse path fall back to built-in
-// or error cleanly if a required tensor is absent).
+
 static void save_voice_profile(const std::string & dir,
                                const std::vector<float>   & speaker_emb,
                                const std::vector<int32_t> & cond_prompt_speech_tokens,
                                const std::vector<float>   & embedding,
                                const std::vector<int32_t> & prompt_token,
                                const std::vector<float>   & prompt_feat,
-                               int prompt_feat_rows /* = pf_data.size() / 80 */)
+                               int prompt_feat_rows )
 {
     struct stat st;
     if (::stat(dir.c_str(), &st) != 0) {
@@ -302,109 +254,63 @@ static void save_voice_profile(const std::string & dir,
     fprintf(stderr, "save_voice_profile: wrote %d .npy files into %s\n", n_saved, dir.c_str());
 }
 
-// --------------------------------------------------------------------------
-// CLI
-// --------------------------------------------------------------------------
 
 struct cli_params {
-    std::string model;           // T3 GGUF (required unless --tokens-file + --s3gen-gguf)
-    std::string tokens_file;     // optional pre-tokenized speech tokens (skips T3)
-    std::string text;            // input text for T3
-    std::string output;          // legacy: speech-tokens output file (if set, write tokens)
-    // S3Gen + HiFT vocoder:
-    std::string s3gen_gguf;      // enables full text → wav pipeline
-    std::string out_wav;         // wav output path (requires --s3gen-gguf)
-    std::string ref_dir;         // override built-in voice with .npy reference dump
-    std::string reference_audio; // wav file; computes prompt_feat natively in C++
-    std::string save_voice_dir;  // if set, dump the 5 conditioning tensors here for reuse
-    bool    debug          = false;  // --debug: load Python-dumped intermediates for validation
-    bool    verbose        = false;  // --verbose: per-stage profile timings (human-readable)
+    std::string model;
+    std::string tokens_file;
+    std::string text;
+    std::string output;
+
+    std::string s3gen_gguf;
+    std::string out_wav;
+    std::string ref_dir;
+    std::string reference_audio;
+    std::string save_voice_dir;
+    bool    debug          = false;
+    bool    verbose        = false;
     bool    dump_tokens_only = false;
     int32_t seed           = 0;
     int32_t n_threads      = std::min(4, (int32_t) std::thread::hardware_concurrency());
-    int32_t n_predict      = 1000;   // matches Python's default-ish output budget for paragraph-length text
+    int32_t n_predict      = 1000;
     int32_t n_ctx          = 0;
     int32_t n_gpu_layers   = 0;
-    // Sampling defaults matched to ChatterboxTurboTTS.generate() in tts_turbo.py:
-    //   temperature=0.8, top_k=1000, top_p=0.95, repetition_penalty=1.2
-    // The previous greedy defaults (top_k=1) collapse into silence-token
-    // repetition loops on any non-trivial text.
+
+
     int32_t top_k          = 1000;
     float   top_p          = 0.95f;
     float   temp           = 0.8f;
     float   repeat_penalty = 1.2f;
-    // Experimental: route CFM flash-attn through the F32 Q + F16 K/V path
-    // so backends with `flash_attn_f32_f16` (Adreno OpenCL) dispatch the
-    // mixed-precision kernel.  Opt-in mobile latency knob.  See PROGRESS.md
-    // "OpenCL / Adreno bring-up".
+
+
     bool    cfm_f16_kv_attn = false;
 
-    // Multilingual-only knobs. Python ChatterboxMultilingualTTS.generate()
-    // defaults: cfg_weight=0.5, temperature=0.8, repetition_penalty=2.0,
-    // min_p=0.05, top_p=1.0 (top_k unused).
-    float       cfg_weight   = 0.5f;   // classifier-free guidance strength
-    float       min_p        = 0.05f;  // minimum-probability warp (0 = off)
-    std::string language;              // tier-1 lang code when variant = t3_mtl
-    float       exaggeration = 0.5f;   // emotion_adv scalar (0..1)
 
-    // Streaming synthesis (PROGRESS.md B1).  When > 0, speech tokens from
-    // T3 are fed to S3Gen+HiFT in chunks of this size, with `cache_source`
-    // carried across chunks for phase continuity and `trim_fade` only on
-    // chunk 0.  Chunks are concatenated in memory and written to --out when
-    // the loop finishes, or piped to stdout as soon as each chunk finishes
-    // when --out is "-".  No per-chunk files are ever written.
+    float       cfg_weight   = 0.5f;
+    float       min_p        = 0.05f;
+    std::string language;
+    float       exaggeration = 0.5f;
+
+
     int32_t stream_chunk_tokens       = 0;
-    // Optional: override first-chunk size (typically smaller than
-    // stream_chunk_tokens so first-audio-out is fast, then the pipeline
-    // switches to larger chunks to amortise the fixed per-chunk overhead).
-    // 0 → same as stream_chunk_tokens.
+
+
     int32_t stream_first_chunk_tokens = 0;
-    // Optional: override CFM Euler step count for streaming chunks.  Defaults
-    // to 2 (matches Python's meanflow); setting 1 halves CFM cost at the
-    // price of a bit of extra high-frequency noise.
+
+
     int32_t stream_cfm_steps          = 0;
-    // Override CFM Euler step count for non-streaming synthesis.  Defaults
-    // to 0 (= use the GGUF's `n_timesteps`: 10 for Multilingual standard
-    // CFM, 2 for Turbo's meanflow).  Lowering N (e.g. 7-8 on Multilingual)
-    // reduces S3Gen wall-clock proportionally; the §3.21 sweep documents
-    // the audio-cosine knee.  Streaming uses --stream-cfm-steps instead.
+
+
     int32_t cfm_steps                 = 0;
 
-    // Auto-split the input text into sentences before running the pipeline.
-    // Chatterbox Turbo's T3 degrades badly on autoregressive outputs longer
-    // than ~15 s (well outside its training distribution), so anything over
-    // a few sentences comes out as garbled prosody, hallucinated phonemes
-    // or drifting timbre — regardless of backend (reproduced on Python and
-    // ONNX too).  Splitting at sentence boundaries keeps each T3 call
-    // in-distribution.  Segments are concatenated with a short raised-cosine
-    // crossfade at the seams.
-    //
-    //   max_sentence_chars      Target length per segment in characters.
-    //                           When a sentence exceeds this, we split
-    //                           further at `, : ;`.  Set to 0 to disable
-    //                           auto-split entirely (single-shot, old
-    //                           behaviour; matches --no-auto-split).
-    //                           Default 180 ≈ 5–8 s of audio.
-    //
-    //   crossfade_ms            Raised-cosine crossfade length at segment
-    //                           seams, in ms.  Default 30.
+
     int32_t max_sentence_chars        = 180;
     int32_t crossfade_ms              = 30;
 
-    // Incremental streaming input.  When --input-file PATH is set, the binary
-    // opens PATH for reading and follows it with tail -f semantics: as soon as
-    // a complete sentence (ending in . ! ? or \n) has been read, it's
-    // tokenised, fed to T3, and the resulting speech tokens are streamed
-    // through S3Gen + HiFT to stdout.  Intended for pairing with an upstream
-    // process (a streaming LLM, a live transcription, a human typing, …) that
-    // writes text to the file while we synthesise it.
-    //
-    // Requires --s3gen-gguf, --stream-chunk-tokens > 0, --out -.
-    // Exclusive with --text / --tokens-file.
+
     std::string input_file;
-    std::string input_eof_marker;        // optional; stops reading when seen
-    bool        input_by_line    = false; // one request per \n; don't split
-                                          // on . ! ? within a line
+    std::string input_eof_marker;
+    bool        input_by_line    = false;
+
 };
 
 static int32_t sample_next_token(
@@ -528,10 +434,8 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
             if (i + 1 >= argc) { fprintf(stderr, "error: %s requires an argument\n", flag); return nullptr; }
             return argv[++i];
         };
-        // Safe numeric parsers: turn std::stoi / std::stof "no conversion"
-        // exceptions into a user-friendly error + clean exit.  Catches the
-        // common mistake of a flag being followed by *another flag* because
-        // the intended value was forgotten (e.g. `--n-gpu-layers --out ...`).
+
+
         auto parse_int = [&](const char * flag, int32_t & out) -> bool {
             auto v = next(flag);
             if (!v) return false;
@@ -617,12 +521,8 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--dump-tokens-only") { params.dump_tokens_only = true; }
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); std::exit(0); }
         else {
-            // Surface two common shell typos that would otherwise produce
-            // cryptic messages: (a) an argument that's entirely whitespace
-            // — symptom of `\<space>` at end of a continuation line, the
-            // backslash escapes the space instead of the newline; (b) a
-            // leading backslash on the arg itself, symptom of the same
-            // thing on the previous line.
+
+
             bool all_ws = !arg.empty();
             for (char c : arg) if (!std::isspace((unsigned char)c)) { all_ws = false; break; }
             if (all_ws) {
@@ -649,13 +549,13 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         }
         return true;
     }
-    // Bake-only mode: just save the 5 voice tensors and exit.
+
     const bool bake_only = !params.save_voice_dir.empty()
                         && !params.reference_audio.empty()
                         && params.text.empty()
                         && params.tokens_file.empty();
-    // If we're only doing the S3Gen+HiFT back half (user already has speech tokens),
-    // --model (T3) is optional; otherwise it's required.
+
+
     const bool skip_t3 = !params.s3gen_gguf.empty() && !params.tokens_file.empty() && params.text.empty();
     if (!skip_t3 && !bake_only && params.model.empty()) {
         fprintf(stderr, "error: --model is required (pass --s3gen-gguf + --tokens-file to skip T3, "
@@ -690,9 +590,6 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
     return true;
 }
 
-// --------------------------------------------------------------------------
-// I/O helpers
-// --------------------------------------------------------------------------
 
 static std::vector<int32_t> read_token_file(const std::string & path) {
     std::ifstream fin(path);
@@ -713,38 +610,29 @@ static void write_token_file(const std::string & path, const std::vector<int32_t
     fout << '\n';
 }
 
-// --------------------------------------------------------------------------
-// GGUF helpers
 
 int tts_cpp_cli_main(int argc, char ** argv) {
     ggml_time_init();
     cli_params params;
     if (!parse_args(argc, argv, params)) {
-        // Don't dump the full usage here — parse_args already printed the
-        // specific error (missing / malformed value, unknown flag).  Dumping
-        // ~90 lines of option descriptions below it just pushes the actual
-        // message off-screen.  Point users at --help if they want it.
+
+
         fprintf(stderr, "Run `%s --help` for the full list of options.\n", argv[0]);
         return 1;
     }
 
-    // Apply the log filter BEFORE any ggml_backend_*_init() runs, otherwise
-    // Metal / Vulkan device-init messages leak out.
+
     g_log_verbose = params.verbose ? 1 : 0;
     ggml_log_set(chatterbox_log_cb, nullptr);
 
     try {
-        // Early preflight: if the user supplied --reference-audio, make sure
-        // it's long enough for real voice cloning.  Bail out now with a clear
-        // message instead of silently falling back on the built-in voice when
-        // the conditioning tensors come out undersized.
+
+
         if (!params.reference_audio.empty()) {
             if (!validate_reference_audio(params.reference_audio)) return 1;
         }
 
-        // Bake-only mode: user passed --reference-audio + --save-voice but no
-        // text to synthesise.  Compute the five voice tensors, dump them, and
-        // exit.  Later runs can reuse with --ref-dir DIR (no preprocessing).
+
         if (!params.save_voice_dir.empty()
             && !params.reference_audio.empty()
             && params.text.empty()
@@ -753,10 +641,10 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 fprintf(stderr, "error: --save-voice needs both --model and --s3gen-gguf\n");
                 return 1;
             }
-            // Peek cond_prompt_len out of the T3 GGUF metadata (no weight load).
-            int cond_prompt_len = 375;  // Turbo default
+
+            int cond_prompt_len = 375;
             {
-                gguf_init_params gp = { /*.no_alloc=*/ true, /*.ctx=*/ nullptr };
+                gguf_init_params gp = {  true,  nullptr };
                 gguf_context * g = gguf_init_from_file(params.model.c_str(), gp);
                 if (g) {
                     int64_t id = gguf_find_key(g, KEY_COND_PROMPT_LEN);
@@ -765,13 +653,10 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 }
             }
 
-            // Voice-cloning preprocessing shares a backend: on Mac we pick
-            // Metal, on Linux + NVIDIA we pick CUDA / Vulkan.  Falls back to
-            // the ggml-cpu NEON/AVX kernels when n_gpu_layers == 0.
+
             ggml_backend_t vc_backend = init_backend(params.n_gpu_layers);
 
-            // (1) speaker_emb via VoiceEncoder (3-layer LSTM + proj + L2-norm
-            //     on the chosen backend).
+
             std::vector<float> se_bake;
             {
                 const int64_t _t0 = ggml_time_us();
@@ -788,7 +673,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 fprintf(stderr, "BENCH: VC_STAGE_speaker_emb_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
-            // (2 + 4) cond_prompt_speech_tokens + prompt_token via S3TokenizerV2.
+
             std::vector<int32_t> pt_bake, ct_bake;
             {
                 const int64_t _t0 = ggml_time_us();
@@ -799,7 +684,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 fprintf(stderr, "BENCH: VC_STAGE_s3tokenizer_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
-            // (3) embedding via CAMPPlus.
+
             std::vector<float> emb_bake;
             {
                 const int64_t _t0 = ggml_time_us();
@@ -808,7 +693,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 fprintf(stderr, "BENCH: VC_STAGE_campplus_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
-            // (5) prompt_feat via mel_extract_24k_80.
+
             std::vector<float> pf_bake;
             int pf_rows = 0;
             {
@@ -828,7 +713,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             return 0;
         }
 
-        // Short-circuit: user gave us speech tokens directly + --s3gen-gguf. Skip T3 entirely.
+
         if (params.model.empty() && !params.s3gen_gguf.empty() && !params.tokens_file.empty()) {
             std::vector<int32_t> speech_tokens = read_token_file(params.tokens_file);
             if (speech_tokens.empty()) throw std::runtime_error("empty speech tokens file");
@@ -849,36 +734,31 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                                                 opts.prompt_feat_rows_override,
                                                 params.verbose))
                     throw std::runtime_error("failed to compute prompt_feat from --reference-audio");
-                // Best-effort: try to compute the S3Gen `embedding` natively too.
-                // Falls through to ref_dir/embedding.npy if the s3gen GGUF is pre-A1-2d-a.
+
+
                 (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf,
                                                opts.embedding_override,
-                                               /*backend=*/nullptr, params.verbose);
-                // And the S3Gen-side prompt_token via S3TokenizerV2 (Phase 2e).
-                // No backend available in this path yet (we haven't loaded T3);
-                // fall back to ggml-cpu.  Callers going through the bake path
-                // above or the main T3 path below pass the real backend.
+                                               nullptr, params.verbose);
+
+
                 std::vector<int32_t> dummy_cond;
                 (void)compute_speech_tokens_native(params.reference_audio, params.s3gen_gguf,
-                                                   /*max_cond_tokens=*/-1,
+                                                   -1,
                                                    opts.prompt_token_override, dummy_cond,
-                                                   params.n_threads, /*backend=*/nullptr,
+                                                   params.n_threads, nullptr,
                                                    params.verbose);
             }
             return s3gen_synthesize_to_wav(speech_tokens, opts);
         }
 
-        // Load model first so we can use the GGUF-embedded tokenizer (if any).
+
         chatterbox_model model;
         const int64_t _t3_load_t0 = ggml_time_us();
         if (!load_model_gguf(params.model, model, params.n_ctx, params.n_gpu_layers)) return 1;
         const int64_t _t3_load_ms = (ggml_time_us() - _t3_load_t0) / 1000;
         fprintf(stderr, "BENCH: T3_LOAD_MS=%lld\n", (long long)_t3_load_ms);
 
-        // Warm the S3Gen GGUF cache in the background while T3 inference
-        // runs.  This cuts first-audio-out latency by ~700 ms in streaming
-        // mode — by the time T3 emits its first chunk of tokens, S3Gen is
-        // already in RAM with its tensors allocated on the right backend.
+
         std::thread s3gen_preload_thread;
         if (!params.s3gen_gguf.empty()) {
             s3gen_preload_thread = std::thread([path = params.s3gen_gguf,
@@ -887,16 +767,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             });
         }
 
-        // Voice-profile override on the T3 side.  We resolve two tensors
-        // independently:
-        //
-        //   speaker_emb           — take from ref_dir/speaker_emb.npy if
-        //                           available, otherwise compute in C++ from
-        //                           --reference-audio via VoiceEncoder.
-        //   cond_prompt_tokens    — only available from ref_dir (until the
-        //                           S3TokenizerV2 C++ port in Phase 2e).
-        //
-        // The S3Gen side is overridden later inside s3gen_synthesize_to_wav.
+
         bool have_se = false, have_ct = false;
         std::vector<float>   se_data;
         std::vector<int32_t> ct_data;
@@ -927,8 +798,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     throw std::runtime_error("failed to load --reference-audio for VoiceEncoder");
                 normalise_lufs(wav, sr, -27.0);
                 if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
-                // Reuse the T3 backend — already loaded & sitting on the GPU
-                // at this point in the flow.
+
+
                 if (!voice_encoder_embed(wav, vew, model.backend, se_data))
                     throw std::runtime_error("VoiceEncoder forward failed");
                 have_se = true;
@@ -939,19 +810,16 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             }
         }
 
-        // Speech-token overrides: compute both cond_prompt_speech_tokens
-        // (T3 side) and prompt_token (S3Gen side, stashed for later) via
-        // the C++ S3TokenizerV2 port if --reference-audio is given and the
-        // s3gen GGUF has the tokenizer weights (Phase 2e).
+
         std::vector<int32_t> prompt_token_from_ref;
         bool ct_from_cpp = false;
         if (!have_ct && !params.reference_audio.empty() && !params.s3gen_gguf.empty()) {
             std::vector<int32_t> cond_tokens;
             if (compute_speech_tokens_native(params.reference_audio, params.s3gen_gguf,
-                                             /*max_cond_tokens=*/model.hparams.cond_prompt_len,
+                                             model.hparams.cond_prompt_len,
                                              prompt_token_from_ref, cond_tokens,
                                              params.n_threads,
-                                             /*backend=*/model.backend,
+                                             model.backend,
                                              params.verbose)) {
                 ct_data = std::move(cond_tokens);
                 have_ct = true;
@@ -1002,42 +870,13 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 "%s: no T3 override; keeping built-in T3 voice\n", __func__);
         }
 
-        // -----------------------------------------------------------------
-        // --input-file: incremental / tail -f streaming synthesis
-        // -----------------------------------------------------------------
-        //
-        // When --input-file is set we bypass the static --text pipeline and
-        // enter a loop that:
-        //
-        //   1. fread()s whatever bytes are currently available in the file,
-        //   2. scans for complete sentences (ending in . ! ? or newline),
-        //   3. tokenises and synthesises each sentence the moment it arrives,
-        //      streaming the resulting PCM to stdout chunk-by-chunk, and
-        //   4. sleeps briefly and polls again when the file has no new data.
-        //
-        // The file is expected to be written by another process. Termination:
-        //   - SIGINT / SIGTERM (flag is polled between reads and chunks)
-        //   - `--input-eof-marker STR` seen in the input (any text before it
-        //     is flushed and synthesised, then we exit cleanly).
-        //
-        // Because the binary doesn't have daemon/server-mode plumbing, every
-        // sentence reuses the same in-process T3 + S3Gen+HiFT state: no model
-        // reloads, no warm-up between sentences. First-audio latency for a
-        // new sentence ≈ T3 prompt eval (~100-300 ms with Metal+q8_0) +
-        // first-chunk S3Gen (~250 ms) ≈ 400-550 ms.
+
         if (!params.input_file.empty()) {
-            // Wait for the S3Gen background preload up-front so that any
-            // early-return below (fopen failure, missing tokenizer, ...)
-            // doesn't leave a joinable std::thread that std::terminate()s on
-            // destruction.
+
+
             if (s3gen_preload_thread.joinable()) s3gen_preload_thread.join();
 
-            // Free all T3-owned GPU resources before an early return.  Without
-            // this Metal's static device destructor asserts at process exit
-            // ("rsets->data count != 0") because the residency sets attached
-            // to model.buffer_w / buffer_kv are still live when the dylib
-            // tears the device down.  (S3Gen's cache registers its own
-            // atexit hook; T3 has no such hook, main() is its owner.)
+
             auto free_t3 = [&]() {
                 if (model.buffer_stack || model.ctx_stack) {
                     tts_cpp::chatterbox::detail::t3_stack_unregister(
@@ -1072,20 +911,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             gpt2_bpe bpe_live;
             bpe_live.load_from_arrays(model.tok_tokens, model.tok_merges);
 
-            // Use open()/read() on a plain fd rather than fopen()/fread()
-            // because macOS/Linux stdio keeps its own readahead buffer; once
-            // a FILE* hits EOF the buffer can happily keep returning 0 for
-            // many subsequent reads even after the writer appended new
-            // bytes and we called clearerr().  read() always asks the
-            // kernel for the current state, which is what `tail -f`
-            // semantics require.
-            //
-            // Special case: `--input-file -` means "read from stdin", so the
-            // user can run a single process, type (or pipe) text into the
-            // terminal, and hear it spoken back.  We intentionally do not
-            // open() "/dev/stdin" here because that gets a fresh fd whose
-            // initial offset is 0 on some systems, which re-reads prior
-            // bytes of the terminal session on TTYs.
+
             int in_fd;
             const bool input_from_stdin = (params.input_file == "-");
             if (input_from_stdin) {
@@ -1101,19 +927,18 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             }
             const bool stdin_is_tty = input_from_stdin && isatty(STDIN_FILENO) != 0;
 
-            // S3Gen opts: same setup as the regular streaming branch below.
+
             s3gen_synthesize_opts opts;
             opts.s3gen_gguf_path = params.s3gen_gguf;
-            opts.out_wav_path    = params.out_wav;     // "-" → stdout
+            opts.out_wav_path    = params.out_wav;
             opts.ref_dir         = params.ref_dir;
             opts.seed            = params.seed;
             opts.n_threads       = params.n_threads;
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
-            // Live-input streaming: --stream-cfm-steps takes precedence per
-            // chunk; --cfm-steps falls in as the per-chunk default below
-            // (`stream_cfm_steps > 0 ? stream_cfm_steps : cfm_steps`).
+
+
             opts.cfm_steps       = params.cfm_steps;
             opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
@@ -1124,7 +949,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     throw std::runtime_error("failed to compute prompt_feat from --reference-audio");
                 (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf,
                                                opts.embedding_override,
-                                               /*backend=*/model.backend, params.verbose);
+                                               model.backend, params.verbose);
                 if (!prompt_token_from_ref.empty()) {
                     opts.prompt_token_override = std::move(prompt_token_from_ref);
                 }
@@ -1138,7 +963,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 }
             }
 
-            // Ctrl-C / SIGTERM: set a flag the read + synth loops poll.
+
             static std::atomic<bool> live_stop{false};
             {
                 struct sigaction sa;
@@ -1183,26 +1008,21 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             fprintf(stderr, "\n=== live input: %s (%s%s) ===\n",
                     src_label, stop_hint, mode_label);
             if (stdin_is_tty) {
-                // Prompt lives on stderr so it doesn't collide with the
-                // raw-PCM stream on stdout.
+
+
                 fprintf(stderr, "> ");
                 fflush(stderr);
             }
 
             auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
 
-            // Pop the next complete sentence out of `pending`. Returns false
-            // if no terminator has been seen yet. When force_final is true we
-            // return whatever non-empty tail remains (used for the final
-            // flush after eof-marker / SIGINT).
+
             auto pop_sentence = [&](std::string & out, bool force_final) -> bool {
                 if (pending.empty()) return false;
                 for (size_t i = 0; i < pending.size(); ++i) {
                     char c = pending[i];
-                    // --input-by-line: only a literal newline ends a
-                    // request, so internal . ! ? stay inside the same
-                    // utterance and T3 gets the whole thing as a single
-                    // prompt (no mid-line restart + 150 ms gap).
+
+
                     if (params.input_by_line) {
                         if (c != '\n') continue;
                         size_t j = i + 1;
@@ -1216,12 +1036,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     const unsigned char nx =
                         at_end ? 0 : (unsigned char)pending[i + 1];
                     const bool nx_ws     = !at_end && is_ws(nx);
-                    // Writers that pack sentences back-to-back without a
-                    // space after the terminator (e.g. "Hello.World." from
-                    // an LLM that forgot punctuation spacing) would
-                    // otherwise bundle everything into one utterance.
-                    // Accept "<.!?> + <uppercase letter>" as a sentence
-                    // break too.
+
+
                     const bool nx_upper  = !at_end && nx >= 'A' && nx <= 'Z';
                     if (c == '\n' || at_end || nx_ws || nx_upper) {
                         size_t j = i + 1;
@@ -1236,9 +1052,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     pending.clear();
                     return !out.empty();
                 }
-                // Force-flush when the buffer overruns max_sentence_chars * 2
-                // without any punctuation, so a writer streaming word soup
-                // (no periods) still gets audio out.
+
+
                 if (params.max_sentence_chars > 0 &&
                     (int)pending.size() > params.max_sentence_chars * 2) {
                     const size_t n = (size_t)params.max_sentence_chars;
@@ -1249,23 +1064,16 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 return false;
             };
 
-            // Synthesize one sentence end-to-end: T3 -> S3Gen chunked
-            // streaming -> stdout PCM. Returns non-zero to abort the loop.
+
             auto synth_sentence = [&](const std::string & raw_sentence) -> int {
                 std::string normalized = gpt2_bpe::punc_norm(raw_sentence);
                 if (normalized.empty()) return 0;
 
-                // Reject inputs that are only punctuation / whitespace.
-                // Otherwise T3 happily hallucinates ~1-2 s of speaker-biased
-                // audio for e.g. the single token "." — which with a cloned
-                // voice can come out sounding like a word from the previous
-                // utterance (reported live: "i heard 'you?' in seg 3 audio
-                // where seg 3 was just '.'").  Nothing sensible comes out of
-                // such inputs, so just drop them and keep the prompt.
+
                 bool has_word_char = false;
                 for (unsigned char c : normalized) {
                     if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                        (c >= '0' && c <= '9') || c >= 0x80 /* UTF-8 cont */) {
+                        (c >= '0' && c <= '9') || c >= 0x80 ) {
                         has_word_char = true;
                         break;
                     }
@@ -1287,28 +1095,12 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                             segments_done + 1, preview.c_str());
                 }
 
-                // --- T3: text tokens -> speech tokens ---
-                //
-                // Re-seed the RNG deterministically per sentence.  Otherwise
-                // `rng_live` carries state across sentences: after a couple of
-                // long (hundreds-of-tokens) sentences, the RNG is in a very
-                // different state than a fresh run, and that state can
-                // combine with --repeat-penalty to shift where T3 lands on
-                // its stop token.  Deterministic per-segment reseed makes
-                // each sentence's sampling independent of the history while
-                // keeping everything reproducible (seed + segment index).
+
                 rng_live.seed((uint32_t)params.seed + (uint32_t)segments_done);
 
                 const int64_t t3_t0 = ggml_time_us();
 
-                // Same early-stop / retry loop as batch mode's
-                // run_t3_for_segment.  T3 occasionally samples
-                // stop_speech_token way too soon when the speaker
-                // conditioning is out-of-distribution - most visible
-                // with cloned voices - which manifests at the waveform
-                // level as the first / last word of a sentence being
-                // dropped.  Replay with a different RNG stream up to 3
-                // times, keep the longest result.
+
                 const int min_tokens = std::max(8, (int)(text_toks.size() * 5));
                 constexpr int MAX_RETRIES = 3;
                 auto rng_snapshot = rng_live;
@@ -1376,8 +1168,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 t3_tokens_total_live += generated.size();
                 t3_total_ms_live     += (ggml_time_us() - t3_t0) / 1000;
 
-                // --- S3Gen + HiFT streaming (same boundary + cache logic
-                //     as the multi-segment streaming path below) ---
+
                 std::vector<int32_t> seg_toks = std::move(generated);
                 for (int i = 0; i < tts_cpp::chatterbox::kS3GenLookaheadTokens; ++i) {
                     seg_toks.push_back(S3GEN_SIL);
@@ -1435,9 +1226,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     prev_mels_emitted += (int)(chunk_pcm.size() / 480);
                 }
 
-                // Short silence between sentences — keeps the downstream
-                // player's buffer fed while we wait for the next sentence
-                // to arrive on the pipe.  Also reads as a natural pause.
+
                 if (params.crossfade_ms > 0) {
                     const int gap_ms = std::max(150, 2 * params.crossfade_ms);
                     std::vector<float> gap((size_t)(sr * gap_ms / 1000), 0.0f);
@@ -1448,20 +1237,12 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 return 0;
             };
 
-            // --- Main tail -f loop ---
-            //
-            // INPUT_POLL_MS is the quiet-period sleep between read() attempts
-            // when the input file has no new bytes and between select()
-            // wake-ups on a TTY (so SIGINT is noticed without the user also
-            // pressing Enter).  25 ms gives ~25 ms first-byte latency for
-            // interactive appends, which is well below perception threshold
-            // (and the syscall is essentially free at that rate).
+
             constexpr int INPUT_POLL_MS = 25;
             int  loop_rc     = 0;
-            bool stdin_eof   = false;  // only meaningful when reading from stdin
-            // Re-prints the interactive prompt once per "ready for input"
-            // state (after start-up, and after each synthesised sentence
-            // when nothing is queued).
+            bool stdin_eof   = false;
+
+
             auto reprompt = [&]() {
                 if (stdin_is_tty && !stdin_eof && pending.empty() && !live_stop.load()) {
                     fprintf(stderr, "> ");
@@ -1469,10 +1250,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 }
             };
             while (!live_stop.load()) {
-                // For TTY stdin, read() blocks until the user types a line.
-                // Use select() with the poll timeout so SIGINT (which sets
-                // live_stop) is noticed promptly and the user doesn't need
-                // to also press Enter to exit.
+
+
                 if (stdin_is_tty) {
                     fd_set rf; FD_ZERO(&rf); FD_SET(in_fd, &rf);
                     struct timeval tv;
@@ -1500,18 +1279,15 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         }
                     }
                 } else if (r == 0 && input_from_stdin) {
-                    // EOF on stdin: the user pressed Ctrl-D (TTY) or the
-                    // upstream pipe was closed.  Drain the buffer one
-                    // last time and exit.  For regular files r == 0 just
-                    // means "no new bytes appended yet", so we only
-                    // treat it as terminal when reading from stdin.
+
+
                     stdin_eof = true;
                 }
 
-                // Drain every complete sentence currently in the buffer.
+
                 bool synthesised_any = false;
                 std::string sentence;
-                while (pop_sentence(sentence, /*force_final=*/false)) {
+                while (pop_sentence(sentence, false)) {
                     loop_rc = synth_sentence(sentence);
                     sentence.clear();
                     synthesised_any = true;
@@ -1520,9 +1296,9 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 if (loop_rc != 0) break;
 
                 if (saw_eof_marker || stdin_eof) {
-                    // Final flush: synthesise any non-terminated tail.
+
                     std::string tail;
-                    if (pop_sentence(tail, /*force_final=*/true)) {
+                    if (pop_sentence(tail, true)) {
                         loop_rc = synth_sentence(tail);
                     }
                     break;
@@ -1538,15 +1314,15 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 }
             }
 
-            // SIGINT with a non-empty buffer: flush what we have.
+
             if (live_stop.load() && !pending.empty() && loop_rc == 0) {
                 std::string tail;
-                if (pop_sentence(tail, /*force_final=*/true)) {
+                if (pop_sentence(tail, true)) {
                     (void)synth_sentence(tail);
                 }
             }
-            // On TTY stdin, leave the shell cursor on a fresh line so the
-            // post-run summary doesn't overwrite the last "> ".
+
+
             if (stdin_is_tty) {
                 fprintf(stderr, "\n");
             }
@@ -1569,13 +1345,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             return loop_rc;
         }
 
-        // ----------- Segment planning & tokenization ------------------
-        //
-        // When --text is given and --max-sentence-chars > 0, split the
-        // text into TTS-friendly segments and tokenize each separately.
-        // Auto-split is suppressed when the tokens-file path is used,
-        // when --stream-chunk-tokens requests streaming output, and when
-        // --dump-tokens-only prints a single token list.
+
         gpt2_bpe bpe;
         mtl_tokenizer mtl_tok;
         const bool is_mtl = (model.hparams.variant == CHBX_VARIANT_MTL);
@@ -1634,11 +1404,11 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             seg_text_tokens.reserve(text_segments.size());
             for (size_t si = 0; si < text_segments.size(); ++si) {
                 if (is_mtl) {
-                    // MTLTokenizer applies its own normalization (NFKD +
-                    // lowercase + language prefix); skip gpt2_bpe::punc_norm.
+
+
                     std::vector<int32_t> ids = mtl_tok.encode(text_segments[si], params.language);
-                    // Python ChatterboxMultilingualTTS.generate pads with
-                    // start_text_token (255) + ids + stop_text_token (0).
+
+
                     std::vector<int32_t> padded;
                     padded.reserve(ids.size() + 2);
                     padded.push_back(model.hparams.start_text_token);
@@ -1660,7 +1430,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 }
             }
             if (params.dump_tokens_only) {
-                // --dump-tokens-only only ever has one segment (auto-split disabled).
+
                 for (size_t i = 0; i < seg_text_tokens[0].size(); ++i) {
                     if (i) printf(",");
                     printf("%d", seg_text_tokens[0][i]);
@@ -1681,21 +1451,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     seg_text_tokens.size(), params.max_sentence_chars);
         }
 
-        // ----------- T3 autoregressive decode (per segment) ------------
-        //
-        // The KV cache is indexed by position, so calling eval_prompt again
-        // simply overwrites positions 0..prompt_len of the cache — no
-        // explicit reset needed between segments.
-        // T3 autoregressive decode is interleaved *per segment* with S3Gen
-        // below — each segment's T3 runs immediately before its own S3Gen
-        // call, not all up-front.  This gives low first-audio-out latency
-        // (T3(seg0) + first S3Gen chunk ≈ 2–3 s regardless of paragraph
-        // length) while avoiding GPU contention from running T3 and S3Gen
-        // concurrently on the same device (which doubled per-chunk wall
-        // time on Metal when we tried a concurrent background-thread T3).
-        //
-        // The per-segment T3 loop is wrapped in this closure so both the
-        // batch and streaming S3Gen branches can call it uniformly.
+
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         std::mt19937 rng(params.seed);
         const size_t N_SEG = seg_text_tokens.size();
@@ -1716,21 +1472,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 sp_mtl.cfg_weight     = params.cfg_weight;
             }
 
-            // Early-stop heuristic.  T3 occasionally samples `stop_speech_token`
-            // way too soon when the speaker conditioning is out-of-distribution
-            // (most visible with cloned voices).  Python doesn't hit this
-            // because a different RNG stream happens to dodge the bad draw;
-            // our std::mt19937 seeded the same way draws differently and
-            // sometimes lands on a truncating sequence.
-            //
-            // Guard: if T3 exits via stop-token and the output length is
-            // implausibly short vs. the input text, replay with a
-            // different RNG offset.  Floor of 8 tokens covers very short
-            // inputs ("Hi."); the 5x multiplier on BPE-token count is a
-            // conservative lower bound (Python's reference averages ~5.5x
-            // speech tokens per BPE token for English).  If every retry
-            // still comes out short, we keep the *longest* attempt rather
-            // than whatever the last draw happened to produce.
+
             const int min_tokens = std::max(8, (int)(seg_text_tokens[si].size() * 5));
             constexpr int MAX_RETRIES = 3;
             auto rng_snapshot = rng;
@@ -1738,7 +1480,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             std::vector<int32_t> generated, best_generated;
             for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt) {
                 rng = rng_snapshot;
-                rng.discard((size_t)attempt * 1009);   // move to a different RNG stream each retry
+                rng.discard((size_t)attempt * 1009);
 
                 std::vector<float> logits;
                 std::vector<float> logits_c, logits_u;
@@ -1783,14 +1525,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         : sample_next_token(logits, generated, params, rng);
                     generated.push_back(current);
 
-                    // Port of the token_repetition check in the Python
-                    // AlignmentStreamAnalyzer.  MTL T3 sometimes emits a
-                    // plausible end-of-speech silence cadence mid-utterance
-                    // and then hallucinates more low-energy content before
-                    // eventually stopping.  Three consecutive identical
-                    // tokens cleanly signal this cadence without firing on
-                    // normal speech.  Gated to MTL because the turbo
-                    // codebook has a different cadence signature.
+
                     if (is_mtl && generated.size() >= 3) {
                         size_t n = generated.size();
                         if (generated[n - 1] == generated[n - 2] &&
@@ -1811,17 +1546,10 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                             generated.size());
                 }
 
-                // Keep the longest attempt as the fallback in case every
-                // retry still comes out short.
+
                 if (generated.size() > best_generated.size()) best_generated = generated;
 
-                // The 5x speech-tokens-per-BPE-token floor was calibrated for
-                // English Turbo (GPT-2 BPE, ~5 speech tokens per text token).
-                // MTL uses the Llama tokenizer with a ~1.7x ratio, so a clean
-                // stop-token termination on a short MTL segment looks
-                // "implausible" by this heuristic and would trigger up to 3
-                // spurious retries (4x T3 wall time).  The 3x-repeated-token
-                // early-stop (above) handles MTL's catastrophic case.
+
                 const bool plausible = is_mtl || (int)generated.size() >= min_tokens;
                 if (!stopped_by_stop_token || plausible) {
                     if (attempt > 0) {
@@ -1853,9 +1581,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             seg_generated[si] = std::move(generated);
         };
 
-        // Legacy --output tokens file: run T3 on the first segment early and
-        // dump its tokens.  Downstream S3Gen for that same segment will
-        // reuse seg_generated[0] without re-running T3.
+
         if (!params.output.empty()) {
             run_t3_for_segment(0);
             write_token_file(params.output, seg_generated[0]);
@@ -1863,17 +1589,14 @@ int tts_cpp_cli_main(int argc, char ** argv) {
         std::vector<bool> seg_t3_done(N_SEG, false);
         if (!params.output.empty()) seg_t3_done[0] = true;
 
-        // Background prefetch slot for the *next* segment's T3, used by the
-        // streaming path to hide T3 cost behind the previous segment's
-        // streaming audio.  Only one prefetch is in flight at a time because
-        // run_t3_for_segment mutates the shared allocr / rng / KV cache.
+
         std::future<void> next_t3_future;
         size_t next_t3_segment = (size_t)-1;
 
         auto ensure_t3 = [&](size_t si) {
             if (seg_t3_done[si]) return;
             if (next_t3_segment == si && next_t3_future.valid()) {
-                next_t3_future.get();   // propagates exceptions from the worker
+                next_t3_future.get();
                 seg_t3_done[si] = true;
                 next_t3_segment = (size_t)-1;
                 return;
@@ -1882,9 +1605,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             seg_t3_done[si] = true;
         };
 
-        // Kick off T3 for segment `si` on a worker thread so it overlaps
-        // with the caller's ongoing S3Gen streaming.  Caller must ensure
-        // no previous prefetch is still in flight.
+
         auto prefetch_t3 = [&](size_t si) {
             if (si >= N_SEG || seg_t3_done[si] || next_t3_segment == si) return;
             next_t3_segment = si;
@@ -1893,11 +1614,10 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             });
         };
 
-        // If --s3gen-gguf is set, chain into the S3Gen + HiFT vocoder to write a wav.
+
         if (!params.s3gen_gguf.empty()) {
-            // Make sure the background preload finished before we call into
-            // s3gen_synthesize_to_wav — otherwise we race with its own lazy
-            // load and pay the ~700 ms cost anyway.
+
+
             if (s3gen_preload_thread.joinable()) s3gen_preload_thread.join();
             s3gen_synthesize_opts opts;
             opts.s3gen_gguf_path = params.s3gen_gguf;
@@ -1908,9 +1628,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             opts.debug           = params.debug;
             opts.verbose         = params.verbose;
             opts.n_gpu_layers    = params.n_gpu_layers;
-            // Non-streaming CFM Euler step count (0 = GGUF default).
-            // Streaming chunks honour --stream-cfm-steps with --cfm-steps as
-            // fallback when copts is set up further below.
+
+
             opts.cfm_steps       = params.cfm_steps;
             opts.cfm_f16_kv_attn = params.cfm_f16_kv_attn;
             if (!params.reference_audio.empty()) {
@@ -1921,13 +1640,12 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     throw std::runtime_error("failed to compute prompt_feat from --reference-audio");
                 (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf,
                                                opts.embedding_override,
-                                               /*backend=*/model.backend, params.verbose);
+                                               model.backend, params.verbose);
                 if (!prompt_token_from_ref.empty()) {
                     opts.prompt_token_override = std::move(prompt_token_from_ref);
                 }
 
-                // Optionally persist the five voice tensors to disk so later
-                // runs can reuse them via --ref-dir DIR (no --reference-audio).
+
                 if (!params.save_voice_dir.empty()) {
                     save_voice_profile(params.save_voice_dir,
                                        se_data, ct_data,
@@ -1938,12 +1656,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 }
             }
             if (params.stream_chunk_tokens <= 0 && !multi_seg) {
-                // Single-shot.  Two output modes:
-                //   --out PATH  → s3gen_synthesize_to_wav writes the wav and
-                //                 prints its own "Wrote ..." line.
-                //   --out -     → capture PCM in-memory and emit raw s16le to
-                //                 stdout (so it can be piped into `play` /
-                //                 `ffplay` without streaming mode).
+
+
                 ensure_t3(0);
                 if (params.out_wav == "-") {
                     std::vector<float> pcm;
@@ -1959,9 +1673,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     if (rc != 0) return rc;
                 }
             } else if (params.stream_chunk_tokens <= 0) {
-                // Auto-split multi-segment batch mode: render each segment
-                // into in-memory PCM, concatenate with a raised-cosine
-                // crossfade at the seams, write a single wav at the end.
+
+
                 const int sr = opts.sr ? opts.sr : 24000;
                 std::vector<float> full_pcm;
                 const int64_t _seg_t0 = ggml_time_us();
@@ -1991,23 +1704,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
                 }
             } else {
-                // Streaming synthesis.  Runs the chunked S3Gen+HiFT loop on
-                // each T3 segment.  Within a segment, `hift_cache_source`
-                // keeps SineGen phase continuous across chunks and
-                // `skip_mel_frames` trims the already-emitted mel tail.  At
-                // segment boundaries both reset: a new utterance starts, the
-                // crossfade (in file mode) or the natural sentence-break
-                // pause (in stdout mode) masks any seam.
-                //
-                // Also: resetting per segment is precisely what keeps per-
-                // chunk cost bounded — encoder and CFM only ever process the
-                // current segment's cumulative mel, which stays small
-                // (~200-300 tokens).  Single-segment streaming on a long
-                // paragraph otherwise scales linearly with total length.
-                //
-                // Mirrors scripts/dump-streaming-reference.py.  Appends 3
-                // S3GEN_SIL tokens at each segment's tail so every chunk's
-                // `append_lookahead_silence=false` is safe.
+
+
                 constexpr int S3GEN_SIL = tts_cpp::chatterbox::kS3GenSilenceToken;
 
                 const int chunk_n       = params.stream_chunk_tokens;
@@ -2027,7 +1725,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                             to_stdout ? " → stdout (raw s16le @ 24 kHz mono)" : "");
                 }
 
-                std::vector<float> full_streamed_wav;   // only used in file mode
+                std::vector<float> full_streamed_wav;
                 const double stream_t0_ms = 1e-3 * ggml_time_us();
                 double first_chunk_t_ms = -1.0;
                 int global_chunk_idx = 0;
@@ -2040,12 +1738,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     }
                     const int total_n = (int)seg_toks.size();
 
-                    // Chunk boundaries within this segment.  The small
-                    // `first_chunk_n` override only applies to the very first
-                    // segment — there it buys low first-audio-out latency.
-                    // For later segments the player already has audio queued,
-                    // so we use the bigger `chunk_n` for all chunks to keep
-                    // per-chunk RTF < 1.0 and avoid a per-segment stutter.
+
                     const int seg_first = (si == 0) ? first_chunk_n : chunk_n;
                     std::vector<int> boundaries = {0};
                     int cursor = std::min(seg_first, total_n);
@@ -2055,23 +1748,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         boundaries.push_back(cursor);
                     }
 
-                    // Absorb a short trailing chunk into the previous one.
-                    // When total_n isn't a clean multiple of the chunk
-                    // stride, the final chunk can emit only a handful of
-                    // new tokens — but S3Gen still pays the full encoder+
-                    // CFM cost on the cumulative mel, so it shows up as a
-                    // cosmetically-bad RTF (e.g. "520 ms compute for 160 ms
-                    // audio, RTF=3.25") and burns one wasted encoder+CFM
-                    // dispatch.  Merging saves ~500 ms of compute per
-                    // segment with no audible impact because the same
-                    // audio is still emitted, just in one dispatch instead
-                    // of two.
-                    //
-                    // Threshold: compute ≈ fixed (~500 ms) per chunk; audio
-                    // emitted ≈ tail_len × 40 ms.  Break-even (RTF ≈ 1) is
-                    // at ~12 tokens.  chunk_n / 3 catches anything
-                    // noticeably worse than that for the usual 25-token
-                    // stride, and scales for larger strides too.
+
                     const int min_tail = std::max(6, chunk_n / 3);
                     if (boundaries.size() >= 3) {
                         const int tail_len = boundaries.back() - boundaries[boundaries.size() - 2];
@@ -2080,7 +1757,7 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         }
                     }
 
-                    std::vector<float> hift_cache_source;       // reset per segment
+                    std::vector<float> hift_cache_source;
                     std::vector<float> seg_streamed_wav;
                     int prev_mels_emitted = 0;
                     size_t last_streamed = 0;
@@ -2103,8 +1780,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         copts.append_lookahead_silence  = false;
                         copts.finalize                  = is_last_in_seg;
                         copts.skip_mel_frames           = prev_mels_emitted;
-                        // First chunk of EACH segment gets trim_fade, masking
-                        // HiFT's per-utterance resnet cold start.
+
+
                         copts.apply_trim_fade           = (k == 1);
                         copts.hift_cache_source         = hift_cache_source;
                         std::vector<float> tail_out;
@@ -2135,23 +1812,13 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                         prev_mels_emitted  += (int)(chunk_samples / 480);
                         last_streamed = seg_streamed_wav.size();
 
-                        // Kick off T3 for the NEXT segment as soon as the
-                        // first chunk of the current segment has been emitted.
-                        // This hides the ~1–2 s T3 cost behind the remaining
-                        // S3Gen chunks so the player doesn't stall waiting
-                        // for the next segment's tokens at the boundary.
-                        // First chunk runs on a "clean" GPU so its RTF stays
-                        // low; subsequent chunks share the GPU with T3 but
-                        // the queue grown by chunk 1 absorbs the slowdown.
+
                         if (k == 1 && si + 1 < N_SEG) prefetch_t3(si + 1);
                     }
 
                     if (to_stdout) {
-                        // In stdout mode, emit a short inter-segment silence
-                        // (unless this is the final segment) so the player's
-                        // buffer stays non-empty while T3 decodes the next
-                        // segment (~1.5 s with no PCM otherwise).  The
-                        // silence reads as a natural sentence-break pause.
+
+
                         const bool more = (si + 1 < N_SEG);
                         if (more && params.crossfade_ms > 0) {
                             const int gap_ms = std::max(150, 2 * params.crossfade_ms);
@@ -2160,9 +1827,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                             stream_emit_pcm_stdout(gap);
                         }
                     } else {
-                        // File mode: concatenate segments with a raised-cosine
-                        // crossfade at each boundary, identical to the
-                        // non-streaming auto-split path.
+
+
                         append_pcm_crossfade(full_streamed_wav, seg_streamed_wav,
                                              sr, multi_seg ? params.crossfade_ms : 0);
                     }
@@ -2178,9 +1844,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
             }
         } else {
-            // Legacy: print the tokens to stdout too (handy for piping).
-            // In auto-split mode this prints the first segment's tokens only;
-            // real callers who want all segments pass --s3gen-gguf and --out.
+
+
             ensure_t3(0);
             const auto & toks = seg_generated[0];
             for (size_t i = 0; i < toks.size(); ++i) { if (i) printf(","); printf("%d", toks[i]); }

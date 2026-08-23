@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 import argparse
 import json
 import re
@@ -57,15 +58,15 @@ def as_numpy(tensor: torch.Tensor, *, dtype=None, transpose: bool = False) -> np
     return np.ascontiguousarray(array)
 
 
-# Which exported tensor names hold "big" 2-D projection weights that are
-# worth quantizing. These are the ones ggml_mul_mat will consume; their
-# inner (reduction) dimension is always a multiple of 256 for GPT-2 Medium
-# (n_embd = 1024, inner_ffn = 4096), which is the block size requirement
-# for Q4_K / Q5_K.
+
+
+
+
+
 def _is_quantizable_weight(gguf_name: str) -> bool:
     if gguf_name == "chatterbox/speech_head":
         return True
-    # Per-layer: model/h{i}/attn/c_attn/w, c_proj/w, mlp/c_fc/w, mlp/c_proj/w
+
     if gguf_name.startswith("model/h") and (
         gguf_name.endswith("/attn/c_attn/w") or
         gguf_name.endswith("/attn/c_proj/w") or
@@ -76,10 +77,10 @@ def _is_quantizable_weight(gguf_name: str) -> bool:
     return False
 
 
-# NOTE: the Python gguf 0.18 package only implements the "legacy" block
-# types (Q4_0/1, Q5_0/1, Q8_0). The K-quants (Q4_K, Q5_K, Q6_K) are
-# declared but NotImplementedError at runtime — use llama.cpp's
-# llama-quantize tool on the F16 GGUF if you need those.
+
+
+
+
 _QUANT_TYPE = {
     "q8_0": gguf.GGMLQuantizationType.Q8_0,
     "q5_0": gguf.GGMLQuantizationType.Q5_0,
@@ -88,36 +89,25 @@ _QUANT_TYPE = {
 
 
 def add_maybe_quantized(writer: "gguf.GGUFWriter", name: str, array: np.ndarray, quant: str):
-    """Pass F32/F16 arrays straight through; quantize the "big" projection
-    weights when --quant is not f16.
-    """
     if quant == "f16" or not _is_quantizable_weight(name):
         writer.add_tensor(name, array)
         return str(array.dtype)
 
     qtype = _QUANT_TYPE[quant]
-    # Block-quantized kernels consume F32 input.
+
     qdata = gguf.quants.quantize(array.astype(np.float32), qtype)
-    # GGUF writer wants the BYTE shape as raw_shape (the qdata.shape);
-    # it converts back to element shape using the quant type's block size.
+
+
     writer.add_tensor(name, qdata, raw_shape=qdata.shape, raw_dtype=qtype)
     return qtype.name
 
 
 def load_tokenizer_assets(ckpt_dir: Path):
-    """Read vocab.json + merges.txt + added_tokens.json and return arrays
-    ready to embed as GGUF metadata.
-
-    Returns (tokens, types, merges):
-      tokens:  list[str], token text indexed by token id
-      types:   list[int], gguf TokenType (1=NORMAL, 4=USER_DEFINED for added tokens)
-      merges:  list[str], BPE merge rules in "left right" format (header skipped)
-    """
     vocab_path  = ckpt_dir / "vocab.json"
     merges_path = ckpt_dir / "merges.txt"
     added_path  = ckpt_dir / "added_tokens.json"
 
-    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))  # {token: id}
+    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
     added = {}
     if added_path.exists():
         added = json.loads(added_path.read_text(encoding="utf-8"))
@@ -173,7 +163,7 @@ def map_tensor_name(name: str):
     layer_idx = int(match.group(1))
     suffix = match.group(2)
 
-    # GPT-2 Conv1D weights need transposing; biases and LayerNorm do not
+
     table = {
         "ln_1.weight": ("model/h{}/ln_1/g", torch.float32, False),
         "ln_1.bias": ("model/h{}/ln_1/b", torch.float32, False),
@@ -233,8 +223,8 @@ def main() -> None:
     writer.add_string("chatterbox.variant", "t3_turbo")
     writer.add_string("chatterbox.reference_repo", REPO_ID)
 
-    # Embed the GPT-2 BPE tokenizer so the C++ binary has no runtime dependency
-    # on vocab.json / merges.txt / added_tokens.json on disk.
+
+
     tok_tokens, tok_types, tok_merges = load_tokenizer_assets(ckpt_dir)
     writer.add_tokenizer_model("gpt2")
     writer.add_token_list(tok_tokens)
@@ -269,11 +259,11 @@ def main() -> None:
     writer.add_tensor("chatterbox/builtin/speaker_emb", as_numpy(builtin_speaker, dtype=torch.float32))
     writer.add_tensor("chatterbox/builtin/cond_prompt_speech_tokens", as_numpy(builtin_tokens))
 
-    # VoiceEncoder weights (3-layer unidirectional LSTM + Linear projection).
-    # Used by main.cpp to compute speaker_emb natively when --reference-audio
-    # is given, so no Python helper is needed at inference time.  LSTM layout
-    # is PyTorch's default: each weight_i{h,h}_l* is (4*hidden, ...) with the
-    # [i, f, g, o] gate rows stacked.
+
+
+
+
+
     ve_path = ckpt_dir / "ve.safetensors"
     if ve_path.exists():
         ve_state = load_file(ve_path)
@@ -282,7 +272,7 @@ def main() -> None:
         writer.add_uint32("voice_encoder.n_mels",        VE_INPUT)
         writer.add_uint32("voice_encoder.hidden_size",   VE_HIDDEN)
         writer.add_uint32("voice_encoder.num_layers",    3)
-        writer.add_uint32("voice_encoder.embedding_size", VE_HIDDEN)  # proj is (256, 256)
+        writer.add_uint32("voice_encoder.embedding_size", VE_HIDDEN)
         writer.add_uint32("voice_encoder.partial_frames", 160)
         writer.add_uint32("voice_encoder.sample_rate",   16000)
         writer.add_uint32("voice_encoder.n_fft",         400)
@@ -293,8 +283,8 @@ def main() -> None:
         writer.add_float32("voice_encoder.min_coverage", 0.8)
 
         for k, t in ve_state.items():
-            # Skip the cosine-similarity scaling parameters; they're only used
-            # for training/CFG and don't affect embedding extraction.
+
+
             if k.startswith("similarity_"):
                 continue
             writer.add_tensor(
@@ -302,13 +292,13 @@ def main() -> None:
                 as_numpy(t, dtype=torch.float32),
             )
 
-        # Precomputed mel filterbank for the VE mel (40 channels @ 16 kHz,
-        # n_fft=400). Matches librosa.filters.mel with fmin=0, fmax=8000.
+
+
         import librosa
         import numpy as np
         ve_mel_fb = librosa.filters.mel(
             sr=16000, n_fft=400, n_mels=40, fmin=0, fmax=8000,
-        ).astype(np.float32)  # (40, 201)
+        ).astype(np.float32)
         writer.add_tensor("voice_encoder/mel_fb",
                           np.ascontiguousarray(ve_mel_fb))
         print(f"Embedded VoiceEncoder: 14 tensors, mel_fb {ve_mel_fb.shape}")

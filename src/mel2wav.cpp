@@ -1,11 +1,5 @@
-// mel2wav: a standalone CLI that takes a mel spectrogram (.npy) and runs the
-// Chatterbox HiFTGenerator (vocoder) in pure C++/ggml to produce a 24kHz wav.
-//
-// This is the end-to-end validation for the HiFT port.  It reuses the s3gen
-// GGUF we produce with convert-s3gen-to-gguf.py.
-//
-// Usage:
-//   mel2wav --s3gen-gguf MODEL.gguf --mel-npy MEL.npy --out OUT.wav [--seed N]
+
+
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -25,7 +19,7 @@
 #include <string>
 #include <vector>
 
-// ---------- GGUF loader (same as test_s3gen.cpp) ----------
+
 struct model_ctx {
     ggml_backend_t backend = nullptr;
     ggml_context * ctx_w = nullptr;
@@ -36,7 +30,7 @@ struct model_ctx {
 static model_ctx load_s3gen_gguf(const std::string & path) {
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params gp = {  false,  &tmp_ctx };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) throw std::runtime_error("gguf_init_from_file failed: " + path);
     m.backend = ggml_backend_cpu_init();
@@ -66,7 +60,7 @@ static ggml_tensor * find_tensor(const model_ctx & m, const std::string & name) 
     return it->second;
 }
 
-// F32 conv1d via im2col + mul_mat
+
 static ggml_tensor * conv1d_f32(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor * input,
                                 int stride, int padding, int dilation) {
     ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
@@ -86,7 +80,7 @@ static ggml_tensor * conv_transpose_1d_f32(ggml_context * ctx, ggml_tensor * ker
     return ggml_cont(ctx, v);
 }
 
-// Snake activation (shape ne=[T, C] with alpha ne=[C])
+
 static ggml_tensor * snake(ggml_context * ctx, ggml_tensor * x,
                            ggml_tensor * alpha, ggml_tensor * inv_alpha) {
     ggml_tensor * a  = ggml_reshape_2d(ctx, alpha,     1, alpha->ne[0]);
@@ -106,7 +100,7 @@ static std::vector<float> invert_alpha_cpu(const model_ctx & m, const std::strin
     return inv;
 }
 
-// Reflection pad along ne[0]
+
 static ggml_tensor * reflect_pad_1d(ggml_context * ctx, ggml_tensor * x, int p_left, int p_right) {
     ggml_tensor * y = x;
     for (int i = 0; i < p_left; ++i) {
@@ -125,7 +119,7 @@ static ggml_tensor * reflect_pad_1d(ggml_context * ctx, ggml_tensor * x, int p_l
     return y;
 }
 
-// ---------- FFT kernels ----------
+
 static std::vector<float> build_hann_window(int n, bool periodic = true) {
     std::vector<float> w(n);
     double N = periodic ? (double)n : (double)(n - 1);
@@ -177,13 +171,12 @@ static std::vector<float> build_window_sum(int T_stft, int n_fft, int hop, const
     return ws;
 }
 
-// ---------- SineGen + SourceModule (CPU, produces source signal) ----------
-// Returns (T_wav,) time-domain source signal.
-static std::vector<float> sinegen_source(const std::vector<float> & f0_wav,  // (T_wav,) upsampled F0
+
+static std::vector<float> sinegen_source(const std::vector<float> & f0_wav,
                                          int sampling_rate, int harmonic_num,
                                          float sine_amp, float noise_std,
                                          float voiced_threshold,
-                                         const std::vector<float> & l_linear_w,  // (harmonic_num+1,)
+                                         const std::vector<float> & l_linear_w,
                                          float l_linear_b, uint32_t seed) {
     int T_wav = (int)f0_wav.size();
     int H = harmonic_num + 1;
@@ -192,7 +185,7 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav,  // 
     std::normal_distribution<float> gauss(0.0f, 1.0f);
 
     std::vector<float> phase_vec(H, 0.0f);
-    for (int h = 1; h < H; ++h) phase_vec[h] = uniform(rng);  // phase_vec[0] = 0
+    for (int h = 1; h < H; ++h) phase_vec[h] = uniform(rng);
 
     std::vector<float> sine_waves(H * T_wav, 0.0f);
     std::vector<double> cum_phase(H, 0.0);
@@ -211,8 +204,7 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav,  // 
         }
     }
 
-    // l_linear: (T_wav, H) @ (H,) + b -> (T_wav,); then tanh
-    // But we have sine_waves stored channel-major: sine_waves[h*T_wav + t]
+
     std::vector<float> source(T_wav, 0.0f);
     for (int t = 0; t < T_wav; ++t) {
         float s = l_linear_b;
@@ -222,7 +214,7 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav,  // 
     return source;
 }
 
-// ---------- Graph: f0_predictor (mel -> f0) ----------
+
 static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vector<float> & mel, int T_mel) {
     static size_t buf_size = 8 * 1024 * 1024;
     std::vector<uint8_t> buf(buf_size);
@@ -244,7 +236,7 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
         x = ggml_add(ctx, x, ggml_reshape_2d(ctx, b, 1, C_out));
         x = ggml_unary(ctx, x, GGML_UNARY_OP_ELU);
     }
-    ggml_tensor * xp = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));  // [512, T]
+    ggml_tensor * xp = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
     ggml_tensor * cw = find_tensor(m, "hift/f0_predictor/classifier/weight");
     ggml_tensor * cb = find_tensor(m, "hift/f0_predictor/classifier/bias");
     ggml_tensor * y = ggml_mul_mat(ctx, cw, xp);
@@ -267,7 +259,7 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
     return f0;
 }
 
-// ---------- Main HiFT graph: mel + s_stft -> wav ----------
+
 static std::vector<float> run_hift_decode(const model_ctx & m,
                                           const std::vector<float> & mel, int T_mel,
                                           const std::vector<float> & s_stft, int T_stft) {
@@ -341,7 +333,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
         return x;
     };
 
-    // conv_pre
+
     ggml_tensor * cpw = find_tensor(m, "hift/conv_pre/weight");
     ggml_tensor * cpb = find_tensor(m, "hift/conv_pre/bias");
     ggml_tensor * x = ggml_pad_ext(ctx, mel_in, 3, 3, 0, 0, 0, 0, 0, 0);
@@ -388,7 +380,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     x = conv1d_f32(ctx, cp2w, x, 1, 0, 1);
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cp2b, 1, NFFT2));
 
-    // ISTFT part: split mag/phase, compute spec, apply inverse DFT, divide by w_sum, trim
+
     size_t col_stride = x->nb[1];
     ggml_tensor * mag_log = ggml_cont(ctx, ggml_view_2d(ctx, x, T_stft, F, col_stride, 0));
     mag_log = ggml_clamp(ctx, mag_log, -1e6f, 1e2f);
@@ -439,13 +431,13 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     return wav;
 }
 
-// Graph-based STFT of the source signal (produces s_stft for run_hift_decode).
+
 static std::vector<float> run_stft(const model_ctx & m, const std::vector<float> & src) {
     const int n_fft = 16;
     const int hop = 4;
     const int F = n_fft / 2 + 1;
     int T_src = (int)src.size();
-    int T_stft = (T_src + n_fft - n_fft) / hop + 1;  // center-mode
+    int T_stft = (T_src + n_fft - n_fft) / hop + 1;
 
     auto window = build_hann_window(n_fft, true);
     auto kernel = build_stft_kernel(n_fft, window);
@@ -474,13 +466,13 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
 
     std::vector<float> out(ggml_nelements(spec));
     ggml_backend_tensor_get(spec, out.data(), 0, ggml_nbytes(spec));
-    (void)T_stft;  // silence unused
+    (void)T_stft;
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
     return out;
 }
 
-// Write 24 kHz 16-bit PCM WAV
+
 static void write_wav(const std::string & path, const std::vector<float> & wav, int sr) {
     FILE * f = std::fopen(path.c_str(), "wb");
     if (!f) throw std::runtime_error("cannot open " + path);
@@ -515,11 +507,11 @@ static void write_wav(const std::string & path, const std::vector<float> & wav, 
     std::fclose(f);
 }
 
-// ---------- main ----------
+
 int main(int argc, char ** argv) {
     std::string gguf_path, mel_path, out_path;
     int seed = 42;
-    int sampling_rate = 24000;  // S3GEN_SR
+    int sampling_rate = 24000;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--s3gen-gguf" && i + 1 < argc) gguf_path = argv[++i];
@@ -541,25 +533,25 @@ int main(int argc, char ** argv) {
     model_ctx m = load_s3gen_gguf(gguf_path);
     fprintf(stderr, "  %zu tensors loaded\n", m.tensors.size());
 
-    // Load mel: shape (80, T)
+
     npy_array mel_npy = npy_load(mel_path);
     int T_mel = (int)mel_npy.shape[1];
     std::vector<float> mel(T_mel * 80);
     std::memcpy(mel.data(), npy_as_f32(mel_npy), mel.size() * sizeof(float));
     fprintf(stderr, "Mel shape: (%lld, %lld)\n", (long long)mel_npy.shape[0], (long long)mel_npy.shape[1]);
 
-    // f0_predictor
+
     fprintf(stderr, "Running f0_predictor...\n");
     auto f0 = run_f0_predictor(m, mel, T_mel);
 
-    // Upsample f0 to wav rate: nearest-neighbor, factor = 480
-    int upsample = 8 * 5 * 3 * 4;  // prod(upsample_rates) * hop_len = 480
+
+    int upsample = 8 * 5 * 3 * 4;
     int T_wav = T_mel * upsample;
     std::vector<float> f0_up(T_wav);
     for (int i = 0; i < T_mel; ++i)
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
 
-    // SineGen + SourceModule
+
     fprintf(stderr, "Running SineGen (seed=%d)...\n", seed);
     std::vector<float> l_linear_w(9);
     ggml_tensor * llw = find_tensor(m, "hift/m_source/l_linear/weight");
@@ -574,13 +566,13 @@ int main(int argc, char ** argv) {
                               sine_amp, noise_std, voiced_threshold,
                               l_linear_w, l_linear_b, (uint32_t)seed);
 
-    // STFT of source
+
     fprintf(stderr, "Running STFT on source...\n");
     auto s_stft = run_stft(m, src);
     int T_stft = (int)(s_stft.size() / 18);
     fprintf(stderr, "  s_stft shape: (18, %d)\n", T_stft);
 
-    // Run full HiFT decode (mel + s_stft -> wav)
+
     fprintf(stderr, "Running HiFT decode...\n");
     auto wav = run_hift_decode(m, mel, T_mel, s_stft, T_stft);
     fprintf(stderr, "  wav shape: (%zu,)\n", wav.size());

@@ -201,10 +201,6 @@ endif()
 
 if (TTS_CPP_INSTALL AND TTS_CPP_BUILD_LIBRARY)
     if (TTS_CPP_USE_SYSTEM_GGML)
-        # Full install(EXPORT) flow.  Only reachable when `ggml` is an
-        # imported target from `find_package(ggml CONFIG REQUIRED)` — the
-        # standalone `add_subdirectory(ggml)` path would fail
-        # install(EXPORT) because its ggml target isn't in an export set.
         include(CMakePackageConfigHelpers)
 
         install(TARGETS tts-cpp
@@ -239,11 +235,6 @@ if (TTS_CPP_INSTALL AND TTS_CPP_BUILD_LIBRARY)
             DESTINATION ${CMAKE_INSTALL_DATADIR}/tts-cpp
         )
     else()
-        # Standalone build: install the archive + headers, but skip the
-        # Config.cmake / Targets.cmake export set since the in-tree
-        # `ggml` target can't be exported without also exporting its
-        # whole subdirectory.  Downstream library-first consumers build
-        # with TTS_CPP_USE_SYSTEM_GGML=ON and get the full Config.cmake.
         install(TARGETS tts-cpp
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

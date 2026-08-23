@@ -1,16 +1,5 @@
-// Staged parity test for T3 multilingual (Llama-520M).
-//
-// Each stage runs a narrow slice of the C++ forward pass with the rest
-// injected from Python-dumped .npy references.  Walk bottom-up to localise
-// any numerical drift to a specific sub-stage:
-//
-//   cond      : build cond_emb (spkr_enc + perceiver + emotion) only
-//   text      : text_emb + learned text_pos_emb
-//   inputs    : full input assembly (cond_emb + text + initial_speech + bos)
-//   layer0    : one Llama block on top of Python-injected inputs_embeds
-//   layerN    : first N Llama blocks on Python-injected inputs_embeds
-//   full      : all 30 layers + final RMSNorm + speech_head
-//   all       : run each stage in turn and stop at the first failure
+
+
 
 #include "chatterbox_t3_internal.h"
 #include "t3_mtl.h"
@@ -27,11 +16,7 @@
 #include <thread>
 #include <vector>
 
-// Pull the implementation-detail symbols (`chatterbox_model`,
-// `build_stage_*_graph`, etc.) into the global scope so each `int main`
-// stage can stay compact.  Fine for a test executable; tightly couples
-// these tests to detail-namespace renames, which is the right trade-off
-// for a parity harness.
+
 using namespace tts_cpp::chatterbox::detail;
 
 namespace {
@@ -81,9 +66,7 @@ std::vector<ggml_fp16_t> causal_mask_f16(int N) {
     return m;
 }
 
-// Python dumps are numpy (batch, seq, embd).  ggml F32 layout for our 2D
-// (n_embd, seq) is the same contiguous `embd`-fastest order as numpy
-// (seq, embd) after batch index 0.  Return a pointer into the raw bytes.
+
 const float * row_0(const npy_array & arr, size_t & n) {
     if (arr.dtype != "<f4") throw std::runtime_error("expected float32");
     n = 1;
@@ -91,7 +74,7 @@ const float * row_0(const npy_array & arr, size_t & n) {
     return reinterpret_cast<const float *>(arr.data.data());
 }
 
-// Stage: cond_emb only.
+
 bool stage_cond(stage_run & r, const chatterbox_model & model, const std::string & ref_dir) {
     fprintf(stderr, "\n== STAGE cond ==\n");
     ggml_cgraph * gf = build_stage_cond_emb_graph(model);
@@ -112,7 +95,7 @@ bool stage_cond(stage_run & r, const chatterbox_model & model, const std::string
     std::vector<float> got(ggml_nelements(cond));
     ggml_backend_tensor_get(cond, got.data(), 0, ggml_nbytes(cond));
 
-    npy_array ref = npy_load(ref_dir + "/cond_emb.npy");  // (1, 34, n_embd)
+    npy_array ref = npy_load(ref_dir + "/cond_emb.npy");
     size_t N_ref = 1;
     for (auto d : ref.shape) N_ref *= (size_t) d;
     if (N_ref != got.size()) {
@@ -123,7 +106,7 @@ bool stage_cond(stage_run & r, const chatterbox_model & model, const std::string
                          reinterpret_cast<const float *>(ref.data.data()),
                          got.size());
     print_compare("cond_emb", s);
-    // F16-stored speech_emb contributes ~1.5e-4 rel drift in cond_prompt.
+
     return s.rel_err < 5e-4;
 }
 
@@ -149,8 +132,7 @@ bool stage_text(stage_run & r, const chatterbox_model & model, const std::string
     std::vector<float> got(ggml_nelements(out));
     ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
 
-    // Python ref: text_emb_raw (2, T, C) is batched (post-CFG doubling).
-    // text_pos_emb_out is (T, C).  Expected cond row = text_emb_raw[0] + text_pos_emb_out.
+
     npy_array raw = npy_load(ref_dir + "/text_emb_raw.npy");
     npy_array pos_ref = npy_load(ref_dir + "/text_pos_emb_out.npy");
     if (raw.dtype != "<f4" || pos_ref.dtype != "<f4") { fprintf(stderr, "expected f32\n"); return false; }
@@ -203,7 +185,7 @@ bool stage_inputs(stage_run & r, const chatterbox_model & model,
     std::vector<float> got(ggml_nelements(out));
     ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
 
-    npy_array ref = npy_load(ref_dir + "/inputs_embeds_initial.npy");  // (2, N, C)
+    npy_array ref = npy_load(ref_dir + "/inputs_embeds_initial.npy");
     if (ref.shape.size() != 3) { fprintf(stderr, "bad inputs_embeds shape\n"); return false; }
     const int64_t T = ref.shape[1];
     const int64_t C = ref.shape[2];
@@ -249,7 +231,7 @@ bool stage_layers(stage_run & r, const chatterbox_model & model,
     std::vector<float> got(ggml_nelements(out));
     ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
 
-    // Reference: layer{n_layers-1}_out_call0.npy[0] for cond, [1] for uncond.
+
     int ref_idx = n_layers - 1;
     std::string ref_name;
     if (ref_idx == 0) ref_name = "layer0_out_call0.npy";
@@ -325,12 +307,12 @@ bool stage_logits(stage_run & r, const chatterbox_model & model,
     }
     auto s = compare_f32(got.data(), last_row, got.size());
     print_compare("speech_logits (last pos)", s);
-    // Accumulated drift through 30 F16 Llama layers + F16 speech_head.
-    // Logit magnitudes are O(8) so 5e-3 rel is argmax-safe.
+
+
     return s.rel_err < 5e-3;
 }
 
-} // namespace
+}
 
 int main(int argc, char ** argv) {
     if (argc < 4) {
@@ -353,7 +335,7 @@ int main(int argc, char ** argv) {
     if (n_threads <= 0) n_threads = 4;
 
     chatterbox_model model;
-    if (!load_model_gguf(model_path, model, /*ctx=*/0, n_gpu_layers)) return 1;
+    if (!load_model_gguf(model_path, model, 0, n_gpu_layers)) return 1;
     if (model.hparams.variant != CHBX_VARIANT_MTL) {
         fprintf(stderr, "model is not t3_mtl\n"); return 1;
     }

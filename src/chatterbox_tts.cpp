@@ -1,25 +1,5 @@
-// chatterbox_tts: end-to-end text -> wav synthesis using T3-generated speech
-// tokens and a pre-computed speaker/prompt reference dump.
-//
-// Pipeline (all in C++/ggml):
-//   flow_input_tokens = concat(prompt_token, speech_tokens_padded)
-//   x = input_embedding(flow_input_tokens)               (T, D=512)
-//   mu = encoder(x) + upsample2x + encoder_proj          (2T, 80)
-//   spks = affine(F.normalize(embedding))                (80,)
-//   conds[:mel_len1] = prompt_feat, rest = 0             (2T, 80)
-//   z = randn(80, 2T)
-//   for t,r in [(0, 0.5), (0.5, 1.0)]:
-//       dxdt = estimator(z, mu, t_emb, spks, conds)
-//       z = z + (r-t) * dxdt
-//   mel = z[:, mel_len1:]                                (80, 2T - mel_len1)
-//   f0 = f0_predictor(mel)
-//   source = sinegen(upsample(f0)) -> tanh(linear)       (T_wav,)
-//   s_stft = stft(source)
-//   wav = hift_decode(mel, s_stft) + istft
-//
-// Usage:
-//   chatterbox_tts --s3gen-gguf MODEL.gguf --ref-dir DIR \
-//                  --tokens-file TOKENS.txt --out OUT.wav
+
+
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -59,7 +39,7 @@
 #include <thread>
 #include <vector>
 
-// Global thread count (set in main; used to configure CPU backend in each graph run)
+
 static int g_n_threads = 1;
 
 static double now_ms() {
@@ -79,9 +59,6 @@ struct scoped_timer {
 };
 #define TIMED(label) scoped_timer _st_##__LINE__(label)
 
-// ============================================================================
-// GGUF loader + helpers
-// ============================================================================
 
 struct model_ctx {
     ggml_backend_t backend = nullptr;
@@ -89,11 +66,7 @@ struct model_ctx {
     ggml_backend_buffer_t buffer_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
 
-    // Variant metadata read from GGUF once at load time.
-    //   meanflow=true  : Turbo (2-step Euler, time_embed_mixer, noised_mels overlay,
-    //                    no CFG on the CFM side)
-    //   meanflow=false : Multilingual (10-step Euler with cosine t_schedule,
-    //                    classifier-free-guidance via cfg_rate)
+
     bool  meanflow    = true;
     int   n_timesteps = 2;
     float cfg_rate    = 0.0f;
@@ -157,14 +130,7 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
     return b;
 }
 
-// Process-wide cache of the loaded S3Gen GGUF so repeated calls (streaming
-// or server mode) pay the ~700 ms tensor-load cost only once.  Keyed on
-// (path, n_gpu_layers) — switching backend invalidates the cache.
-//
-// Thread-safety: simple mutex around load/lookup.  The returned pointer
-// stays alive for the lifetime of the process (we never evict), which
-// matches the streaming CLI's single-voice use case.  A proper LRU would
-// belong in a server front-end.
+
 static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose);
 
 namespace {
@@ -172,14 +138,9 @@ struct s3gen_cache_entry { std::string path; int gpu = 0; std::unique_ptr<model_
 static std::mutex                            g_s3gen_cache_mu;
 static std::unique_ptr<s3gen_cache_entry>    g_s3gen_cache_entry;
 static double                                g_s3gen_cache_last_load_ms = 0.0;
-}  // namespace
+}
 
-// Release any cached model_ctx (frees its backend buffer, ggml context and
-// backend).  Must run before the ggml-metal / ggml-cuda / ggml-vulkan dylib
-// tears down its static device list; otherwise their static destructors hit
-// a "rsets->data count != 0" assert (residency sets still referenced by an
-// orphan backend buffer).  We register it with atexit() on first cache
-// insertion so it runs before process-exit dylib finalisers.
+
 static void s3gen_model_cache_release() {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
     if (!g_s3gen_cache_entry) return;
@@ -213,10 +174,7 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
     g_s3gen_cache_entry = std::make_unique<s3gen_cache_entry>(
         s3gen_cache_entry{path, n_gpu_layers, std::move(m)});
 
-    // Register the release on first insertion.  atexit() handlers run in
-    // LIFO and execute before any static destructors in DSOs loaded *after*
-    // this point — which on macOS / Linux is how we avoid Metal's device
-    // teardown assert on process exit.
+
     static bool registered = false;
     if (!registered) {
         std::atexit(s3gen_model_cache_release);
@@ -230,7 +188,7 @@ static double s3gen_model_cache_last_load_ms() { return g_s3gen_cache_last_load_
 static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose) {
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params gp = {  false,  &tmp_ctx };
     const char * fc_env = std::getenv("TRIDENT_FASTCONV");
     const bool fastconv = fc_env && fc_env[0] != '0';
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
@@ -272,13 +230,8 @@ static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, boo
         m.n_timesteps = (k_ts >= 0) ? (int) gguf_get_val_u32(g, k_ts) : (m.meanflow ? 2 : 10);
         m.cfg_rate    = (k_cf >= 0) ? gguf_get_val_f32(g, k_cf) : (m.meanflow ? 0.0f : 0.7f);
         if (k_mf < 0 && k_ts < 0 && k_cf < 0) {
-            // Pre-§3.19 GGUFs lack the variant keys.  Defaults match the
-            // historical Turbo behaviour, so legacy chatterbox-s3gen.gguf
-            // files continue to work unchanged.  Print a one-time warning
-            // because the same defaults applied to a *multilingual* S3Gen
-            // GGUF produced by an older converter would silently run the
-            // wrong CFM solver and emit garbage.  Re-converting picks up
-            // the proper keys.
+
+
             fprintf(stderr, "warning: s3gen GGUF lacks variant keys "
                             "(s3gen.meanflow / n_timesteps / cfg_rate); "
                             "assuming Turbo (meanflow, 2 steps).  If this is "
@@ -303,7 +256,7 @@ static ggml_tensor * find_tensor(const model_ctx & m, const std::string & name) 
     return it->second;
 }
 
-// F32 conv1d via im2col + mul_mat.  kernel ne=[K, IC, OC]
+
 static ggml_tensor * conv1d_f32(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor * input,
                                 int stride, int padding, int dilation) {
     ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
@@ -313,25 +266,16 @@ static ggml_tensor * conv1d_f32(ggml_context * ctx, ggml_tensor * kernel, ggml_t
     return ggml_reshape_3d(ctx, result, im2col->ne[1], kernel->ne[2], im2col->ne[2]);
 }
 
-// Batch-aware F32 conv1d.  Input: (L, IC, B) or (L, IC).  Kernel: (K, IC, OC).
-// Output: (L_out, OC, B).  B=1 degenerates to the old (L_out, OC, 1) layout.
-//
-// ggml_mul_mat broadcasts its FIRST operand over the SECOND's ne[2..3]
-// (the docs state: "A: [ne03, ne02, n, k]", "B: [ne03*x, ne02*y, m, k]"),
-// and ggml_can_mul_mat rejects the opposite broadcast direction.  When the
-// im2col output carries a batch dim and the kernel does not, we therefore
-// put the kernel first and permute the result back to (L_out, OC, B) so
-// downstream bias-add + LayerNorm layouts stay the same as the batch=1
-// path.
+
 static ggml_tensor * conv1d_f32_b(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor * input,
                                   int stride, int padding, int dilation) {
     ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
-    // im2col ne=[K*IC, L_out, B]
+
     ggml_tensor * k_flat = ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]);
-    // mul_mat(A=k_flat[k=K*IC, n=OC], B=im2col[k=K*IC, m=L_out, ne02=B])
-    //   → result ne=[OC, L_out, B]
+
+
     ggml_tensor * prod = ggml_mul_mat(ctx, k_flat, im2col);
-    // Permute (OC, L_out, B) → (L_out, OC, B).
+
     return ggml_cont(ctx, ggml_permute(ctx, prod, 1, 0, 2, 3));
 }
 
@@ -345,10 +289,7 @@ static ggml_tensor * conv_transpose_1d_f32(ggml_context * ctx, ggml_tensor * ker
     return ggml_cont(ctx, v);
 }
 
-// Metal backend currently has no PAD / PAD_EXT dispatcher entry, so emulate
-// front/back zero padding on dim 0 via concat(scale(view, 0), x) /
-// concat(x, scale(view, 0)).  The scale(..., 0) trick produces a defined
-// zero tensor (as opposed to allocating an uninitialised one and hoping).
+
 static ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back) {
     if (p_front <= 0 && p_back <= 0) return x;
     ggml_tensor * y = x;
@@ -383,7 +324,7 @@ static ggml_tensor * layer_norm(ggml_context * ctx, ggml_tensor * x,
     return ggml_add(ctx, y, b);
 }
 
-// LayerNorm on channel axis where x ne=[T, C].
+
 static ggml_tensor * layer_norm_on_channel(ggml_context * ctx, ggml_tensor * x,
                                            ggml_tensor * w, ggml_tensor * b, float eps = 1e-5f) {
     ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
@@ -411,9 +352,6 @@ static ggml_tensor * reflect_pad_1d(ggml_context * ctx, ggml_tensor * x, int p_l
     return y;
 }
 
-// ============================================================================
-// Encoder (Conformer) — produces mu for CFM
-// ============================================================================
 
 struct conformer_w {
     ggml_tensor *norm_mha_w, *norm_mha_b, *norm_ff_w, *norm_ff_b;
@@ -478,22 +416,7 @@ static ggml_tensor * conformer_block(ggml_context * ctx, const conformer_w & w,
                                           bd_reshaped->nb[1], bd_reshaped->nb[2], 0);
     bd_final = ggml_cont(ctx, bd_final);
 
-    // Rel-pos Conformer MHA is kept on the classic ggml_soft_max +
-    // separate V mat-mul path rather than ggml_flash_attn_ext because
-    // the f16 cast of the relative-position bias `bd_final` (which
-    // flash_attn_ext requires for its mask argument — ggml.c:5320
-    // GGML_ASSERT(mask->type == GGML_TYPE_F16)) drifts the softmax
-    // output by ~1e-4 per block, which compounds through the
-    // 10-step CFM estimator downstream and fails the WAV quality
-    // gate (cos 0.998647 vs required > 0.9998, md5 differs vs the
-    // §3.22 reference 79002f09bc48dda95ec0c2cfc2b895bd). Measured
-    // speed upside was −13 ms S3Gen / −1.8 % total on M3 Ultra with
-    // Metal, Q4_0, Spanish prompt, seed 42 — real but not worth
-    // trading against the audio quality threshold. See PROGRESS
-    // §3.25 for the full negative-finding writeup. Same pattern
-    // works on parakeet.cpp (see §15.8 there) because parakeet's
-    // downstream is a joint argmax over tokens, which is invariant
-    // to sub-bit-15 precision drift in attention scores.
+
     ggml_tensor * scores = ggml_add(ctx, ac, bd_final);
     scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float)HD));
     ggml_tensor * attn = ggml_soft_max(ctx, scores);
@@ -540,12 +463,12 @@ static void compute_pos_emb(std::vector<float> & pe, int T, int D) {
     }
 }
 
-// Run the full S3Gen encoder: input (T, D=512) -> mu (2T, 80)
+
 static std::vector<float> run_encoder(const model_ctx & m, const std::vector<float> & input_embed, int T, int D = 512) {
     const int H = 8, HEAD_DIM = 64;
     const int T2 = 2 * T;
 
-    static size_t buf_size = 64 * 1024 * 1024;  // plenty
+    static size_t buf_size = 64 * 1024 * 1024;
     std::vector<uint8_t> buf(buf_size);
     ggml_init_params gp = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(gp);
@@ -558,7 +481,7 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     ggml_tensor * pos2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, 2*T2 - 1);
     ggml_set_name(pos2, "pos2"); ggml_set_input(pos2);
 
-    // encoder_embed: Linear + LayerNorm + scale
+
     ggml_tensor * elw = find_tensor(m, "flow/encoder/embed/linear/w");
     ggml_tensor * elb = find_tensor(m, "flow/encoder/embed/linear/b");
     ggml_tensor * enw = find_tensor(m, "flow/encoder/embed/norm/w");
@@ -568,7 +491,7 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     x = ggml_add(ctx, ggml_mul(ctx, x, enw), enb);
     x = ggml_scale(ctx, x, std::sqrt((float)D));
 
-    // pre_lookahead: 2 convs + LeakyReLU + residual
+
     ggml_tensor * residual = x;
     ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
     ggml_tensor * pw1 = find_tensor(m, "flow/encoder/pre_lookahead/conv1/w");
@@ -585,13 +508,13 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     xt = ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
     x = ggml_add(ctx, xt, residual);
 
-    // 6 conformer blocks at length T
+
     for (int i = 0; i < 6; ++i) {
         auto w = load_conformer(m, "flow/encoder/block" + std::to_string(i));
         x = conformer_block(ctx, w, x, pos1, D, T, H, HEAD_DIM);
     }
 
-    // Upsample1D 2x
+
     ggml_tensor * up_w = find_tensor(m, "flow/encoder/up_layer/conv/w");
     ggml_tensor * up_b = find_tensor(m, "flow/encoder/up_layer/conv/b");
     ggml_tensor * xu = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
@@ -603,7 +526,7 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     xu = ggml_add(ctx, xu, ggml_reshape_2d(ctx, up_b, 1, D));
     x = ggml_cont(ctx, ggml_permute(ctx, xu, 1, 0, 2, 3));
 
-    // up_embed
+
     ggml_tensor * ulw = find_tensor(m, "flow/encoder/up_embed/linear/w");
     ggml_tensor * ulb = find_tensor(m, "flow/encoder/up_embed/linear/b");
     ggml_tensor * unw = find_tensor(m, "flow/encoder/up_embed/norm/w");
@@ -613,19 +536,19 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     x = ggml_add(ctx, ggml_mul(ctx, x, unw), unb);
     x = ggml_scale(ctx, x, std::sqrt((float)D));
 
-    // 4 up_conformer blocks at length 2T
+
     for (int i = 0; i < 4; ++i) {
         auto w = load_conformer(m, "flow/encoder/up_block" + std::to_string(i));
         x = conformer_block(ctx, w, x, pos2, D, T2, H, HEAD_DIM);
     }
 
-    // after_norm
+
     ggml_tensor * anw = find_tensor(m, "flow/encoder/after_norm/w");
     ggml_tensor * anb = find_tensor(m, "flow/encoder/after_norm/b");
     x = ggml_norm(ctx, x, 1e-5f);
     x = ggml_add(ctx, ggml_mul(ctx, x, anw), anb);
 
-    // encoder_proj: Linear(D -> 80)
+
     ggml_tensor * epw = find_tensor(m, "flow/encoder_proj/w");
     ggml_tensor * epb = find_tensor(m, "flow/encoder_proj/b");
     ggml_tensor * mu = ggml_add(ctx, ggml_mul_mat(ctx, epw, x), epb);
@@ -648,12 +571,9 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     ggml_backend_tensor_get(mu, mu_data.data(), 0, ggml_nbytes(mu));
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
-    return mu_data;  // shape ggml ne=[T2, 80] = numpy (80, T2)
+    return mu_data;
 }
 
-// ============================================================================
-// CFM estimator (single forward) — same graph as stage_G4 of test_s3gen.cpp
-// ============================================================================
 
 struct cfm_resnet_w {
     ggml_tensor *b1_conv_w, *b1_conv_b, *b1_ln_w, *b1_ln_b;
@@ -733,35 +653,28 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
     ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);
     ggml_tensor * k = ggml_mul_mat(ctx, w.to_k, nx);
     ggml_tensor * v = ggml_mul_mat(ctx, w.to_v, nx);
-    // Zero-cont Q/K/V for flash-attn (see PROGRESS.md 3.14).  After
-    // mul_mat the result is (INNER, T) contiguous; INNER = H * HD.
-    // Metal's flash_attn_ext takes strided (HD, T, H) views directly,
-    // so drop the reshape+permute+cont triple.
+
+
     const size_t col_stride  = (size_t) INNER * sizeof(float);
     const size_t head_stride = (size_t) HD    * sizeof(float);
     q = ggml_view_3d(ctx, q, HD, T, H, col_stride, head_stride, 0);
     k = ggml_view_3d(ctx, k, HD, T, H, col_stride, head_stride, 0);
     v = ggml_view_3d(ctx, v, HD, T, H, col_stride, head_stride, 0);
     if (f16_kv_attn) {
-        // Experimental OpenCL/mobile mode: keep Q in F32 but materialise K/V
-        // into contiguous F16 so backends with `flash_attn_f32_f16` (e.g.
-        // Adreno OpenCL, see PROGRESS.md "OpenCL / Adreno bring-up" §
-        // "OpenCL optimization log") dispatch the mixed-precision kernel
-        // instead of the F32-only one.  ggml_cpy handles the strided-source
-        // → contiguous-F16-dst case across Metal / OpenCL / CPU.
+
+
         ggml_tensor * k_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
         ggml_tensor * v_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
         k = ggml_cpy(ctx, k, k_f16);
         v = ggml_cpy(ctx, v, v_f16);
     }
 
-    // Fused softmax(QK^T / sqrt(HD)) @ V, streaming (no materialized T x T attn matrix).
-    // Output layout is (HD, H, T) internally ((D, H, N) per flash_attn_ext docs).
-    ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
-                                                /*scale=*/1.0f / std::sqrt((float)HD),
-                                                /*max_bias=*/0.0f,
-                                                /*logit_softcap=*/0.0f);
-    // flash_attn_ext output: ne=[HD, H, T, 1] (contiguous). Reshape to (INNER, T).
+
+    ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, nullptr,
+                                                1.0f / std::sqrt((float)HD),
+                                                0.0f,
+                                                0.0f);
+
     ggml_tensor * flat = ggml_reshape_2d(ctx, attn_fa, INNER, T);
     ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, w.to_out_w, flat), w.to_out_b);
     x = ggml_add(ctx, x, attn_out);
@@ -794,15 +707,6 @@ static ggml_tensor * cfm_causal_k3(ggml_context * ctx, ggml_tensor * x,
     return ggml_add(ctx, y, ggml_reshape_2d(ctx, b, 1, C_out));
 }
 
-// --------------------------------------------------------------------------
-// Batch-aware CFM estimator helpers.  These mirror the batch=1 helpers but
-// preserve an outer batch dim so the non-meanflow CFG path can run cond +
-// uncond through the decoder in a single forward call (batch=2), amortising
-// the weight-read cost across both passes.
-//
-// Shape convention: x ne=[T, C, B].  t_emb is (TIME_DIM, B).  Biases are
-// (C,) — ggml broadcasts size-1 dims.
-// --------------------------------------------------------------------------
 
 static ggml_tensor * cfm_causal_block_b(ggml_context * ctx, ggml_tensor * x,
                                         ggml_tensor * conv_w, ggml_tensor * conv_b,
@@ -817,9 +721,9 @@ static ggml_tensor * cfm_causal_block_b(ggml_context * ctx, ggml_tensor * x,
 static ggml_tensor * cfm_resnet_b(ggml_context * ctx, const cfm_resnet_w & w,
                                   ggml_tensor * x, ggml_tensor * t_emb_b, int64_t C_out) {
     ggml_tensor * h = cfm_causal_block_b(ctx, x, w.b1_conv_w, w.b1_conv_b, w.b1_ln_w, w.b1_ln_b, C_out);
-    ggml_tensor * t_feat = ggml_mish_fn(ctx, t_emb_b);                      // (TIME_DIM, B)
+    ggml_tensor * t_feat = ggml_mish_fn(ctx, t_emb_b);
     ggml_tensor * t_proj = ggml_add(ctx, ggml_mul_mat(ctx, w.mlp_w, t_feat),
-                                    w.mlp_b);                                // (C, B)
+                                    w.mlp_b);
     const int64_t B = t_proj->ne[1];
     h = ggml_add(ctx, h, ggml_reshape_3d(ctx, t_proj, 1, C_out, B));
     h = cfm_causal_block_b(ctx, h, w.b2_conv_w, w.b2_conv_b, w.b2_ln_w, w.b2_ln_b, C_out);
@@ -833,13 +737,12 @@ static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
                                  bool f16_kv_attn,
                                  int H = 8, int HD = 64) {
     int INNER = H * HD;
-    ggml_tensor * nx = layer_norm(ctx, x, w.norm1_w, w.norm1_b);            // (C, T, B)
-    ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);                        // (INNER, T, B)
+    ggml_tensor * nx = layer_norm(ctx, x, w.norm1_w, w.norm1_b);
+    ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);
     ggml_tensor * k = ggml_mul_mat(ctx, w.to_k, nx);
     ggml_tensor * v = ggml_mul_mat(ctx, w.to_v, nx);
-    // Zero-cont Q/K/V (see PROGRESS.md 3.14): express the
-    // (HD, T, H, B) layout expected by flash_attn_ext as a strided view
-    // on the already-contiguous (INNER, T, B) mul_mat output.
+
+
     const size_t col_stride   = (size_t) INNER   * sizeof(float);
     const size_t head_stride  = (size_t) HD      * sizeof(float);
     const size_t batch_stride = (size_t) INNER * T * sizeof(float);
@@ -847,17 +750,16 @@ static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
     k = ggml_view_4d(ctx, k, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
     v = ggml_view_4d(ctx, v, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
     if (f16_kv_attn) {
-        // Mirror the batch=1 path: optionally materialise K/V as contiguous
-        // F16 so backends with `flash_attn_f32_f16` (Adreno OpenCL) dispatch
-        // the mixed-precision kernel.  See basic_tfm() for full rationale.
+
+
         ggml_tensor * k_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HD, T, H, B);
         ggml_tensor * v_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HD, T, H, B);
         k = ggml_cpy(ctx, k, k_f16);
         v = ggml_cpy(ctx, v, v_f16);
     }
-    ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
+    ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, nullptr,
                                                 1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
-    // flash_attn_ext output ne=[HD, H, T, B].  Reshape back to (INNER, T, B).
+
     ggml_tensor * flat = ggml_reshape_3d(ctx, attn_fa, INNER, T, B);
     ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, w.to_out_w, flat), w.to_out_b);
     x = ggml_add(ctx, x, attn_out);
@@ -872,9 +774,9 @@ static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
 static ggml_tensor * apply_tfm_stack_b(ggml_context * ctx, const cfm_tfm_stack & s,
                                        ggml_tensor * x, int T, int C, int B,
                                        bool f16_kv_attn) {
-    ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));    // (C, T, B)
+    ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
     for (const auto & b : s.blocks) xt = basic_tfm_b(ctx, b, xt, T, C, B, f16_kv_attn);
-    return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));               // (T, C, B)
+    return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
 }
 
 static ggml_tensor * cfm_causal_k3_b(ggml_context * ctx, ggml_tensor * x,
@@ -884,16 +786,7 @@ static ggml_tensor * cfm_causal_k3_b(ggml_context * ctx, ggml_tensor * x,
     return ggml_add(ctx, y, ggml_reshape_2d(ctx, b, 1, C_out));
 }
 
-// Compute the time embedding for a single scalar t (or r).
-// Returns (TIME_EMB_DIM=1024,) after sinusoidal + 2-layer MLP.
-//
-// Cached: the graph topology (inputs, weights, output shape) is constant
-// across all 10 CFM steps. Previously each call rebuilt the graph,
-// reserved a fresh gallocr, computed, and freed — burning ~1 ms of
-// dispatch + allocator overhead per step on Metal. Per call (multilingual,
-// 10 CFM steps) that's ~10 ms; for meanflow with `compute_time_mixed`
-// it's slightly more. The cache is keyed on the backend pointer so a
-// fresh model_ctx in another thread doesn't share scaffolding.
+
 struct time_mlp_cache {
     ggml_backend_t  backend = nullptr;
     std::vector<uint8_t> buf;
@@ -955,7 +848,7 @@ static std::vector<float> compute_time_mlp(const model_ctx & m, float t_val) {
     return out;
 }
 
-// Mix t and r embeddings via time_embed_mixer (Linear(2048 -> 1024), no bias)
+
 static std::vector<float> compute_time_mixed(const model_ctx & m,
                                              const std::vector<float> & t_mlp,
                                              const std::vector<float> & r_mlp) {
@@ -990,16 +883,7 @@ static std::vector<float> compute_time_mixed(const model_ctx & m,
     return out;
 }
 
-// Cached CFM estimator state — graph is built once and reused across steps.
-//
-// Cache key is (T, b2): a graph built for batch=1 (cfm_estimator_forward) cannot
-// be reused for the batch=2 path (cfm_estimator_forward_b2) since the input
-// tensor layouts differ (ne[2] = 1 vs 2).  Today `use_b2` is constant per
-// `s3gen_synthesize_to_wav` invocation and the cache lives on the stack of
-// that one call, so a single key would be safe — but a future change that
-// switches modes mid-utterance (e.g. CFG warm-up where step 0 is single-pass
-// and steps 1+ are batched) would silently reuse a wrong-shape graph and
-// crash inside the allocator.
+
 struct cfm_estimator_cache {
     int  T  = -1;
     bool b2 = false;
@@ -1013,8 +897,7 @@ struct cfm_estimator_cache {
     }
 };
 
-// Single estimator forward: (x, mu, t_emb, spks, cond) -> dxdt
-// All shapes are numpy (80, T) or (80,) as given, flattened row-major.
+
 static std::vector<float> cfm_estimator_forward(
     const model_ctx & m,
     cfm_estimator_cache & cache,
@@ -1032,11 +915,8 @@ static std::vector<float> cfm_estimator_forward(
     if (build_graph) {
         if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
         if (cache.ctx) { ggml_free(cache.ctx); cache.ctx = nullptr; }
-        // 64 MB is comfortable headroom for ~1500 tensor headers + 65536-node
-        // graph metadata at no_alloc=true (the buffer holds tensor structs
-        // and graph book-keeping only, not weight data).  Was 256 MB before;
-        // dropped after measuring real usage at <8 MB and noticing that the
-        // virtual reservation was inflating RSS on systems without overcommit.
+
+
         cache.buf.resize(64 * 1024 * 1024);
         ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
         cache.ctx = ggml_init(gp);
@@ -1101,20 +981,8 @@ static std::vector<float> cfm_estimator_forward(
 
     cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
     ggml_gallocr_reserve(cache.allocr, gf);
-    }  // end graph-build block
+    }
 
-    // Tried: run one dummy compute right after gallocr_reserve to pre-warm
-    // Vulkan's first-dispatch state (shader residency / memory pool / command
-    // pool warmup), hoping the real step0 would then run at step1 speed
-    // (~12 ms instead of ~83 ms).  Outcome: the cold-compute cost is
-    // per-dispatch, not per-graph-first-dispatch — adding the warmup just
-    // shifted 70 ms from "hidden first-dispatch" to "explicit extra compute"
-    // without reducing step0.  S3GEN_INFER went UP by ~13 ms.  Reverted.
-    // The 83→12 ms gap appears to be a driver/scheduler warm-up cost on the
-    // first command buffer submission that no amount of dummy work inside
-    // cfm_estimator_forward removes.  Real fix would need to move the first
-    // dispatch elsewhere in the pipeline (e.g. during T3→S3Gen transition)
-    // so it overlaps with other host work, which is a bigger refactor.
 
     ggml_gallocr_alloc_graph(cache.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x.data(), 0, x.size()*sizeof(float));
@@ -1130,15 +998,7 @@ static std::vector<float> cfm_estimator_forward(
     return out_data;
 }
 
-// Single estimator forward, batch=2 — runs the conditional and unconditional
-// passes through the decoder in one shot.  Inputs are flat F32 vectors of
-// shape (T*MEL) or (MEL,) etc.; the `*_u` suffix carries the uncond copy.
-// Output is two dxdt vectors (cond, uncond) each of shape (T*MEL).
-//
-// Used by the non-meanflow (MTL) CFM loop to halve its per-utterance
-// estimator-call count — the expensive weight-tensor reads amortise across
-// both batch elements, so the pipeline gets close to a 2× speedup on CPU
-// where the decoder is memory-bandwidth bound.
+
 static void cfm_estimator_forward_b2(
     const model_ctx & m,
     cfm_estimator_cache & cache,
@@ -1158,10 +1018,8 @@ static void cfm_estimator_forward_b2(
     if (build_graph) {
         if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
         if (cache.ctx) { ggml_free(cache.ctx); cache.ctx = nullptr; }
-        // 64 MB is plenty for 65536 graph nodes + ~3000 tensor headers (the
-        // batch=2 graph roughly doubles tensor count vs the batch=1 path).
-        // Was 512 MB before — see cfm_estimator_forward for the rationale on
-        // why the original number was overspec.
+
+
         cache.buf.resize(64 * 1024 * 1024);
         ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
         cache.ctx = ggml_init(gp);
@@ -1180,7 +1038,7 @@ static void cfm_estimator_forward_b2(
     ggml_tensor * cond_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, B); ggml_set_name(cond_in, "cond_in"); ggml_set_input(cond_in);
     ggml_tensor * t_emb_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, TIME_DIM, B); ggml_set_name(t_emb_in, "t_emb"); ggml_set_input(t_emb_in);
 
-    // Broadcast spks (MEL, B) over T → (T, MEL, B).
+
     ggml_tensor * spks_bc = ggml_repeat(ctx,
         ggml_reshape_3d(ctx, spks_in, 1, MEL, B), x_in);
     ggml_tensor * xc = ggml_concat(ctx, x_in, mu_in, 1);
@@ -1232,7 +1090,7 @@ static void cfm_estimator_forward_b2(
 
     ggml_gallocr_alloc_graph(cache.allocr, gf);
 
-    // Stage inputs: cond slice [0, T*MEL), uncond slice [T*MEL, 2*T*MEL).
+
     const size_t one_tm = (size_t) T * MEL * sizeof(float);
     const size_t one_m  = (size_t) MEL * sizeof(float);
     const size_t one_td = (size_t) TIME_DIM * sizeof(float);
@@ -1258,9 +1116,8 @@ static void cfm_estimator_forward_b2(
 
     ggml_tensor * out_t = ggml_graph_get_tensor(gf, "out");
     const size_t half = (size_t) T * MEL;
-    // Reuse the host readback arena across CFM steps.  On Vulkan this does
-    // not remove the required backend synchronization, but it eliminates a
-    // large malloc/free from the critical CFG path.
+
+
     thread_local std::vector<float> both;
     both.resize((size_t) ggml_nelements(out_t));
     const size_t want = both.size() * sizeof(float);
@@ -1296,9 +1153,6 @@ static void cfm_estimator_forward_b2(
     out_u.assign(both.begin() + half, both.begin() + 2 * half);
 }
 
-// ============================================================================
-// HiFT vocoder (lifted from mel2wav.cpp)
-// ============================================================================
 
 static std::vector<float> build_hann_window(int n, bool periodic = true) {
     std::vector<float> w(n);
@@ -1371,7 +1225,7 @@ static std::vector<float> invert_alpha_cpu(const model_ctx & m, const std::strin
     return inv;
 }
 
-// F0 predictor (mel (80, T) -> f0 (T,))
+
 static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vector<float> & mel, int T_mel) {
     static size_t buf_size = 8 * 1024 * 1024;
     std::vector<uint8_t> buf(buf_size);
@@ -1411,7 +1265,7 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
     return f0;
 }
 
-// SineGen + SourceModule (CPU implementation)
+
 static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int sr,
                                          int harmonic_num, float sine_amp, float noise_std,
                                          float voiced_threshold,
@@ -1448,7 +1302,7 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
     return src;
 }
 
-// STFT (time-domain source -> spec)
+
 static std::vector<float> run_stft(const model_ctx & m, const std::vector<float> & src) {
     const int n_fft = 16, hop = 4;
     const int F = n_fft / 2 + 1;
@@ -1482,7 +1336,7 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
     return out;
 }
 
-// Full HiFT decode: mel + s_stft -> wav (inlined from mel2wav.cpp)
+
 static std::vector<float> run_hift_decode(const model_ctx & m,
                                           const std::vector<float> & mel, int T_mel,
                                           const std::vector<float> & s_stft, int T_stft) {
@@ -1496,11 +1350,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     std::vector<int> src_rb_ksizes = {7, 7, 11};
     std::vector<std::vector<int>> src_rb_dils = {{1,3,5},{1,3,5},{1,3,5}};
 
-    // Thread-local arena: previously this was a fresh `std::vector<uint8_t>
-    // buf(64 MB)` per HiFT call, which forced a 64 MB memset on every
-    // generate (~5–10 ms on M3 Ultra). The buffer is reused across calls;
-    // each ggml_init resets the arena pointer, so we never accumulate stale
-    // tensor metadata between invocations.
+
     static const size_t buf_size = 64 * 1024 * 1024;
     thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params gp = { buf_size, buf.data(), true };
@@ -1598,7 +1448,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     x = conv1d_f32(ctx, cp2w, x, 1, 3, 1);
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cp2b, 1, NFFT2));
 
-    // ISTFT
+
     size_t col_stride = x->nb[1];
     ggml_tensor * mag_log = ggml_cont(ctx, ggml_view_2d(ctx, x, T_stft, F, col_stride, 0));
     mag_log = ggml_clamp(ctx, mag_log, -1e6f, 1e2f);
@@ -1646,9 +1496,6 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     return wav;
 }
 
-// ============================================================================
-// WAV writer
-// ============================================================================
 
 static void write_wav(const std::string & path, const std::vector<float> & wav, int sr) {
     FILE * f = std::fopen(path.c_str(), "wb");
@@ -1673,9 +1520,6 @@ static void write_wav(const std::string & path, const std::vector<float> & wav, 
     std::fclose(f);
 }
 
-// ============================================================================
-// Token file loader (reads "1,2,3" or newline-separated ints)
-// ============================================================================
 
 static std::vector<int32_t> read_tokens_file(const std::string & path) {
     std::ifstream f(path);
@@ -1684,7 +1528,7 @@ static std::vector<int32_t> read_tokens_file(const std::string & path) {
     std::string token;
     while (std::getline(f, token, ',')) {
         try { out.push_back(std::stoi(token)); } catch (...) {
-            // maybe newline-separated, try stoi after trimming
+
             while (!token.empty() && (token.back() == '\n' || token.back() == ' ' || token.back() == '\r')) token.pop_back();
             if (!token.empty()) out.push_back(std::stoi(token));
         }
@@ -1692,11 +1536,6 @@ static std::vector<int32_t> read_tokens_file(const std::string & path) {
     return out;
 }
 
-// ============================================================================
-// Public entry point — takes pre-generated T3 speech tokens + a voice source
-// (either a --ref-dir with .npy files or the built-in voice baked into the
-// s3gen GGUF) and writes a 24 kHz wav.
-// ============================================================================
 
 #include "tts-cpp/chatterbox/s3gen_pipeline.h"
 
@@ -1711,17 +1550,13 @@ int s3gen_synthesize_to_wav(
     const int  sr         = opts.sr;
     const bool debug_mode = opts.debug;
     const bool verbose    = opts.verbose;
-    const int  pre_lookahead_len = 3;  // Chatterbox default
+    const int  pre_lookahead_len = 3;
 
-    // Verbose progress / per-stage timing goes through this helper so all of
-    // it can be disabled with `--verbose` unset.  Errors and machine-parseable
-    // BENCH: lines stay unconditional below.
+
     auto vlog = [&](const char * fmt, auto... args) {
         if (!verbose) return;
-        // `fmt` is always a string literal at call sites but the compiler
-        // can't prove that through the variadic lambda.  Android NDK's
-        // default `-Werror=format-security` (together with `_FORTIFY_SOURCE=2`)
-        // then refuses to build unless we silence the warning locally.
+
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-security"
         fprintf(stderr, fmt, args...);
@@ -1749,13 +1584,11 @@ int s3gen_synthesize_to_wav(
         return 1;
     }
 
-    // Reference conditioning: prefer GGUF-embedded built-in voice;
-    // fall back to .npy files if --ref-dir was provided.
-    // Layout: emb (192,) float32; pt (N,) int32; pf (mel_len1, 80) float32.
+
     std::vector<float>   emb_data;
     std::vector<int32_t> pt_data;
     std::vector<float>   pf_data;
-    int pf_rows = 0;  // mel_len1
+    int pf_rows = 0;
 
     if (ref_dir.empty() && opts.embedding_override.empty() && opts.prompt_feat_override.empty()
         && opts.prompt_token_override.empty()) {
@@ -1796,12 +1629,7 @@ int s3gen_synthesize_to_wav(
 
     vlog("Speech tokens: %zu\n", speech_tokens.size());
 
-    // Trim tokens >= vocab_size.  In batch / last-chunk (`finalize=true`) we
-    // append 3 S3GEN_SIL lookahead tokens to give the encoder right-context
-    // for the true ending.  For streaming chunks (`finalize=false`) we skip
-    // that: the lookahead will come from real speech tokens in the next
-    // chunk, and we'll trim the 6 mel frames corresponding to the pre-
-    // lookahead window right after CFM.
+
     const int32_t S3GEN_SIL = tts_cpp::chatterbox::kS3GenSilenceToken;
     const int32_t VOCAB_SIZE = 6561;
     std::vector<int32_t> padded;
@@ -1812,33 +1640,21 @@ int s3gen_synthesize_to_wav(
         for (int i = 0; i < pre_lookahead_len; ++i) padded.push_back(S3GEN_SIL);
     }
 
-    // Cache the loaded model across invocations so the streaming driver
-    // pays the ~700 ms GGUF-load cost only once.  Keyed on (path,
-    // n_gpu_layers) so switching backends still works.  Verbose gates the
-    // banner prints but the BENCH line always goes out for perf checks.
+
     model_ctx & m = *s3gen_model_cache_get(gguf_path, opts.n_gpu_layers, verbose);
     {
         const double load_ms = s3gen_model_cache_last_load_ms();
-        // Only emit the BENCH line on an actual GGUF load — on cache hits
-        // the value is always 0 and repeating it per chunk adds noise.
+
+
         if (load_ms > 0.0 || verbose) {
             fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
         }
     }
 
-    // HiFT-side graphs (f0_predictor, STFT, hift_decode) used to need a
-    // dedicated CPU copy of the S3Gen GGUF on Metal because conv_transpose_1d,
-    // pad_ext and diag_mask_inf were either missing or pathologically slow in
-    // ggml-metal.  After the kernel fixes in ggml/src/ggml-metal/, HiFT runs
-    // on the main backend directly on every platform.
+
     const model_ctx & m_hift = m;
 
-    // If neither --ref-dir nor any C++ override populated the three
-    // conditioning tensors above, pull the built-in voice from the GGUF.
-    //
-    // NB: `ref_dir.empty()` alone is NOT a valid check here — --reference-audio
-    // by itself (no --ref-dir) legitimately fills all three via the C++
-    // override path, and we must not overwrite those.
+
     if (pt_data.empty() && emb_data.empty() && pf_data.empty()) {
         ggml_tensor * t_emb = find_tensor(m, "s3gen/builtin/embedding");
         ggml_tensor * t_pt  = find_tensor(m, "s3gen/builtin/prompt_token");
@@ -1849,7 +1665,7 @@ int s3gen_synthesize_to_wav(
         ggml_backend_tensor_get(t_emb, emb_data.data(), 0, ggml_nbytes(t_emb));
         ggml_backend_tensor_get(t_pt,  pt_data.data(),  0, ggml_nbytes(t_pt));
         ggml_backend_tensor_get(t_pf,  pf_data.data(),  0, ggml_nbytes(t_pf));
-        // prompt_feat is stored ggml ne=[80, 500] = numpy (500, 80).
+
         pf_rows = (int)t_pf->ne[1];
         vlog("  built-in voice: embedding=(%zu,) prompt_token=(%zu,) prompt_feat=(%d, %lld)\n",
                 emb_data.size(), pt_data.size(), pf_rows, (long long)t_pf->ne[0]);
@@ -1859,7 +1675,7 @@ int s3gen_synthesize_to_wav(
     const int D = 512;
     const int MEL = 80;
 
-    // 1) Concat prompt_token + padded speech_tokens
+
     int n_prompt = (int)pt_data.size();
     int n_total = n_prompt + (int)padded.size();
     vlog("n_prompt=%d n_speech_padded=%zu n_total=%d\n", n_prompt, padded.size(), n_total);
@@ -1868,7 +1684,7 @@ int s3gen_synthesize_to_wav(
     std::memcpy(flow_tokens.data(), pt_data.data(), n_prompt * sizeof(int32_t));
     std::memcpy(flow_tokens.data() + n_prompt, padded.data(), padded.size() * sizeof(int32_t));
 
-    // 2) input_embedding lookup + multiply by mask
+
     vlog("Running input_embedding...\n");
     ggml_tensor * emb_w = find_tensor(m, "flow/input_embedding");
     std::vector<float> emb_w_data(ggml_nelements(emb_w));
@@ -1891,7 +1707,7 @@ int s3gen_synthesize_to_wav(
                 input_embed[0], input_embed[1], input_embed[2], input_embed[3], input_embed[4]);
     }
 
-    // 3) Run encoder -> mu_T (numpy (T_mu, 80) layout, to match encoder_proj.npy)
+
     vlog("Running encoder (T=%d)...\n", n_total);
     double encoder_t0 = now_ms();
     std::vector<float> mu_T = run_encoder(m, input_embed, n_total, D);
@@ -1899,21 +1715,16 @@ int s3gen_synthesize_to_wav(
     int T_mu = 2 * n_total;
     vlog("  encoder output: (%d, 80) = %zu floats\n", T_mu, mu_T.size());
 
-    // Streaming: trim the last `pre_lookahead_len * token_mel_ratio = 6`
-    // frames off the encoder output BEFORE CFM (matches Python's
-    // flow.inference(finalize=False) which does `h = h[:, :-6]` pre-
-    // decoder).  Doing it here — not post-CFM — keeps mu / cond / z and
-    // CFM's internal attention all sized consistently with Python, so
-    // a Python-dumped noise tensor produces bit-exact mel output in C++.
-    const int TOKEN_MEL_RATIO_PRE = 2;  // each speech token expands to 2 mels
+
+    const int TOKEN_MEL_RATIO_PRE = 2;
     if (!opts.finalize) {
-        const int trim = pre_lookahead_len * TOKEN_MEL_RATIO_PRE;  // 6
+        const int trim = pre_lookahead_len * TOKEN_MEL_RATIO_PRE;
         if (T_mu <= trim) {
             fprintf(stderr, "error: streaming chunk too short (T_mu=%d ≤ trim=%d)\n", T_mu, trim);
             return 1;
         }
         T_mu -= trim;
-        mu_T.resize((size_t)T_mu * MEL);  // numpy layout (T_mu, 80): drop last `trim` rows
+        mu_T.resize((size_t)T_mu * MEL);
         vlog("  streaming: trimmed %d mel frames -> T_mu=%d\n", trim, T_mu);
     }
 
@@ -1941,17 +1752,13 @@ int s3gen_synthesize_to_wav(
         fprintf(stderr, "  [mu_T (before transpose)] max_abs=%.4e rms=%.4e vs encoder_proj.npy\n", ma, std::sqrt(rsum / mn));
     }
 
-    // Transpose mu_T from numpy (T_mu, 80) layout to numpy (80, T_mu) for CFM.
-    // In memory: mu_T has [t0_m0, t0_m1, ..., t0_m79, t1_m0, ...]
-    //            mu should be [m0_t0, m0_t1, ..., m0_tTmu-1, m1_t0, ...]
+
     std::vector<float> mu(T_mu * MEL);
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mu; ++t)
             mu[m2 * T_mu + t] = mu_T[t * MEL + m2];
 
-    // Streaming debug: optionally dump the encoder_proj output (same as
-    // Python's `mu` tensor fed into flow_matching.forward) so the test
-    // harness can isolate encoder-side vs CFM-side divergence.
+
     if (!opts.dump_mel_path.empty()) {
         std::string base = opts.dump_mel_path;
         if (base.size() > 4 && base.substr(base.size() - 4) == ".npy")
@@ -1959,7 +1766,7 @@ int s3gen_synthesize_to_wav(
         npy_save_f32(base + "_mu.npy", {(int64_t)T_mu, MEL}, mu_T.data());
     }
 
-    // 4) Speaker embedding: F.normalize + spk_embed_affine_layer
+
     vlog("Computing speaker embedding...\n");
     const float * emb_raw = emb_data.data();
     float norm = 0.0f;
@@ -1968,8 +1775,8 @@ int s3gen_synthesize_to_wav(
     std::vector<float> emb_norm(192);
     for (int i = 0; i < 192; ++i) emb_norm[i] = emb_raw[i] / norm;
 
-    ggml_tensor * saw = find_tensor(m, "flow/spk_embed_affine/w");  // (80, 192) numpy -> ne=[192, 80]
-    ggml_tensor * sab = find_tensor(m, "flow/spk_embed_affine/b");  // (80,)
+    ggml_tensor * saw = find_tensor(m, "flow/spk_embed_affine/w");
+    ggml_tensor * sab = find_tensor(m, "flow/spk_embed_affine/b");
     std::vector<float> saw_data(ggml_nelements(saw)), sab_data(ggml_nelements(sab));
     ggml_backend_tensor_get(saw, saw_data.data(), 0, ggml_nbytes(saw));
     ggml_backend_tensor_get(sab, sab_data.data(), 0, ggml_nbytes(sab));
@@ -1980,31 +1787,28 @@ int s3gen_synthesize_to_wav(
         spks[o] = acc;
     }
 
-    // 5) Build cond: zeros(T_mu, 80), fill first mel_len1 rows with prompt_feat
+
     int mel_len1 = pf_rows;
     if (mel_len1 > T_mu) {
         fprintf(stderr, "error: mel_len1=%d > T_mu=%d\n", mel_len1, T_mu);
         return 1;
     }
     std::vector<float> cond(T_mu * MEL, 0.0f);
-    // pf is (mel_len1, 80) numpy = ne=[80, mel_len1] in ggml. We want cond ne=[T_mu, MEL].
-    // In memory ggml ne=[T_mu, MEL] means [t0_m0, t1_m0, ..., t_Tmu-1_m0, t0_m1, ...].
-    // So cond[m, t] = pf[t, m].
+
+
     const float * pf_raw = pf_data.data();
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < mel_len1; ++t)
             cond[m2 * T_mu + t] = pf_raw[t * MEL + m2];
 
-    // Streaming debug: dump spks + cond so we can compare against Python's
-    // flow.decoder input tensors chunk-by-chunk.
+
     if (!opts.dump_mel_path.empty()) {
         std::string base = opts.dump_mel_path;
         if (base.size() > 4 && base.substr(base.size() - 4) == ".npy")
             base.resize(base.size() - 4);
         npy_save_f32(base + "_spks.npy", {MEL}, spks.data());
-        // C++ stores cond in ggml ne=[T_mu, MEL] layout (T_mu innermost) which
-        // Python sees as numpy shape (MEL, T_mu).  Dump in that layout so we
-        // can diff directly against Python's (80, T_mu) decoder-input cond.
+
+
         npy_save_f32(base + "_cond.npy", {MEL, (int64_t)T_mu}, cond.data());
         fprintf(stderr, "  [stream] dumped spks (%d,) cond (%d, %d) → %s_{spks,cond}.npy\n",
                 MEL, MEL, T_mu, base.c_str());
@@ -2025,7 +1829,7 @@ int s3gen_synthesize_to_wav(
         for (size_t i = 0; i < ns; ++i) { float d = spks[i] - rs[i]; ma = std::max(ma, std::fabs(d)); rsum += d*d; }
         fprintf(stderr, "  [spks] max_abs=%.4e rms=%.4e vs ref\n", ma, std::sqrt(rsum / ns));
 
-        // Also compare mu vs cfm_step0_mu.npy (which should equal encoder_proj)
+
         npy_array ref_mu = npy_load(ref_dir + "/cfm_step0_mu.npy");
         const float * rm = (const float*)ref_mu.data.data();
         size_t nm = std::min(mu.size(), ref_mu.n_elements());
@@ -2034,14 +1838,7 @@ int s3gen_synthesize_to_wav(
         fprintf(stderr, "  [mu vs step0_mu] max_abs=%.4e rms=%.4e vs ref\n", ma, std::sqrt(rsum / nm));
     }
 
-    // 6) Initial CFM noise.  Layout mirrors Python: z has shape (80, T_mu).
-    //
-    //  - meanflow (Turbo):   randn everywhere, then replace the speech region
-    //                        with a second independent randn draw (matches
-    //                        `flow_matching.forward`'s `noised_mels` overlay).
-    //  - standard CFM (MTL): randn(80, T_mu) once; no overlay.  The speech
-    //                        region is implicitly conditioned through `cond`
-    //                        instead of via an extra noise tensor.
+
     const bool meanflow = m.meanflow;
     vlog("Initializing CFM noise (seed=%d, %s)...\n", seed,
             meanflow ? "meanflow" : "standard CFM + CFG");
@@ -2083,13 +1880,7 @@ int s3gen_synthesize_to_wav(
         }
     }
 
-    // 7) CFM loop.
-    //  - meanflow:      t_span linearly spaced on [0,1], default 2 steps,
-    //                   one estimator call per step, t_emb mixed with r via
-    //                   the meanflow-only time_embed_mixer.
-    //  - standard CFM:  t_span cosine-scheduled, default 10 steps, two
-    //                   estimator calls per step (cond + uncond with zeroed
-    //                   mu/spks/cond) combined via cfg_rate.
+
     std::vector<float> t_span;
     int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps :
                     (meanflow ? 2 : m.n_timesteps);
@@ -2109,12 +1900,8 @@ int s3gen_synthesize_to_wav(
     const std::vector<float> zero_mu  (T_mu * MEL, 0.0f);
     const std::vector<float> zero_cond(T_mu * MEL, 0.0f);
     const std::vector<float> zero_spks(MEL, 0.0f);
-    // Pack cond + uncond into one batch=2 forward call on GPU backends so
-    // their per-dispatch overhead amortises across both passes.  On ggml-cpu
-    // the dispatch overhead is already ~zero and the extra permute+cont ops
-    // that a batched attention block needs in each layer actually regress
-    // throughput (measured +11% S3Gen wall time on M4 CPU), so we keep the
-    // two-call path there.  Meanflow has no CFG to begin with.
+
+
     const bool use_b2 = (!meanflow) && (cfg_rate != 0.0f) &&
                         !ggml_backend_is_cpu(m.backend);
 
@@ -2164,14 +1951,8 @@ int s3gen_synthesize_to_wav(
                 dxdt_cond[i] = (1.0f + cfg_rate) * dxdt_cond[i] - cfg_rate * dxdt_uncond[i];
             }
         } else if (!meanflow && cfg_rate != 0.0f) {
-            // Non-Metal CFG path (CPU + any backend where use_b2 is false).
-            // Run the conditional and unconditional passes back-to-back on
-            // the same B=1 graph (cfm_estimator_cache key (T, b2=false)
-            // means both calls reuse the same cached graph) and combine
-            // with the standard CFG mix.  Restoring this branch fixes a
-            // silent regression introduced when the b2 path landed on Metal:
-            // previously the else clause computed only the conditional pass
-            // and dropped CFG entirely on every non-Metal backend.
+
+
             dxdt_cond = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, opts.cfm_f16_kv_attn);
             auto dxdt_uncond = cfm_estimator_forward(m, cfm_cache, z, zero_mu, t_emb, zero_spks, zero_cond, T_mu, opts.cfm_f16_kv_attn);
             for (size_t i = 0; i < dxdt_cond.size(); ++i) {
@@ -2205,17 +1986,7 @@ int s3gen_synthesize_to_wav(
     }
     vlog("  [cfm_total] %.1f ms\n", now_ms() - cfm_t0);
 
-    // 8) Slice mel = z[:, mel_len1:] -> shape (80, T_mu - mel_len1).
-    //
-    // For streaming (finalize=false), also drop the last
-    //   pre_lookahead_len * token_mel_ratio = 3 * 2 = 6 mel frames
-    // — these aren't "safe" yet (they'd change once the next chunk's tokens
-    // provide more right-context).  Matches the trim in Python
-    // CausalMaskedDiffWithXvec.inference(..., finalize=False).
-    // Beyond-prompt mel span: starts at mel_len1 in z, ends at T_mu.
-    // Streaming's 6-frame tail trim is already baked into T_mu above (we
-    // shrunk it pre-CFM, matching Python).  Here we only apply the caller's
-    // skip offset to drop frames already emitted on prior chunks.
+
     int T_mel_full = T_mu - mel_len1;
     int skip = opts.skip_mel_frames;
     if (skip < 0) skip = 0;
@@ -2230,7 +2001,7 @@ int s3gen_synthesize_to_wav(
             opts.finalize ? "true" : "false",
             opts.append_lookahead_silence ? "true" : "false");
     std::vector<float> mel(MEL * T_mel);
-    // z has shape ne=[T_mu, MEL]; grab the slice [mel_len1 + skip, mel_len1 + skip + T_mel).
+
     const int mel_off = mel_len1 + skip;
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mel; ++t)
@@ -2260,7 +2031,7 @@ int s3gen_synthesize_to_wav(
                 ma, std::sqrt(rsum / n), max_ref, ma / std::max(max_ref, 1e-9f));
     }
 
-    // 9) HiFT
+
     double hift_t0 = now_ms();
     vlog("Running f0_predictor...\n");
     double t0 = now_ms();
@@ -2283,17 +2054,14 @@ int s3gen_synthesize_to_wav(
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, l_linear_w, l_linear_b, (uint32_t)(seed + 1));
     vlog("  [sinegen] %.1f ms\n", now_ms() - t0);
 
-    // Streaming: splice in the previous chunk's source tail so the F0 phase
-    // (and hence the vocoded waveform) stays continuous at the chunk seam.
-    // Python equivalent: `s[:, :, :cache_source.shape[2]] = cache_source`
-    // inside HiFTGenerator.inference.
+
     if (!opts.hift_cache_source.empty()) {
         size_t n = std::min(opts.hift_cache_source.size(), src.size());
         std::memcpy(src.data(), opts.hift_cache_source.data(), n * sizeof(float));
         vlog("  [sinegen] spliced %zu cache_source samples at head\n", n);
     }
-    // Export the tail for the next chunk's cache_source BEFORE running STFT
-    // (Python returns `s` unmodified; our tail copy matches that convention).
+
+
     if (opts.hift_source_tail_out != nullptr && opts.source_tail_samples > 0) {
         int tail_n = std::min((int)src.size(), opts.source_tail_samples);
         opts.hift_source_tail_out->assign(src.end() - tail_n, src.end());
@@ -2312,12 +2080,9 @@ int s3gen_synthesize_to_wav(
     vlog("  [hift_total] %.1f ms\n", now_ms() - hift_t0);
     vlog("  wav: %zu samples (%.3fs @ %d Hz)\n", wav.size(), (float)wav.size() / sr, sr);
 
-    // First-chunk / batch-mode: apply raised-cosine fade-in to mask HiFT's
-    // resnet cold start.  Length = 2*(sr/50) = 960 samples (40 ms) at 24 kHz.
-    // First half is zero, second half is (cos(π→0)+1)/2 (0→1 ramp).
-    // Python equivalent: `output_wavs[:, :len(self.trim_fade)] *= self.trim_fade`.
+
     if (opts.apply_trim_fade) {
-        const int n_trim = sr / 50;  // 480 at 24 kHz
+        const int n_trim = sr / 50;
         const int fade_len = 2 * n_trim;
         if ((int)wav.size() >= fade_len) {
             for (int i = 0; i < n_trim; ++i) wav[i] = 0.0f;
@@ -2350,7 +2115,7 @@ int s3gen_synthesize_to_wav(
 
 int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers) {
     try {
-        (void)s3gen_model_cache_get(s3gen_gguf_path, n_gpu_layers, /*verbose=*/false);
+        (void)s3gen_model_cache_get(s3gen_gguf_path, n_gpu_layers, false);
         return 0;
     } catch (const std::exception & e) {
         fprintf(stderr, "s3gen_preload: %s\n", e.what());

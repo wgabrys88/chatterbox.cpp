@@ -1,19 +1,5 @@
 #pragma once
 
-// Library-internal declarations for the T3 (GPT-2 Medium autoregressive
-// text -> speech tokens) front-half of the Chatterbox pipeline.  Shared
-// between src/main.cpp (CLI) and src/chatterbox_engine.cpp (public engine
-// API under include/tts-cpp/chatterbox/engine.h).
-//
-// This header is NOT installed with the library (see CMakeLists.txt
-// install rules) — it's part of the implementation, not the public
-// surface.  Public consumers should use <tts-cpp/chatterbox/engine.h>.
-//
-// Everything lives in `tts_cpp::chatterbox::detail` so the library's
-// compiled object files do not export generic names like
-// `load_model_gguf` / `eval_prompt` / `g_log_verbose` into the global
-// linker namespace where they would collide with sibling ML libraries
-// (llama.cpp, whisper.cpp, stable-diffusion.cpp).
 
 #include <cstdint>
 #include <map>
@@ -129,23 +115,7 @@ struct llama_layer {
     ggml_tensor * mlp_up   = nullptr;
     ggml_tensor * mlp_down = nullptr;
 
-    // Phase 15 fused-matmul stack for the Metal hot path. Allocated in
-    // a dedicated persistent buffer at load time; data is memcpy'd in
-    // from the per-tensor wq / wk / wv GGUF tensors which keep their
-    // own backing storage in the weights buffer.
-    //
-    //   wqkv : shape [n_embd, 3 * n_embd]   (Q rows ‖ K rows ‖ V rows)
-    //
-    // Stacking lets each Llama block run ONE Q4_0 mat-mul where it
-    // previously ran three. On a 30-layer × 84-token T3 step pass
-    // that's 30 * 84 * 2 ≈ 5k fewer kernel launches per call inside
-    // each command-buffer commit; the combined mat-mul is also a
-    // wider M dim (3072 vs 1024) which lets ggml-metal's mul_mm tile
-    // (NR0 = 64 row, NR1 = 32 col) saturate better on the tile loop.
-    //
-    // gate / up are NOT stacked: the multilingual T3 GGUF ships
-    // mlp_gate as F16 and mlp_up as Q4_0, and a single ggml_tensor
-    // can't hold mixed element widths.
+
     ggml_tensor * wqkv = nullptr;
 };
 
@@ -191,28 +161,7 @@ struct chatterbox_model {
     std::vector<gpt2_layer>  layers;
     std::vector<llama_layer> layers_mtl;
 
-    // KV cache.
-    //
-    // Turbo (GPT-2 Medium) variant: memory_k / memory_v are sized
-    // `head_dim * n_kv_head * n_ctx * n_layer` (single batch).
-    //
-    // Multilingual (Llama-520M) variant: memory_k / memory_v hold the
-    // CFG cond+uncond pair packed into a single backing buffer, size
-    // `2 * head_dim * n_kv_head * n_ctx * n_layer` (B=2). The two halves
-    // are interleaved per-layer so each Llama block reads from one
-    // contiguous 2*kv_layer_elems region: layout per layer is
-    //   [cond:  head_dim, n_ctx, n_kv_head] [uncond: head_dim, n_ctx, n_kv_head]
-    // Layer-offset stride is therefore `2 * kv_layer_elems * sizeof(F)`.
-    // Picking the cond half is `b_offset_elems = 0`; uncond is
-    // `b_offset_elems = kv_layer_elems` (one batch's worth, applied as a
-    // per-layer offset). The B=2 batched step+prompt graphs pack both
-    // batches into the same view via ne[3]=2 + per-batch stride.
-    //
-    // The unified buffer means the existing two-call (B=1) cond/uncond
-    // CPU path keeps using memory_k/memory_v unchanged; it just selects
-    // the right half via `b_offset_elems`. memory_k_uncond / memory_v_uncond
-    // are no longer separate allocations; kept here as nullable view aliases
-    // for legacy call-sites that haven't been migrated.
+
     ggml_tensor * memory_k = nullptr;
     ggml_tensor * memory_v = nullptr;
 
@@ -227,17 +176,7 @@ struct chatterbox_model {
     ggml_backend_buffer_t buffer_w  = nullptr;
     ggml_backend_buffer_t buffer_kv = nullptr;
 
-    // Phase 15 stacked fused-matmul weights (wqkv per layer) live in
-    // their own backend buffer. Empty on the CPU backend; the CPU path
-    // uses the original wq/wk/wv directly.
-    //
-    // The buffer is registered in a process-wide t3_stack_registry
-    // (see src/t3_mtl.cpp) so an atexit hook can free it before
-    // Metal's static device destructors run, which otherwise asserts
-    // on `[rsets->data count] == 0` because residency sets stay
-    // referenced through buffer_stack. main()'s explicit free_t3()
-    // calls t3_stack_unregister() before freeing the backend so
-    // error-path early-returns don't double-free at exit.
+
     ggml_context *        ctx_stack    = nullptr;
     ggml_backend_buffer_t buffer_stack = nullptr;
 
@@ -347,10 +286,7 @@ bool eval_step_mtl(
     std::vector<float> &     logits_cond_out,
     std::vector<float> &     logits_uncond_out);
 
-// On a degenerate logits distribution (everything -inf after the sampling
-// cascade), returns `stop_token` so the caller's stop check fires cleanly
-// instead of emitting a pseudo-random in-vocab id.  Pass
-// `model.hparams.stop_speech_token` from the speech-decode loop.
+
 int32_t sample_next_token_mtl(
     const std::vector<float> &         logits_cond,
     const std::vector<float> &         logits_uncond,
@@ -359,4 +295,4 @@ int32_t sample_next_token_mtl(
     std::mt19937 &                     rng,
     int32_t                            stop_token);
 
-} // namespace tts_cpp::chatterbox::detail
+}

@@ -1,11 +1,5 @@
-// Standalone validation for the Metal kernels we added/fixed in ggml:
-//   - GGML_OP_DIAG_MASK_INF
-//   - GGML_OP_PAD with non-zero front-pad offsets (lp0..lp3)
-//   - GGML_OP_MUL_MAT + GGML_OP_ADD(bias) [+ GGML_OP_UNARY(GELU_ERF)]
-//     fusion in kernel_mul_mm (PROGRESS §3.27, §3.28)
-//
-// Runs each op twice (once on CPU, once on Metal) with the same input and
-// compares element-by-element.  Exits non-zero on mismatch.
+
+
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -44,7 +38,7 @@ static std::vector<float> run_graph(ggml_backend_t backend,
 
 static int test_diag_mask_inf(ggml_backend_t cpu, ggml_backend_t gpu) {
     fprintf(stderr, "[diag_mask_inf] ");
-    const int N = 37, H = 5;  // 5 heads
+    const int N = 37, H = 5;
     const int n_past = 4;
 
     std::mt19937 rng(1);
@@ -221,19 +215,7 @@ static int test_conv_transpose_1d(ggml_backend_t cpu, ggml_backend_t gpu,
     return 1;
 }
 
-// Test the MUL_MAT + ADD(bias) [+ GELU_ERF] fusion in kernel_mul_mm.
-// Builds the 2- or 3-op subgraph on both CPU and GPU backends, dispatches,
-// and compares output element-wise.  On the GPU side, ggml-metal's fusion
-// system (FC_MUL_MM + 2 / +3 / +4, PROGRESS §3.27 / §3.28) collapses these
-// into a single `kernel_mul_mm_..._bias=1_res=X_gelu=Y` dispatch; the CPU
-// path is always the unfused triple.  Any numerical drift beyond atol
-// indicates either a kernel bug or a shape-handling mismatch.
-//
-// Uses Q4_0 weights to match the chatterbox CFM hot path — that's the
-// shape the fused kernel is specifically targeting.  K must be %32 for
-// Q4_0 blocks; N / T are unconstrained.
-//
-// fuse_mode: 0 = MUL_MAT + ADD(bias), 1 = MUL_MAT + ADD(bias) + GELU_ERF.
+
 static int test_mul_mm_fused(ggml_backend_t cpu, ggml_backend_t gpu,
                              int K, int N, int T, int B, int fuse_mode,
                              const char * label) {
@@ -241,11 +223,8 @@ static int test_mul_mm_fused(ggml_backend_t cpu, ggml_backend_t gpu,
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
-    // W: (K, N) in ggml layout → src0 of shape [K, N] = ggml ne=[K, N].
-    //    Quantized to Q4_0 — block of 32 in the K (innermost) dim.
-    // X: (K, T, B) → src1 of shape [K, T, B] in ggml ne=[K, T, B].
-    // Output: (N, T, B).
-    // bias: (N,) — broadcast over T, B.
+
+
     std::vector<float> W_f32(K * N);
     std::vector<float> X_f32(K * T * B);
     std::vector<float> bias_f32(N);
@@ -278,7 +257,7 @@ static int test_mul_mm_fused(ggml_backend_t cpu, ggml_backend_t gpu,
         ggml_gallocr_reserve(allocr, gf);
         ggml_gallocr_alloc_graph(allocr, gf);
 
-        // Quantise W to Q4_0 into the backend buffer.
+
         {
             std::vector<uint8_t> qbuf(ggml_nbytes(ggml_graph_get_tensor(gf, "W")));
             ggml_quantize_chunk(GGML_TYPE_Q4_0, W_f32.data(), qbuf.data(), 0, N, K, nullptr);
@@ -308,15 +287,8 @@ static int test_mul_mm_fused(ggml_backend_t cpu, ggml_backend_t gpu,
         const float r = d / std::max(std::fabs(ref[i]), 1e-6f);
         if (d > max_err) max_err = d;
         if (r > max_rel) max_rel = r;
-        // Tolerance: the CPU reference and the GPU kernel both dequantize
-        // Q4_0 then do f32 mul_mat, but in different accumulation orders
-        // (CPU walks rows scalarly, Metal kernel_mul_mm uses cooperative
-        // matmul on 8x8 tiles).  Observed max abs ~5e-3 on Q4_0 shapes
-        // in the 256..1024 range.  Fail only if abs diff exceeds 2e-2
-        // — that's 4x the Q4_0 noise floor, catches real kernel bugs
-        // (like §3.29's reverted direct-store RMW which would have
-        // shown up as wholesale >1e-1 drift) without flagging
-        // accumulation-order drift.
+
+
         if (d > 2e-2f) {
             if (bad < 5) {
                 fprintf(stderr, "\n  mismatch @ %zu: cpu=%.6g gpu=%.6g diff=%.3e rel=%.3e",
@@ -352,29 +324,24 @@ int main() {
     int rc = 0;
     rc |= test_diag_mask_inf(cpu, gpu);
     rc |= test_pad_ext(cpu, gpu);
-    // HiFT-sized shapes:
-    rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/130, /*IC=*/512, /*OC=*/256, /*K=*/16, /*s0=*/8,  "ups[0]");
-    rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/1040, /*IC=*/256, /*OC=*/128, /*K=*/15, /*s0=*/5, "ups[1]");
-    rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/5200, /*IC=*/128, /*OC=*/64,  /*K=*/11, /*s0=*/3, "ups[2]");
-    // A small sanity case too.
-    rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/10,   /*IC=*/3,   /*OC=*/4,   /*K=*/5,  /*s0=*/2, "tiny");
 
-    // MUL_MAT + ADD(bias) fusion (PROGRESS §3.27): CFM transformer hot shapes.
-    //   K=256, N=256 — attn to_q / to_k / to_v
-    //   K=256, N=512 — attn to_out
-    //   K=256, N=1024 — FF gate (ff0; also tested with gelu)
-    //   K=1024, N=256 — FF down (ff2)
-    // T=87, B=2 matches CFM's use_b2=true configuration.
-    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/ 256, /*T=*/87, /*B=*/2, /*fuse=*/0, "cfm-attn-qkv");
-    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/ 512, /*T=*/87, /*B=*/2, /*fuse=*/0, "cfm-attn-out");
-    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/1024, /*T=*/87, /*B=*/2, /*fuse=*/0, "cfm-ff-gate-bias");
-    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/1024, /*T=*/87, /*B=*/2, /*fuse=*/1, "cfm-ff-gate-bias+gelu");
-    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/1024, /*N=*/ 256, /*T=*/87, /*B=*/2, /*fuse=*/0, "cfm-ff-down");
-    // Batch=1 sanity — exercises the non-batch path of the dispatcher.
-    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/ 512, /*T=*/87, /*B=*/1, /*fuse=*/0, "cfm-b1");
-    // Non-64-multiple N to exercise the bounds-checked (bco=1) shmem path.
-    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/ 320, /*T=*/87, /*B=*/2, /*fuse=*/0, "bco-bias");
-    rc |= test_mul_mm_fused(cpu, gpu, /*K=*/ 256, /*N=*/ 320, /*T=*/87, /*B=*/2, /*fuse=*/1, "bco-gelu");
+    rc |= test_conv_transpose_1d(cpu, gpu, 130, 512, 256, 16, 8,  "ups[0]");
+    rc |= test_conv_transpose_1d(cpu, gpu, 1040, 256, 128, 15, 5, "ups[1]");
+    rc |= test_conv_transpose_1d(cpu, gpu, 5200, 128, 64,  11, 3, "ups[2]");
+
+    rc |= test_conv_transpose_1d(cpu, gpu, 10,   3,   4,   5,  2, "tiny");
+
+
+    rc |= test_mul_mm_fused(cpu, gpu,  256,  256, 87, 2, 0, "cfm-attn-qkv");
+    rc |= test_mul_mm_fused(cpu, gpu,  256,  512, 87, 2, 0, "cfm-attn-out");
+    rc |= test_mul_mm_fused(cpu, gpu,  256, 1024, 87, 2, 0, "cfm-ff-gate-bias");
+    rc |= test_mul_mm_fused(cpu, gpu,  256, 1024, 87, 2, 1, "cfm-ff-gate-bias+gelu");
+    rc |= test_mul_mm_fused(cpu, gpu, 1024,  256, 87, 2, 0, "cfm-ff-down");
+
+    rc |= test_mul_mm_fused(cpu, gpu,  256,  512, 87, 1, 0, "cfm-b1");
+
+    rc |= test_mul_mm_fused(cpu, gpu,  256,  320, 87, 2, 0, "bco-bias");
+    rc |= test_mul_mm_fused(cpu, gpu,  256,  320, 87, 2, 1, "bco-gelu");
 
     ggml_backend_free(gpu);
     ggml_backend_free(cpu);

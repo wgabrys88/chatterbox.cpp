@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""
-extract-voice.py — turn an arbitrary voice recording into a clean 24 kHz mono
-WAV that's optimal as a Chatterbox voice-cloning reference.
 
-Workflow:
-  1. Probe the source with ffprobe (duration, codec, bitrate).
-  2. Use ffmpeg silencedetect to split the file into speech regions.
-  3. Rank candidate windows (5-15 s, longest clean run preferred; falls back to
-     concatenating the two best short runs when no single long block exists).
-  4. Pick a filter chain based on source codec:
-       clean   (WAV / FLAC / high-bitrate AAC+MP3): minimal (highpass + alimiter)
-       lossy   (Opus / low-bitrate AAC+MP3):         full recovery chain
-                                                     (highpass + denoise + EQ +
-                                                      loudnorm + alimiter)
-  5. Run ffmpeg, writing `voices/<name>.wav`.
-  6. Optionally bake the voice profile via `./build/tts-cli --save-voice`.
-
-Typical use:
-    ./scripts/extract-voice.py ~/Downloads/marco.ogg
-    ./scripts/extract-voice.py ~/Downloads/marco.ogg --name marco --bake
-    ./scripts/extract-voice.py ~/Downloads/marco.ogg --name marco --target 8
-
-Requires: ffmpeg / ffprobe on PATH, Python 3.8+, and (if --bake) a built
-./build/tts-cli plus models/t3-q8_0.gguf + models/chatterbox-s3gen-q8_0.gguf.
-"""
 
 from __future__ import annotations
 
@@ -37,33 +13,33 @@ import sys
 from pathlib import Path
 
 
-# ---------------------------------------------------------------------------
-# Chatterbox requirements.
-# ---------------------------------------------------------------------------
-MIN_REF_SECONDS = 5.1      # tts-cli errors under 5.0 s; leave a safety margin
-MAX_REF_SECONDS = 15.0     # longer than this dilutes the speaker embedding
-DEFAULT_TARGET  = 10.0     # sweet spot between prosody variety and focused timbre
+
+
+
+MIN_REF_SECONDS = 5.1
+MAX_REF_SECONDS = 15.0
+DEFAULT_TARGET  = 10.0
 SAMPLE_RATE     = 24000
 
 
-# ---------------------------------------------------------------------------
-# Filter chains — tuned for Chatterbox's 80-channel log-mel pipeline.
-#
-# "clean"     — minimal (highpass + alimiter), trust the source.  Right
-#               thing for WAV/FLAC and high-bitrate AAC/MP3.
-# "lossy"     — restores presence / air that low-bitrate codecs strip and
-#               loudness-normalises so the speaker embedding doesn't drift
-#               on the shouted/whispered axis.  Good for short sources
-#               without a usable silent region.
-# "noisered"  — SoX noiseprof + noisered: profile the file's silent head,
-#               spectrally subtract that codec noise floor from the speech
-#               window, then highpass + peak-normalise.  On an 18 kbps
-#               Opus source this beat the "lossy" chain cleanly in our
-#               A/B testing (the voice encoder preferred cleaner-but-
-#               duller over synthetic-brightness-tacked-on).  Requires
-#               SoX and at least ~0.3 s of silence at the start of the
-#               file (ffprobed via silencedetect).
-# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 FILTER_CHAIN_CLEAN = (
     "highpass=f=60,"
     "alimiter=limit=0.85:level=disabled"
@@ -78,25 +54,25 @@ FILTER_CHAIN_LOSSY = (
     "alimiter=limit=0.85:level=disabled"
 )
 
-# "noisered" is executed via SoX, not as an ffmpeg -af string.  See
-# extract_via_sox_noisered() below.
-NOISERED_MIN_SILENT_HEAD = 0.3   # s of silence at the start of the file
-                                 # required before we can build a noise
-                                 # profile.
 
-# Sources with any of these codec + bitrate combinations are treated as "lossy".
+
+NOISERED_MIN_SILENT_HEAD = 0.3
+
+
+
+
 LOSSY_CODECS = {"opus", "vorbis"}
-LOSSY_BITRATE_THRESHOLD = {    # <= this bitrate → lossy chain
+LOSSY_BITRATE_THRESHOLD = {
     "aac":       96_000,
     "mp3":       128_000,
-    "opus":    1_000_000,      # any opus → lossy chain
+    "opus":    1_000_000,
     "vorbis":  1_000_000,
 }
 
 
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
+
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
@@ -111,21 +87,21 @@ def _require(prog: str) -> None:
         sys.exit(f"error: {prog} not found on PATH")
 
 
-# ---------------------------------------------------------------------------
-# Probing & silence detection
-# ---------------------------------------------------------------------------
+
+
+
 @dataclasses.dataclass
 class SourceInfo:
     path:       Path
-    duration:   float       # seconds
-    codec:      str         # e.g. "opus", "aac", "pcm_s16le"
-    bitrate:    int         # bps; 0 = unknown
+    duration:   float
+    codec:      str
+    bitrate:    int
     channels:   int
     sample_rate: int
-    silent_head:  float = 0.0    # duration of silence at start of file (s)
-    # (start, length) of the longest internal silence block in the file;
-    # (0, 0) if nothing found.  Used as the noise-profile source when
-    # silent_head is too short.
+    silent_head:  float = 0.0
+
+
+
     longest_silence: tuple = (0.0, 0.0)
 
     @property
@@ -136,19 +112,6 @@ class SourceInfo:
         return thr is not None and 0 < self.bitrate <= thr
 
     def noise_profile_source(self) -> tuple[float, float] | None:
-        """
-        Pick the best (start, length) window to use as noise profile source.
-        Preference order:
-          1. Any internal silence block >= NOISERED_MIN_SILENT_HEAD (we take
-             a 0.3 s slice from its middle — more likely to be true room
-             tone than the edges, which often contain breath tails).
-          2. The silent head of the file, if long enough.
-          3. The first 0.3 s of the file even when it's speech.  SoX's
-             spectral subtraction of "speech-tonality" content empirically
-             produces a result the voice encoder likes on heavily
-             Opus-damaged sources (beats the EQ-boost chain in A/B).
-        Returns None only when the file is too short for any profile.
-        """
         st, ln = self.longest_silence
         if ln >= NOISERED_MIN_SILENT_HEAD:
             prof_len = min(0.3, ln - 0.05)
@@ -195,7 +158,6 @@ class Region:
 def find_speech_regions(info: SourceInfo,
                         silence_db: float = -30.0,
                         silence_min: float = 0.3) -> list[Region]:
-    """Return [(start, end), ...] of speech regions (complement of silencedetect)."""
     r = subprocess.run(
         ["ffmpeg", "-nostats", "-i", str(info.path),
          "-af", f"silencedetect=noise={silence_db}dB:d={silence_min}",
@@ -207,11 +169,11 @@ def find_speech_regions(info: SourceInfo,
         if "silence_start:" in line:
             starts.append(float(line.split("silence_start:")[1].strip()))
         elif "silence_end:" in line:
-            # "silence_end: 12.345 | silence_duration: ..."
+
             ends.append(float(line.split("silence_end:")[1].split("|")[0].strip()))
 
-    # Speech regions = file span minus silence intervals.
-    cuts: list[tuple[float, float]] = []  # (silence_start, silence_end)
+
+    cuts: list[tuple[float, float]] = []
     for s, e in zip(starts, ends):
         cuts.append((s, e))
 
@@ -224,16 +186,16 @@ def find_speech_regions(info: SourceInfo,
     if cursor < info.duration:
         regions.append(Region(cursor, info.duration))
 
-    # Record how much silence (if any) sits at the head of the file, so
-    # the caller can decide whether a SoX-noiseprof noise-subtraction
-    # pass is viable.  silencedetect brackets SILENCE intervals, so the
-    # first silence_end is effectively the length of leading silence.
+
+
+
+
     if ends and (not starts or ends[0] < starts[0]):
         info.silent_head = ends[0]
 
-    # Also track the longest internal silence block so the noisered chain
-    # has an in-file noise sample even when the file starts with speech.
-    # silencedetect gives us paired (start, end) intervals.
+
+
+
     best_len = 0.0
     best_st  = 0.0
     for s, e in zip(starts, ends):
@@ -243,16 +205,16 @@ def find_speech_regions(info: SourceInfo,
             best_st  = s
     info.longest_silence = (best_st, best_len)
 
-    # Drop micro-fragments; they're usually plosives / sniffs, not speech.
+
     return [r for r in regions if r.length >= 1.0]
 
 
-# ---------------------------------------------------------------------------
-# Region selection — pick the window that maximises "likely-to-clone-well".
-# ---------------------------------------------------------------------------
+
+
+
 @dataclasses.dataclass
 class WindowPlan:
-    # Either one continuous window (a..b) or two concatenated windows.
+
     segments: list[Region]
     reason:   str
 
@@ -264,19 +226,6 @@ class WindowPlan:
 def plan_window(regions: list[Region],
                 target: float,
                 safety_margin: float = 0.2) -> WindowPlan:
-    """
-    Pick a window of `target` seconds (clamped to [MIN_REF_SECONDS, MAX_REF_SECONDS]).
-
-    Strategy:
-      1. If any single region is >= target, pick the first such region and
-         extract `target` seconds from its start, skipping `safety_margin` at
-         each edge to avoid clipping into the adjacent silence boundary (where
-         silencedetect may have under-counted consonant tails).
-      2. Else if the longest region is >= MIN_REF_SECONDS, use it in full.
-      3. Else concatenate the two longest regions.  Avoids single-phrase
-         references which can over-fit on one phrase's prosody.
-      4. Else error out — there's not enough speech.
-    """
     if not regions:
         sys.exit("error: no speech regions detected (silencedetect found only silence)")
 
@@ -284,21 +233,21 @@ def plan_window(regions: list[Region],
 
     long_enough = [r for r in regions if r.length >= target + 2 * safety_margin]
     if long_enough:
-        # Prefer regions in the middle of the recording: the speaker is usually
-        # warmed up by then and hasn't started wrapping up yet.
+
+
         long_enough.sort(key=lambda r: abs((r.start + r.end) / 2 -
                                             (regions[0].start + regions[-1].end) / 2))
         r = long_enough[0]
         mid = (r.start + r.end) / 2
         start = max(r.start + safety_margin, mid - target / 2)
         end   = min(r.end   - safety_margin, start + target)
-        start = end - target  # re-anchor in case end hit the tail bound
+        start = end - target
         return WindowPlan(
             [Region(start, end)],
             f"continuous {target:.1f}s from region [{r.start:.2f}..{r.end:.2f}]",
         )
 
-    # No single window is long enough.  Look for the longest region outright.
+
     regions_sorted = sorted(regions, key=lambda r: -r.length)
     longest = regions_sorted[0]
     if longest.length >= MIN_REF_SECONDS:
@@ -310,7 +259,7 @@ def plan_window(regions: list[Region],
                 f"best single region [{start:.2f}..{end:.2f}] ({end-start:.1f}s)",
             )
 
-    # Concatenate the two longest regions.
+
     r1, r2 = regions_sorted[0], regions_sorted[1] if len(regions_sorted) > 1 else None
     if r2 is None:
         sys.exit(f"error: only one speech region found, {longest.length:.1f}s — "
@@ -323,7 +272,7 @@ def plan_window(regions: list[Region],
                  f"need > {MIN_REF_SECONDS:.1f}s")
     seg_a = Region(r1.start + safety_margin, r1.start + safety_margin + a)
     seg_b = Region(r2.start + safety_margin, r2.start + safety_margin + b)
-    # Concat in source order so prosody reads naturally.
+
     segs = sorted([seg_a, seg_b], key=lambda r: r.start)
     return WindowPlan(
         segs,
@@ -332,19 +281,18 @@ def plan_window(regions: list[Region],
     )
 
 
-# ---------------------------------------------------------------------------
-# Extraction — ffmpeg chain OR SoX noiseprof pipeline
-# ---------------------------------------------------------------------------
+
+
+
 def _pick_chain(info: SourceInfo, override: str | None) -> str:
-    """Pick the chain name: 'clean' | 'lossy' | 'noisered'."""
     if override:
         return override
     if info.is_lossy:
-        # Prefer the SoX noise-profile pipeline; it beat the EQ-boost
-        # "lossy" chain on 18 kbps Opus in A/B testing.  noise_profile_
-        # source() falls back to sampling the first 0.3 s of the file
-        # even when that's speech (SoX's spectral subtraction happens
-        # to produce a voice-encoder-friendly signal in that case too).
+
+
+
+
+
         if shutil.which("sox") and info.noise_profile_source() is not None:
             return "noisered"
         return "lossy"
@@ -353,7 +301,6 @@ def _pick_chain(info: SourceInfo, override: str | None) -> str:
 
 def _extract_ffmpeg_chain(info: SourceInfo, plan: WindowPlan, out_wav: Path,
                           chain_str: str, verbose: bool) -> None:
-    """Run a standard ffmpeg -af chain over the window(s)."""
     if len(plan.segments) == 1:
         seg = plan.segments[0]
         cmd = [
@@ -368,8 +315,8 @@ def _extract_ffmpeg_chain(info: SourceInfo, plan: WindowPlan, out_wav: Path,
         _run(cmd)
         return
 
-    # Multiple segments: filter each separately (so loudnorm etc. sees
-    # consistent material), concat via the concat demuxer.
+
+
     tmp_files: list[Path] = []
     for i, seg in enumerate(plan.segments):
         tmp = out_wav.with_suffix(f".part{i}.wav")
@@ -385,7 +332,7 @@ def _extract_ffmpeg_chain(info: SourceInfo, plan: WindowPlan, out_wav: Path,
         _run(cmd)
         tmp_files.append(tmp)
 
-    # Concat via ffmpeg's concat demuxer.
+
     list_txt = out_wav.with_suffix(".concat.txt")
     list_txt.write_text("".join(f"file '{p.resolve()}'\n" for p in tmp_files))
     cmd = ["ffmpeg", "-y", "-v", "error",
@@ -400,12 +347,6 @@ def _extract_ffmpeg_chain(info: SourceInfo, plan: WindowPlan, out_wav: Path,
 
 def _extract_sox_noisered(info: SourceInfo, plan: WindowPlan, out_wav: Path,
                           verbose: bool) -> None:
-    """
-    Two-pass pipeline: sox noiseprof on a silent snippet from the head of
-    the file, then sox noisered on the ffmpeg-extracted speech window.
-    The final signal is highpass-filtered at 60 Hz and peak-normalised to
-    -3 dBFS, matching the 'S' variant that won the A/B test.
-    """
     _require("sox")
     prof = info.noise_profile_source()
     if prof is None:
@@ -416,7 +357,7 @@ def _extract_sox_noisered(info: SourceInfo, plan: WindowPlan, out_wav: Path,
     noise_prof = out_wav.with_suffix(".noise.prof")
     raw_wav    = out_wav.with_suffix(".raw.wav")
 
-    # 1) Extract noise snippet as 24 kHz mono s16le.
+
     cmd = ["ffmpeg", "-y", "-v", "error",
            "-ss", f"{prof_start:.3f}", "-t", f"{prof_len:.3f}", "-i", str(info.path),
            "-ac", "1", "-ar", str(SAMPLE_RATE), "-acodec", "pcm_s16le",
@@ -424,13 +365,13 @@ def _extract_sox_noisered(info: SourceInfo, plan: WindowPlan, out_wav: Path,
     if verbose: sys.stderr.write("$ " + " ".join(cmd) + "\n")
     _run(cmd)
 
-    # 2) Build the noise profile.
+
     cmd = ["sox", str(noise_wav), "-n", "noiseprof", str(noise_prof)]
     if verbose: sys.stderr.write("$ " + " ".join(cmd) + "\n")
     _run(cmd)
 
-    # 3) Extract the speech window (possibly concat if the plan is
-    #    two regions) to a raw 24 kHz mono s16le wav.
+
+
     if len(plan.segments) == 1:
         seg = plan.segments[0]
         cmd = ["ffmpeg", "-y", "-v", "error",
@@ -460,7 +401,7 @@ def _extract_sox_noisered(info: SourceInfo, plan: WindowPlan, out_wav: Path,
         for p in tmp_parts + [list_txt]:
             p.unlink(missing_ok=True)
 
-    # 4) Apply noise reduction + highpass + normalise to -3 dBFS.
+
     cmd = ["sox", str(raw_wav), str(out_wav),
            "noisered", str(noise_prof), "0.2",
            "highpass", "60",
@@ -468,17 +409,13 @@ def _extract_sox_noisered(info: SourceInfo, plan: WindowPlan, out_wav: Path,
     if verbose: sys.stderr.write("$ " + " ".join(cmd) + "\n")
     _run(cmd)
 
-    # Clean up intermediates.
+
     for p in (noise_wav, noise_prof, raw_wav):
         p.unlink(missing_ok=True)
 
 
 def extract(info: SourceInfo, plan: WindowPlan, out_wav: Path,
             chain: str, verbose: bool = False) -> None:
-    """
-    Dispatch on `chain` (one of "clean" / "lossy" / "noisered") and run
-    the matching extraction pipeline.
-    """
     if chain == "noisered":
         _extract_sox_noisered(info, plan, out_wav, verbose)
     elif chain == "lossy":
@@ -489,9 +426,9 @@ def extract(info: SourceInfo, plan: WindowPlan, out_wav: Path,
         sys.exit(f"internal error: unknown chain {chain!r}")
 
 
-# ---------------------------------------------------------------------------
-# Optional: bake the voice profile via ./build/tts-cli.
-# ---------------------------------------------------------------------------
+
+
+
 def bake(tts_cli: Path, t3: Path, s3gen: Path,
          ref_wav: Path, out_dir: Path,
          n_gpu_layers: int, verbose: bool) -> None:
@@ -514,9 +451,9 @@ def bake(tts_cli: Path, t3: Path, s3gen: Path,
     subprocess.run(cmd, check=True)
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
+
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -560,8 +497,8 @@ def main() -> None:
 
     info = probe(args.input)
 
-    # silencedetect runs first because we need info.silent_head in order
-    # to decide whether the 'noisered' chain is viable.
+
+
     regions = find_speech_regions(info, args.silence_db, args.silence_min)
     chain = _pick_chain(info, args.force_chain)
 

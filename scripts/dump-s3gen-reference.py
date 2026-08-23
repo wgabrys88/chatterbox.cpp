@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
-"""
-Dump every intermediate tensor from the Python S3Gen inference path.
 
-These tensors are used to verify the C++/ggml implementation stage by stage.
-
-Output layout (directory passed via --out):
-    text_tokens.npy           int32  (N_text,)
-    speech_tokens.npy         int32  (N_speech,)
-    speech_tokens_padded.npy  int32  (N_speech_with_silence,)
-    flow_input_tokens.npy     int32  (N_prompt+N_speech+sil,)     concat of prompt_token + trimmed speech_tokens
-    embedding.npy             float32 (192,)
-    speaker_emb_normalized.npy float32 (192,)
-    speaker_emb_affine.npy    float32 (80,)
-    input_embedded.npy        float32 (N_tokens, 512)
-    encoder_output.npy        float32 (2*N_tokens, 512)
-    encoder_proj.npy          float32 (2*N_tokens, 80)             mu
-    conds_filled.npy          float32 (80, 2*N_tokens)             prompt_feat + zeros
-    cfm_z0.npy                float32 (80, 2*N_tokens)             initial noise (fixed seed)
-    cfm_step0_dxdt.npy        float32 (80, 2*N_tokens)
-    cfm_step1_dxdt.npy        float32 (80, 2*N_tokens)
-    mel_output.npy            float32 (80, 2*N_speech)
-    waveform.npy              float32 (N_samples,)
-    prompt_token.npy          int32  (250,)
-    prompt_feat.npy           float32 (500, 80)
-"""
 
 import argparse
 import os
@@ -37,7 +13,6 @@ from chatterbox.models.s3gen.const import S3GEN_SIL
 
 
 def make_hook(storage: dict, name: str, multi_call: bool = False):
-    """If multi_call, each call saves with a sequence suffix _call0, _call1, ..."""
     counter = {"n": 0}
     def hook(_module, _inputs, output):
         key = f"{name}_call{counter['n']}" if multi_call else name
@@ -56,7 +31,7 @@ def save(t, path: Path):
         arr = t.detach().cpu().contiguous().numpy()
     else:
         arr = t
-    arr = np.ascontiguousarray(arr)  # force C-order for predictable byte layout
+    arr = np.ascontiguousarray(arr)
     np.save(path, arr)
     print(f"  {path.name:38s} shape={tuple(arr.shape)} dtype={arr.dtype}")
 
@@ -77,19 +52,19 @@ def main():
     tts = ChatterboxTurboTTS.from_pretrained(device=args.device)
     assert tts.conds is not None
 
-    # ------------------------------------------------------------------
-    # 1. Text tokens
-    # ------------------------------------------------------------------
+
+
+
     print("\n--- Text tokenization ---")
     normalized = punc_norm(args.text)
     text_tokens = tts.tokenizer(normalized, return_tensors="pt").input_ids.to(tts.device)
     save(text_tokens.squeeze(0).int(), args.out / "text_tokens.npy")
 
-    # ------------------------------------------------------------------
-    # 2. Speech tokens from T3 (deterministic, greedy)
-    # ------------------------------------------------------------------
+
+
+
     print("\n--- T3 speech token generation ---")
-    torch.manual_seed(args.seed)  # reset before T3 forward
+    torch.manual_seed(args.seed)
     speech_tokens = tts.t3.inference_turbo(
         t3_cond=tts.conds.t3, text_tokens=text_tokens,
         temperature=1.0, top_k=1, top_p=1.0, repetition_penalty=1.0,
@@ -97,16 +72,16 @@ def main():
     )
     save(speech_tokens.squeeze(0).int(), args.out / "speech_tokens.npy")
 
-    # Remove OOV tokens and add silence (matches tts_turbo.py generate())
+
     speech_tokens_trim = speech_tokens[speech_tokens < 6561]
     silence = torch.tensor([S3GEN_SIL, S3GEN_SIL, S3GEN_SIL]).long().to(tts.device)
     speech_tokens_padded = torch.cat([speech_tokens_trim, silence])
     save(speech_tokens_padded.int(), args.out / "speech_tokens_padded.npy")
     print(f"Trimmed+silence: {speech_tokens_padded.shape}")
 
-    # ------------------------------------------------------------------
-    # 3. S3Gen flow inference, with hooks to capture intermediates
-    # ------------------------------------------------------------------
+
+
+
     print("\n--- S3Gen flow inference (with hooks) ---")
     flow = tts.s3gen.flow
 
@@ -116,7 +91,7 @@ def main():
         flow.spk_embed_affine_layer.register_forward_hook(make_hook(storage, "speaker_emb_affine")),
         flow.encoder.register_forward_hook(make_hook(storage, "encoder_out")),
         flow.encoder_proj.register_forward_hook(make_hook(storage, "encoder_proj")),
-        # Intermediate encoder stages
+
         flow.encoder.embed.register_forward_hook(make_hook(storage, "encoder_embed")),
         flow.encoder.pre_lookahead_layer.register_forward_hook(make_hook(storage, "pre_lookahead")),
         flow.encoder.up_layer.register_forward_hook(make_hook(storage, "up_layer")),
@@ -128,7 +103,7 @@ def main():
     for i in range(4):
         hooks.append(flow.encoder.up_encoders[i].register_forward_hook(make_hook(storage, f"up_block{i}")))
 
-    # Extra hooks inside block 0 to debug attention
+
     b0 = flow.encoder.encoders[0]
     hooks.append(b0.norm_mha.register_forward_hook(make_hook(storage, "b0_norm_mha")))
     hooks.append(b0.self_attn.linear_q.register_forward_hook(make_hook(storage, "b0_q")))
@@ -139,37 +114,37 @@ def main():
     hooks.append(b0.norm_ff.register_forward_hook(make_hook(storage, "b0_norm_ff")))
     hooks.append(b0.feed_forward.register_forward_hook(make_hook(storage, "b0_ff_out")))
 
-    # Hooks inside CFM decoder for stage-by-stage validation
+
     est = flow.decoder.estimator
-    # Time MLP path - multi_call=True since called per step (and per t/r)
+
     hooks.append(est.time_embeddings.register_forward_hook(make_hook(storage, "cfm_t_sinemb", multi_call=True)))
     hooks.append(est.time_mlp.register_forward_hook(make_hook(storage, "cfm_t_mlp", multi_call=True)))
     hooks.append(est.time_embed_mixer.register_forward_hook(make_hook(storage, "cfm_t_mix", multi_call=True)))
-    # First down_block (multi_call to capture step 0 and step 1)
-    d0_rn = est.down_blocks[0][0]                  # CausalResnetBlock1D
+
+    d0_rn = est.down_blocks[0][0]
     hooks.append(d0_rn.block1.register_forward_hook(make_hook(storage, "cfm_d0_rn_b1", multi_call=True)))
     hooks.append(d0_rn.block2.register_forward_hook(make_hook(storage, "cfm_d0_rn_b2", multi_call=True)))
     hooks.append(d0_rn.mlp.register_forward_hook(make_hook(storage, "cfm_d0_rn_mlp", multi_call=True)))
     hooks.append(d0_rn.res_conv.register_forward_hook(make_hook(storage, "cfm_d0_rn_res", multi_call=True)))
     hooks.append(d0_rn.register_forward_hook(make_hook(storage, "cfm_d0_rn", multi_call=True)))
-    # First transformer block in down_block 0
-    d0_t0 = est.down_blocks[0][1][0]               # BasicTransformerBlock
+
+    d0_t0 = est.down_blocks[0][1][0]
     hooks.append(d0_t0.norm1.register_forward_hook(make_hook(storage, "cfm_d0_t0_n1", multi_call=True)))
     hooks.append(d0_t0.attn1.register_forward_hook(make_hook(storage, "cfm_d0_t0_attn", multi_call=True)))
     hooks.append(d0_t0.norm3.register_forward_hook(make_hook(storage, "cfm_d0_t0_n3", multi_call=True)))
     hooks.append(d0_t0.ff.register_forward_hook(make_hook(storage, "cfm_d0_t0_ff", multi_call=True)))
     hooks.append(d0_t0.register_forward_hook(make_hook(storage, "cfm_d0_t0", multi_call=True)))
-    # Whole down_block[0] output (after downsample)
+
     hooks.append(est.down_blocks[0][2].register_forward_hook(make_hook(storage, "cfm_d0_downsample", multi_call=True)))
-    # Last mid_block output
+
     hooks.append(est.mid_blocks[-1].register_forward_hook(make_hook(storage, "cfm_mid_last", multi_call=True)))
-    # Up_block
+
     hooks.append(est.up_blocks[0][0].register_forward_hook(make_hook(storage, "cfm_u0_rn", multi_call=True)))
     hooks.append(est.up_blocks[0][2].register_forward_hook(make_hook(storage, "cfm_u0_upsample", multi_call=True)))
     hooks.append(est.final_block.register_forward_hook(make_hook(storage, "cfm_final_block", multi_call=True)))
     hooks.append(est.final_proj.register_forward_hook(make_hook(storage, "cfm_final_proj", multi_call=True)))
 
-    # Also save the raw embedding + normalized
+
     ref = tts.conds.gen
     embedding = ref["embedding"]
     prompt_token = ref["prompt_token"]
@@ -180,18 +155,18 @@ def main():
     save(prompt_token.squeeze(0).int().cpu(), args.out / "prompt_token.npy")
     save(prompt_feat.squeeze(0).cpu(), args.out / "prompt_feat.npy")
 
-    # Build the input flow sees: prompt_token + speech_tokens_padded
+
     flow_input_tokens = torch.cat([prompt_token.squeeze(0).cpu(),
                                    speech_tokens_padded.cpu()])
     save(flow_input_tokens.int(), args.out / "flow_input_tokens.npy")
 
-    # Capture CFM internals: z (initial noise) via torch.randn_like monkeypatch,
-    # and per-step dxdt via a hook on cfm.estimator.
+
+
     cfm = flow.decoder
     captured = {}
 
-    # basic_euler calls self.estimator.forward directly -> hooks don't fire.
-    # So we monkeypatch the forward method instead.
+
+
     step_idx = [0]
     estimator = cfm.estimator
     orig_est_forward = estimator.forward
@@ -210,19 +185,19 @@ def main():
         return out
     estimator.forward = estimator_forward_capture
 
-    # Monkeypatch torch.randn_like only inside the CFM call to capture z
+
     import torch as _torch
     orig_randn_like = _torch.randn_like
     z_captured = {"count": 0}
     def randn_like_capture(x, *a, **kw):
         out = orig_randn_like(x, *a, **kw)
-        if z_captured["count"] == 0:  # first call inside CFM is the z init
+        if z_captured["count"] == 0:
             captured["cfm_z0_raw"] = out.detach().clone().cpu()
             z_captured["count"] += 1
         return out
     _torch.randn_like = randn_like_capture
 
-    # Also monkeypatch torch.randn to capture the flow_inference noise (meanflow noise buffer)
+
     orig_randn = _torch.randn
     noise_captured = {"count": 0}
     def randn_capture(*a, **kw):
@@ -234,7 +209,7 @@ def main():
     _torch.randn = randn_capture
 
     try:
-        torch.manual_seed(args.seed)  # reset before CFM noise
+        torch.manual_seed(args.seed)
         mel = tts.s3gen.flow_inference(
             speech_tokens=speech_tokens_padded.unsqueeze(0).to(tts.device),
             ref_dict=ref,
@@ -248,7 +223,7 @@ def main():
         for h in hooks:
             h.remove()
 
-    # Save hooked tensors
+
     for name, t in storage.items():
         if t is None: continue
         save(t.squeeze(0) if t.ndim > 1 else t, args.out / f"{name}.npy")
@@ -258,9 +233,9 @@ def main():
 
     save(mel.squeeze(0).cpu(), args.out / "mel_output.npy")
 
-    # ------------------------------------------------------------------
-    # 4. HiFTGenerator inference (re-register hooks since CFM ones were removed)
-    # ------------------------------------------------------------------
+
+
+
     print("\n--- HiFT vocoder inference ---")
     hift = tts.s3gen.mel2wav
     hift_storage = {}
@@ -279,18 +254,18 @@ def main():
     for i in range(9):
         hift_hooks.append(hift.resblocks[i].register_forward_hook(make_hook(hift_storage, f"hift_rb{i}")))
 
-    # Monkeypatch SineGen's random bits so we can reproduce in C++
+
     sg = hift.m_source.l_sin_gen
     orig_sg_forward = sg.forward
     def sinegen_capture(f0_):
-        # Save inputs
+
         hift_storage["hift_sinegen_input"] = f0_.detach().clone().cpu()
-        # Also capture the uniform phase and gaussian noise before forward calls them
+
         out = orig_sg_forward(f0_)
         return out
     sg.forward = sinegen_capture
 
-    # Also capture the Uniform sample used for phase and the randn used for noise in SineGen.
+
     from torch.distributions.uniform import Uniform as _Uniform
     orig_uniform_sample = _Uniform.sample
     uniform_seen = {"count": 0}
@@ -312,13 +287,13 @@ def main():
         return s
     _torch.randn_like = randn_like_capture2
 
-    # Also capture the randn used for the m_source noise branch
+
     orig_randn_like3 = _torch.randn_like
-    # Note: m_source calls randn_like once more outside SineGen.
-    # We use a counter to distinguish: first call is inside SineGen, second is the outer noise branch.
+
+
 
     try:
-        torch.manual_seed(args.seed + 1)  # Different seed so HiFT random is reproducible per run
+        torch.manual_seed(args.seed + 1)
         hift_cache = torch.zeros(1, 1, 0).to(tts.device)
         wavs, _ = tts.s3gen.mel2wav.inference(speech_feat=mel, cache_source=hift_cache)
     finally:
@@ -335,9 +310,9 @@ def main():
     wav = wavs.squeeze(0).squeeze(0).cpu()
     save(wav, args.out / "waveform.npy")
 
-    # ------------------------------------------------------------------
-    # 5. Save also as WAV for auditory check
-    # ------------------------------------------------------------------
+
+
+
     try:
         import torchaudio as ta
         ta.save(str(args.out / "reference.wav"), wav.unsqueeze(0), tts.sr)

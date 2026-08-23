@@ -1,6 +1,5 @@
-// Smoke-test for resample_sinc. Generates a broadband test signal (multi-tone)
-// in memory, round-trips it through 24 kHz -> 48 kHz -> 24 kHz, and reports
-// SNR in the middle of the buffer (well past the filter transient).
+
+
 
 #include "voice_features.h"
 
@@ -12,14 +11,14 @@
 int main(int argc, char ** argv) {
     (void)argc; (void)argv;
 
-    // 4 seconds of a multi-tone signal at 24 kHz.
+
     const int sr = 24000;
     const int N = 4 * sr;
     std::vector<float> in(N);
     for (int i = 0; i < N; ++i) {
         double t = (double)i / sr;
-        // Frequencies well below Nyquist so the resampler shouldn't have to
-        // attenuate them.
+
+
         double s = 0.25 * std::sin(2 * M_PI *  220.0 * t)
                  + 0.25 * std::sin(2 * M_PI *  880.0 * t)
                  + 0.25 * std::sin(2 * M_PI * 2200.0 * t)
@@ -33,7 +32,7 @@ int main(int argc, char ** argv) {
     printf("up:   samples=%zu sr=48000\n", up.size());
     printf("back: samples=%zu sr=24000 (expected ~%zu)\n", back.size(), in.size());
 
-    // Compare middle region (skip the half-filter-length boundary).
+
     const size_t N_ = std::min(in.size(), back.size());
     const size_t skip = 64;
     float in_rms = 0, diff_rms = 0, diff_max = 0;

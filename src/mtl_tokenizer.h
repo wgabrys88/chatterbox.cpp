@@ -12,12 +12,11 @@ public:
     bool load_from_json(const std::string & json_blob);
     bool load_from_file(const std::string & path);
 
-    // Encode text with optional language prefix. Returns token IDs.
-    // Throws std::runtime_error on unsupported language.
+
     std::vector<int32_t> encode(const std::string & text,
                                 const std::string & language_id = "") const;
 
-    // Decode IDs back to text (best-effort, for debugging).
+
     std::string decode(const std::vector<int32_t> & ids) const;
 
     bool is_language_supported(const std::string & lang) const;
@@ -27,10 +26,10 @@ public:
     int32_t unk_id() const;
     int32_t vocab_size() const;
 
-    // Tier-1 language codes handled natively by this build.
+
     static const std::vector<std::string> & supported_languages();
 
-    // Full list of language codes the Python reference tokenizer accepts.
+
     static const std::vector<std::string> & all_known_languages();
 
 private:
@@ -56,4 +55,4 @@ private:
     void bpe_word(const std::string & word, std::vector<int32_t> & out) const;
 };
 
-} // namespace tts_cpp::chatterbox::detail
+}

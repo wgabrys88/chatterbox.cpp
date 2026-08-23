@@ -1,18 +1,7 @@
 #!/usr/bin/env bash
-# Clone ggml into ./ggml, check out the commit this repo is pinned against,
-# and apply the Chatterbox Metal + (optional) OpenCL patches.  Re-running
-# resets the ggml worktree to the pin and reapplies both — local edits under
-# ./ggml are discarded.
-#
-# Update GGML_COMMIT when patches are re-generated against a newer upstream
-# ggml; this file is the single source of truth for the pin.
 
 set -euo pipefail
 
-# -----------------------------------------------------------------------------
-# The upstream ggml commit that patches/ggml-metal-chatterbox-ops.patch and
-# patches/ggml-opencl-chatterbox-ops.patch are authored against.
-# -----------------------------------------------------------------------------
 GGML_COMMIT="58c38058"
 GGML_URL="https://github.com/ggml-org/ggml.git"
 
@@ -31,8 +20,6 @@ cd ggml
 echo "  → resetting to ${GGML_COMMIT} (discarding uncommitted changes under ./ggml)"
 git fetch origin 2>/dev/null || true
 git reset --hard "$GGML_COMMIT"
-# Remove untracked files (e.g. left over from a previously applied patch) so
-# reapply is deterministic; ggml/ is not intended for long-lived local work.
 git clean -fdq
 
 echo "  → applying patches/ggml-metal-chatterbox-ops.patch"

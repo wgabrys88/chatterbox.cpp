@@ -1,7 +1,5 @@
-// Validation harness for the C++ S3TokenizerV2 port.
-//
-// Usage:
-//   ./build/test-s3tokenizer S3GEN.gguf WAV_16K.npy LOG_MEL.npy TOKENS.npy
+
+
 
 #include "s3tokenizer.h"
 #include "npy.h"
@@ -35,7 +33,7 @@ int main(int argc, char ** argv) {
                            (const float*)wav_npy.data.data() + wav_npy.n_elements());
     fprintf(stderr, "      %zu samples (%.2f s)\n", wav.size(), (double)wav.size() / 16000.0);
 
-    // ---- log-mel parity ----
+
     fprintf(stderr, "[3/4] comparing log-mel\n");
     int T_mel = 0;
     std::vector<float> mel_cpp = s3tokv2_log_mel(wav, w, T_mel);
@@ -53,7 +51,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "      log_mel: max_abs=%.4e  max|ref|=%.4e  rel=%.4e\n",
             (double)ma, (double)mref, (double)(ma / std::max(mref, 1e-12f)));
 
-    // ---- tokens ----
+
     fprintf(stderr, "[4/4] running tokenizer\n");
     auto t0 = std::chrono::steady_clock::now();
     std::vector<int32_t> tokens;

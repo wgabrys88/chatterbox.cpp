@@ -1,7 +1,5 @@
-// Validation harness for the C++ Kaldi fbank port.
-//
-// Usage:
-//   ./build/test-fbank S3GEN.gguf WAV_16K.npy FBANK_RAW.npy
+
+
 
 #include "voice_features.h"
 #include "npy.h"
@@ -24,10 +22,10 @@ int main(int argc, char ** argv) {
     const std::string wav_path  = argv[2];
     const std::string ref_path  = argv[3];
 
-    // Load the Kaldi mel filterbank from the GGUF metadata.
+
     fprintf(stderr, "[1/3] loading mel filterbank from %s\n", gguf_path.c_str());
     ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    gguf_init_params gp = {  false,  &tmp_ctx };
     gguf_context * g = gguf_init_from_file(gguf_path.c_str(), gp);
     if (!g) { fprintf(stderr, "cannot open gguf\n"); return 1; }
     ggml_tensor * fb = ggml_get_tensor(tmp_ctx, "campplus/mel_fb_kaldi_80");

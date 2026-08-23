@@ -10,9 +10,7 @@ struct gpt2_bpe {
     std::vector<std::string>                 id_to_token;
     std::unordered_map<std::string, int>     bpe_ranks;
 
-    // Populate from arrays read out of GGUF metadata
-    // (tokens indexed by id; merges are lines of form "left right").
-    // Returns false if `tokens` is empty.
+
     bool load_from_arrays(const std::vector<std::string> & tokens,
                           const std::vector<std::string> & merges);
 

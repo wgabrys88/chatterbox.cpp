@@ -1,37 +1,5 @@
 #!/usr/bin/env python3
-"""Reference streaming loop for S3Gen + HiFT, derived from the existing
-Python primitives (`flow.inference(finalize)` + `hift.inference(cache_source)`
-+ `trim_fade`).  Python has all the building blocks but never composes them
-into a streaming generator — this script does, and dumps per-chunk tensors
-so the C++ port (src/chatterbox_tts.cpp streaming path, PROGRESS B1) can
-validate chunk-by-chunk.
 
-What gets dumped for a `chunk_size=N` run that produces K chunks:
-
-    streaming_ref/
-      batch_mels.npy                  # (T_mel, 80) non-streamed reference mel
-      batch_wav.npy                   # (L,) non-streamed reference wav
-      chunk_{k}_tokens.npy            # int32 tokens fed to flow for chunk k
-      chunk_{k}_mels_new.npy          # the NEW mel frames emitted by chunk k
-      chunk_{k}_wav.npy               # wav this chunk contributes (pre-overlap-add)
-      chunk_{k}_source.npy            # SineGen source (full, for cache_source next call)
-      chunk_{k}_source_tail.npy       # last N samples of chunk k's source (= cache_source for k+1)
-      streamed_wav.npy                # final streamed wav after overlap-add
-      stats.json                      # chunk sizes + RMS(streamed - batch)
-
-The streamed wav should be numerically close (not bit-exact) to the batch
-wav because HiFT's resnet blocks have cross-chunk receptive fields we don't
-fully cache.  The cache_source fix + trim_fade keeps audible artifacts at
-the seams below the just-noticeable difference for typical HiFT window sizes
-(~20 ms).
-
-Usage:
-
-    python scripts/dump-streaming-reference.py REF.wav \\
-        --text "Hello in my voice." \\
-        --chunk-tokens 25 \\
-        --out artifacts/streaming-ref
-"""
 
 from __future__ import annotations
 
@@ -45,9 +13,6 @@ import soundfile as sf
 
 
 def _patch_dtype_bugs():
-    """The released chatterbox-ref has two torch dtype bugs that break
-    voice cloning on modern torch.  Monkey-patch them the same way we do
-    in other reference scripts."""
     from chatterbox.models.s3tokenizer.s3tokenizer import S3Tokenizer
     _orig_mel = S3Tokenizer.log_mel_spectrogram
     def _p_mel(self, audio, padding=0):
@@ -64,13 +29,6 @@ def _patch_dtype_bugs():
 
 
 def _patch_flow_finalize_bug():
-    """`finalize=False` in chatterbox-ref's flow.inference is dead code:
-    it trims `h` by `pre_lookahead_len * token_mel_ratio` frames but leaves
-    `h_masks` / `h_lengths` untouched, which explodes in the decoder.  The
-    upstream S3GenStreamer that was supposed to use this path isn't in this
-    repo.  Patch the method so finalize=False actually works — identical
-    to finalize=True on the last chunk, and consistently sized everywhere
-    else."""
     from chatterbox.models.s3gen.flow import _repeat_batch_dim
     from chatterbox.models.s3gen.utils.mask import make_pad_mask
     import torch.nn.functional as F
@@ -93,15 +51,15 @@ def _patch_flow_finalize_bug():
         token = self.input_embedding(token.long()) * mask
         h, h_masks = self.encoder(token, token_len)
 
-        # ---- THE FIX ----
-        # When streaming (finalize=False), drop the last `pre_lookahead_len *
-        # token_mel_ratio` mel frames AND shrink the mask/length accordingly
-        # so the decoder sees matching shapes.  When finalize=True, behave
-        # exactly like the released code.
+
+
+
+
+
         if finalize is False:
             trim = self.pre_lookahead_len * self.token_mel_ratio
             h = h[:, :-trim]
-            h_masks = h_masks[..., :-trim]  # h_masks is (B, 1, T)
+            h_masks = h_masks[..., :-trim]
 
         h_lengths = h_masks.sum(dim=-1).squeeze(dim=-1)
         mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
@@ -148,7 +106,7 @@ def main() -> None:
     cond_t3  = tts.conds.t3
     cond_gen = tts.conds.gen
 
-    # ---------- Step 1: generate speech tokens with T3 (same as batch path) ----------
+
     print(f"[1/3] T3 generating speech tokens for text: {args.text!r}")
     from chatterbox.tts_turbo import punc_norm
     text = punc_norm(args.text)
@@ -166,9 +124,9 @@ def main() -> None:
     np.save(args.out / "speech_tokens.npy",
             np.ascontiguousarray(speech_tokens.cpu().numpy().astype(np.int32)))
 
-    # Also dump the voice profile (what the C++ --ref-dir path expects) so a
-    # single --ref-dir points at everything the pipeline needs: voice + text
-    # tokens + chunk-by-chunk ground truth.
+
+
+
     np.save(args.out / "speaker_emb.npy",
             np.ascontiguousarray(cond_t3.speaker_emb.detach().squeeze().cpu().numpy().astype(np.float32)))
     np.save(args.out / "cond_prompt_speech_tokens.npy",
@@ -180,7 +138,7 @@ def main() -> None:
     np.save(args.out / "prompt_feat.npy",
             np.ascontiguousarray(cond_gen["prompt_feat"].detach().squeeze().cpu().numpy().astype(np.float32)))
 
-    # ---------- Step 2: batch reference (non-streamed) ----------
+
     print("[2/3] batch (non-streamed) reference")
     with torch.no_grad():
         batch_mels = tts.s3gen.flow_inference(
@@ -196,40 +154,40 @@ def main() -> None:
     np.save(args.out / "batch_wav.npy", np.ascontiguousarray(batch_wav))
     print(f"      batch: {batch_mels.shape[-1]} mel frames → {len(batch_wav)} wav samples")
 
-    # ---------- Step 3: streaming loop ----------
-    #
-    # The streaming primitives already in Python:
-    #   * flow.inference(..., finalize=False) trims the last
-    #     pre_lookahead_len * token_mel_ratio = 3*2 = 6 mel frames, so they
-    #     get re-computed with more right-context in the next chunk.
-    #   * hift.inference(..., cache_source=prev_tail) overrides the first N
-    #     samples of the new SineGen source with the tail of the previous
-    #     chunk's source, keeping F0 phase continuous across the seam.
-    #   * trim_fade is a 40 ms raised-cosine fade-in, applied ONLY to the
-    #     very first chunk (it masks HiFT's resnet cold start).
-    #
-    # What this loop does not do (would require graph-level state caching):
-    #   * Re-use encoder / CFM state across chunks.  Each chunk still runs
-    #     the full flow on the cumulative token prefix.  This is O(K²) but
-    #     keeps the output mel-for-mel identical to what a stateful streamer
-    #     would produce at the seam.
-    #
-    # token_mel_ratio = 2 (each speech token expands to 2 mel frames).
-    # pre_lookahead_len = 3 tokens → 6 mel frames trimmed when
-    # finalize=False.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     TOKEN_MEL_RATIO  = tts.s3gen.flow.token_mel_ratio
     PRE_LOOKAHEAD    = tts.s3gen.flow.pre_lookahead_len
-    LOOKAHEAD_MELS   = PRE_LOOKAHEAD * TOKEN_MEL_RATIO   # 6
-    # HiFT upsample: 1 mel frame = 480 wav samples (hop at 24 kHz).
+    LOOKAHEAD_MELS   = PRE_LOOKAHEAD * TOKEN_MEL_RATIO
+
     MEL_TO_WAV       = 480
-    # Cache_source overlap window: typically 30-50 ms.  HiFT's Python
-    # default drops cache_source on the floor unless caller carries it;
-    # we pick a 480-sample (20 ms) overlap which is 1 mel frame.
+
+
+
     SOURCE_OVERLAP   = MEL_TO_WAV
 
     chunk_tokens = args.chunk_tokens
     n_speech = len(speech_tokens)
-    # Boundaries: [0, chunk_tokens, 2*chunk_tokens, ..., n_speech]
+
     boundaries = list(range(0, n_speech, chunk_tokens)) + [n_speech]
 
     streamed_wav = np.zeros(0, dtype=np.float32)
@@ -239,37 +197,37 @@ def main() -> None:
 
     print(f"[3/3] streaming loop: {len(boundaries)-1} chunks × {chunk_tokens} tokens")
 
-    # Capture encoder_proj output (CFM's `mu` conditioning) for independent
-    # verification.  The FULL z passed into the estimator is captured below
-    # via the basic_euler wrapper — the earlier torch.randn_like hook was
-    # removed because in meanflow mode, `noised_mels` overwrites the
-    # speech region of z with a second randn draw, which the randn_like
-    # hook silently missed.
+
+
+
+
+
+
     captured_mu = {"mu": None}
     def _enc_proj_hook(mod, inp, out):
         captured_mu["mu"] = out.detach().clone().cpu()
     _mu_hook_handle = tts.s3gen.flow.encoder_proj.register_forward_hook(_enc_proj_hook)
 
-    # Hook flow_matching.forward so we capture the EXACT tensors the decoder
-    # sees (mu, mask, spks, cond), AND wrap basic_euler to grab the first-step
-    # inputs and output for bisection.  We go through the CFM's basic_euler
-    # wrapper because (a) it's the caller that actually invokes
-    # estimator.forward, and (b) its closure captures x after any dtype casts
-    # so we see exactly what the estimator receives.  nn.Module
-    # register_forward_hook won't fire here because basic_euler calls
-    # `self.estimator.forward(...)` directly (bypassing __call__).
+
+
+
+
+
+
+
+
     captured_decoder = {"mu": None, "mask": None, "spks": None, "cond": None}
     captured_step0 = {"x_in": None, "mask": None, "mu": None, "t": None,
                       "r": None, "spks": None, "cond": None, "dxdt": None}
 
     _orig_basic_euler = tts.s3gen.flow.decoder.basic_euler
     def _basic_euler_capture(x, t_span, mu, mask, spks, cond):
-        # stash decoder-level inputs (what C++ would pass in)
+
         captured_decoder["mu"]   = mu.detach().clone().cpu()
         captured_decoder["mask"] = mask.detach().clone().cpu()
         captured_decoder["spks"] = None if spks is None else spks.detach().clone().cpu()
         captured_decoder["cond"] = None if cond is None else cond.detach().clone().cpu()
-        # wrap estimator to catch the first call
+
         _orig_fwd = tts.s3gen.flow.decoder.estimator.forward
         def _est(x, mask, mu, t, spks=None, cond=None, r=None):
             out = _orig_fwd(x, mask, mu, t, spks=spks, cond=cond, r=r)
@@ -291,8 +249,8 @@ def main() -> None:
 
     tts.s3gen.flow.decoder.basic_euler = _basic_euler_capture
 
-    # Capture the FIRST forward pass of each down_block[0] inner module so we
-    # can bisect where the speech-region divergence starts.
+
+
     cfm_stage_captures = {}
     cfm_stage_hooks = []
     def _stage_hook(key):
@@ -301,7 +259,7 @@ def main() -> None:
                 if isinstance(out, torch.Tensor):
                     cfm_stage_captures[key] = out.detach().clone().cpu()
         return _h
-    # down_blocks[0][0] is a CausalResnetBlock1D, [1] is transformer_blocks (ModuleList), [2] is downsample.
+
     est = tts.s3gen.flow.decoder.estimator
     cfm_stage_hooks.append(est.down_blocks[0][0].register_forward_hook(_stage_hook("cfm_d0_rn")))
     cfm_stage_hooks.append(est.down_blocks[0][1][0].register_forward_hook(_stage_hook("cfm_d0_tfm0")))
@@ -325,17 +283,17 @@ def main() -> None:
         if captured_mu["mu"] is not None:
             mu_np = captured_mu["mu"].squeeze(0).numpy().astype(np.float32)
             np.save(args.out / f"chunk_{k:02d}_mu.npy", np.ascontiguousarray(mu_np))
-        # decoder input tensors — shapes follow flow_matching.forward's
-        # convention of (B, 80, T_mu) for mu/cond, (B, 1, T_mu) for mask,
-        # (B, emb_dim) for spks.
+
+
+
         for name in ("mu", "mask", "spks", "cond"):
             t = captured_decoder[name]
             if t is None: continue
             arr = t.squeeze(0).numpy().astype(np.float32)
             np.save(args.out / f"chunk_{k:02d}_dec_{name}.npy", np.ascontiguousarray(arr))
-        # Save the whole step0 tuple (inputs AND output) — deterministic
-        # replay test: feed these inputs to the same estimator.forward and
-        # check the output matches bit-for-bit.
+
+
+
         for name in ("x_in", "mask", "mu", "t", "r", "spks", "cond", "dxdt"):
             t = captured_step0[name]
             if t is None: continue
@@ -344,37 +302,37 @@ def main() -> None:
                 arr = arr.squeeze(0)
             np.save(args.out / f"chunk_{k:02d}_step0_{name}.npy", np.ascontiguousarray(arr))
             captured_step0[name] = None
-        # Per-stage CFM dumps
+
         for stage_key, tval in list(cfm_stage_captures.items()):
             if tval is None: continue
             arr = tval.squeeze(0).numpy().astype(np.float32)
             np.save(args.out / f"chunk_{k:02d}_{stage_key}.npy", np.ascontiguousarray(arr))
         cfm_stage_captures.clear()
 
-        # How many NEW mel frames this chunk produces (beyond the last
-        # chunk's emission):
+
+
         mels_new_count = mels.shape[-1] - prev_mels_emitted
         mels_new = mels[..., prev_mels_emitted:]
         if mels_new.shape[-1] <= 0:
-            # Edge case: last chunk might have 0 new frames if pre-lookahead
-            # already exposed them.  Skip.
+
+
             continue
 
-        # HiFT wants the full running mel (prev + new) because its source
-        # signal is F0-derived and phase-continuous across mel frames.
-        # We pass only the new mels AND carry `cache_source` to bridge the
-        # seam.  (This matches the pattern implied by HiFigan.inference.)
+
+
+
+
         with torch.no_grad():
             wav_k, src_k = tts.s3gen.hift_inference(mels_new, prev_source_tail)
         wav_k_np = wav_k.squeeze().cpu().numpy().astype(np.float32)
 
-        # First-chunk fade-in matches batch path's `trim_fade`.
+
         if k == 1:
             tf = tts.s3gen.trim_fade.cpu().numpy()
             wav_k_np[:len(tf)] *= tf
 
-        # Naïve concat (no overlap-add yet; seams rely on cache_source to
-        # keep F0 phase continuous and HiFT's first chunk has trim_fade).
+
+
         streamed_wav = np.concatenate([streamed_wav, wav_k_np])
 
         np.save(args.out / f"chunk_{k:02d}_mels_new.npy",
@@ -384,7 +342,7 @@ def main() -> None:
         np.save(args.out / f"chunk_{k:02d}_source.npy",
                 np.ascontiguousarray(src_k.squeeze(0).cpu().numpy().astype(np.float32)))
 
-        # Save the source tail for cache_source on the next iteration.
+
         prev_source_tail = src_k[..., -SOURCE_OVERLAP:].clone()
         np.save(args.out / f"chunk_{k:02d}_source_tail.npy",
                 np.ascontiguousarray(prev_source_tail.squeeze(0).cpu().numpy().astype(np.float32)))
@@ -405,9 +363,9 @@ def main() -> None:
     for h in cfm_stage_hooks: h.remove()
     np.save(args.out / "streamed_wav.npy", np.ascontiguousarray(streamed_wav))
 
-    # Numerical comparison.  We can't expect bit-exact equality: HiFT's
-    # resnet receptive field spans chunks we don't fully cache.  But the
-    # RMS error should be well below perceptual threshold.
+
+
+
     n = min(len(streamed_wav), len(batch_wav))
     diff = streamed_wav[:n] - batch_wav[:n]
     stats = {
@@ -424,7 +382,7 @@ def main() -> None:
     }
     (args.out / "stats.json").write_text(json.dumps(stats, indent=2))
 
-    # Also save as a listenable wav next to the npys for sanity-check play.
+
     sf.write(args.out / "batch.wav",    batch_wav,    24000, subtype="PCM_16")
     sf.write(args.out / "streamed.wav", streamed_wav, 24000, subtype="PCM_16")
 

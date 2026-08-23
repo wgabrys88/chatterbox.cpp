@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# End-to-end text -> wav synthesis using the unified tts-cli binary
-# (text -> T3 speech tokens -> S3Gen + HiFT vocoder -> 24 kHz wav).
-#
-# Usage:
-#   scripts/synthesize.sh "Hello, world." out.wav
-#   scripts/synthesize.sh "Hello, world." out.wav --seed 123
 
 set -euo pipefail
 
