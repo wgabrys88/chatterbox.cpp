@@ -99,30 +99,37 @@ struct model_ctx {
     float cfg_rate    = 0.0f;
 };
 
-static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
+static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
 #ifdef GGML_USE_CUDA
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_cuda_init(0);
-        if (b) { if (verbose) fprintf(stderr, "s3gen: using CUDA backend\n"); return b; }
+        if (b) {
+            fprintf(stderr, "tts event=backend role=s3gen backend=CUDA gpu_layers=%d\n", n_gpu_layers);
+            return b;
+        }
     }
 #endif
 #ifdef GGML_USE_METAL
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_metal_init();
-        if (b) { if (verbose) fprintf(stderr, "s3gen: using Metal backend\n"); return b; }
+        if (b) {
+            fprintf(stderr, "tts event=backend role=s3gen backend=Metal gpu_layers=%d\n", n_gpu_layers);
+            return b;
+        }
     }
 #endif
 #ifdef GGML_USE_VULKAN
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_vk_init(0);
         if (b) {
-            if (verbose) {
-                char desc[256] = {0};
-                ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
-                fprintf(stderr, "s3gen: using Vulkan backend (device 0: %s)\n", desc);
-            }
+            char desc[256] = {0};
+            ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
+            fprintf(stderr, "tts event=backend role=s3gen backend=Vulkan gpu_layers=%d device=%s\n",
+                    n_gpu_layers, desc);
             return b;
         }
+        fprintf(stderr, "tts event=backend role=s3gen backend=CPU fallback=vulkan_init_failed gpu_layers=%d\n",
+                n_gpu_layers);
     }
 #endif
 #if defined(GGML_USE_OPENCL)
@@ -131,23 +138,22 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
         if (ocl_reg && ggml_backend_reg_dev_count(ocl_reg) > 0) {
             auto * b = ggml_backend_opencl_init();
             if (b) {
-                if (verbose) {
-                    fprintf(stderr, "s3gen: using OpenCL backend\n");
-                }
+                fprintf(stderr, "tts event=backend role=s3gen backend=OpenCL gpu_layers=%d\n", n_gpu_layers);
                 return b;
             }
-        } else if (verbose && ocl_reg) {
-            if (ggml_backend_reg_dev_count(ocl_reg) == 0) {
-                fprintf(stderr, "s3gen: no OpenCL device; using CPU\n");
-            } else {
-                fprintf(stderr, "s3gen: OpenCL init failed; using CPU\n");
-            }
         }
+        fprintf(stderr, "tts event=backend role=s3gen backend=CPU fallback=opencl_init_failed gpu_layers=%d\n",
+                n_gpu_layers);
     }
 #endif
     auto * b = ggml_backend_cpu_init();
     if (!b) throw std::runtime_error("ggml_backend_cpu_init() failed");
-    if (verbose) fprintf(stderr, "s3gen: using CPU backend\n");
+    if (n_gpu_layers > 0) {
+        fprintf(stderr, "tts event=backend role=s3gen backend=CPU fallback=no_gpu_backend gpu_layers=%d\n",
+                n_gpu_layers);
+    } else {
+        fprintf(stderr, "tts event=backend role=s3gen backend=CPU gpu_layers=0\n");
+    }
     return b;
 }
 
@@ -225,24 +231,38 @@ static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, boo
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
+    const char * fc_env = std::getenv("TRIDENT_FASTCONV");
+    const bool fastconv = fc_env && fc_env[0] != '0';
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) throw std::runtime_error("gguf_init_from_file failed: " + path);
-    m.backend = s3gen_init_backend(n_gpu_layers, verbose);
+    m.backend = s3gen_init_backend(n_gpu_layers);
     int64_t n_tensors = gguf_get_n_tensors(g);
     ggml_init_params p = { ggml_tensor_overhead() * (size_t)n_tensors, nullptr, true };
     m.ctx_w = ggml_init(p);
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(g, i);
         ggml_tensor * src = ggml_get_tensor(tmp_ctx, name);
-        ggml_tensor * dst = ggml_dup_tensor(m.ctx_w, src);
+        ggml_tensor * dst = fastconv && src->type == GGML_TYPE_F16 && ggml_is_3d(src)
+            ? ggml_new_tensor(m.ctx_w, GGML_TYPE_F32, ggml_n_dims(src), src->ne)
+            : ggml_dup_tensor(m.ctx_w, src);
         ggml_set_name(dst, name);
         m.tensors[name] = dst;
     }
     m.buffer_w = ggml_backend_alloc_ctx_tensors(m.ctx_w, m.backend);
+    size_t baked = 0, baked_bytes = 0;
     for (ggml_tensor * cur = ggml_get_first_tensor(m.ctx_w); cur; cur = ggml_get_next_tensor(m.ctx_w, cur)) {
         ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
-        ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+        if (cur->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F16 && ggml_is_3d(src)) {
+            std::vector<float> f32((size_t) ggml_nelements(src));
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) ggml_get_data(src), f32.data(), ggml_nelements(src));
+            ggml_backend_tensor_set(cur, f32.data(), 0, f32.size() * sizeof(float));
+            ++baked;
+            baked_bytes += f32.size() * sizeof(float);
+        } else {
+            ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+        }
     }
+    if (verbose) fprintf(stderr, "  s3gen fastconv=%d baked=%zu f32_bytes=%zu\n", fastconv ? 1 : 0, baked, baked_bytes);
 
     {
         int64_t k_mf = gguf_find_key(g, "s3gen.meanflow");
@@ -1237,12 +1257,43 @@ static void cfm_estimator_forward_b2(
     compute(m.backend, gf);
 
     ggml_tensor * out_t = ggml_graph_get_tensor(gf, "out");
-    // out_t ne=[T, MEL, B=2], contiguous.  Read cond/uncond halves separately.
-    const size_t half_bytes = (size_t) T * MEL * sizeof(float);
-    out_c.resize(T * MEL);
-    out_u.resize(T * MEL);
-    ggml_backend_tensor_get(out_t, out_c.data(), 0,           half_bytes);
-    ggml_backend_tensor_get(out_t, out_u.data(), half_bytes,  half_bytes);
+    const size_t half = (size_t) T * MEL;
+    // Reuse the host readback arena across CFM steps.  On Vulkan this does
+    // not remove the required backend synchronization, but it eliminates a
+    // large malloc/free from the critical CFG path.
+    thread_local std::vector<float> both;
+    both.resize((size_t) ggml_nelements(out_t));
+    const size_t want = both.size() * sizeof(float);
+    if (want > ggml_nbytes(out_t) || both.size() < 2 * half) {
+        throw std::runtime_error("cfm b2 out size mismatch");
+    }
+    ggml_backend_tensor_get(out_t, both.data(), 0, want);
+    {
+        static bool cfm_fp_once = false;
+        if (!cfm_fp_once && T > 0 && half > 0) {
+            const unsigned char * p = (const unsigned char *) both.data();
+            const size_t bytes = half * sizeof(float);
+            unsigned long long h = 1469598103934665603ull;
+            float mn = both[0], mx = both[0];
+            double l2 = 0.0;
+            bool fin = true;
+            for (size_t i = 0; i < half; ++i) {
+                const float x = both[i];
+                if (!std::isfinite(x)) fin = false;
+                if (x < mn) mn = x;
+                if (x > mx) mx = x;
+                l2 += (double) x * x;
+            }
+            for (size_t i = 0; i < bytes; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+            fprintf(stderr,
+                    "tts event=vec tag=dxdt_step0 dim=%zu l2=%.6e min=%.6e max=%.6e fnv=%016llx finite=%d\n",
+                    (size_t) half, std::sqrt(l2), (double) mn, (double) mx, h, fin ? 1 : 0);
+            fflush(stderr);
+            cfm_fp_once = true;
+        }
+    }
+    out_c.assign(both.begin(), both.begin() + half);
+    out_u.assign(both.begin() + half, both.begin() + 2 * half);
 }
 
 // ============================================================================
@@ -2040,8 +2091,11 @@ int s3gen_synthesize_to_wav(
     //                   estimator calls per step (cond + uncond with zeroed
     //                   mu/spks/cond) combined via cfg_rate.
     std::vector<float> t_span;
-    const int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps :
-                          (meanflow ? 2 : m.n_timesteps);
+    int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps :
+                    (meanflow ? 2 : m.n_timesteps);
+    if (!meanflow && cfm_steps > 0 && cfm_steps < 5) {
+        throw std::runtime_error("non-meanflow CFM below 5 is unsupported by Trident");
+    }
     t_span.reserve(cfm_steps + 1);
     for (int i = 0; i <= cfm_steps; ++i) {
         float tau = (float)i / (float)cfm_steps;

@@ -99,6 +99,11 @@ struct EngineOptions {
     float temperature    = 0.8f;
     float repeat_penalty = 1.2f;
 
+    std::string language;
+    float exaggeration   = 0.5f;
+    float cfg_weight     = 0.5f;
+    float min_p          = 0.05f;
+
     // S3Gen side.  0 = library default (2-step meanflow).
     int cfm_steps = 0;
 

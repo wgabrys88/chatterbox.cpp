@@ -34,7 +34,6 @@ find_package(OpenMP)
 
 set(TTS_CPP_LIB_SOURCES
     src/main.cpp
-    src/chatterbox_cli.cpp
     src/gpt2_bpe.cpp
     src/chatterbox_tts.cpp
     src/chatterbox_engine.cpp
@@ -81,6 +80,9 @@ if (TTS_CPP_BUILD_LIBRARY)
     endif()
     if (GGML_OPENCL)
         target_compile_definitions(tts-cpp PRIVATE GGML_USE_OPENCL)
+    endif()
+    if (MSVC)
+        target_compile_definitions(tts-cpp PRIVATE _USE_MATH_DEFINES)
     endif()
 
     set_target_properties(tts-cpp PROPERTIES

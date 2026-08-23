@@ -290,30 +290,34 @@ static ggml_tensor * require_tensor(const chatterbox_model & m, const char * nam
 int g_log_verbose = 0;
 
 ggml_backend_t init_backend(int n_gpu_layers) {
-    const bool v = g_log_verbose != 0;
 #ifdef GGML_USE_CUDA
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_cuda_init(0);
-        if (b) { if (v) fprintf(stderr, "%s: using CUDA backend\n", __func__); return b; }
+        if (b) {
+            fprintf(stderr, "tts event=backend role=t3 backend=CUDA gpu_layers=%d\n", n_gpu_layers);
+            return b;
+        }
     }
 #endif
 #ifdef GGML_USE_METAL
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_metal_init();
-        if (b) { if (v) fprintf(stderr, "%s: using Metal backend\n", __func__); return b; }
+        if (b) {
+            fprintf(stderr, "tts event=backend role=t3 backend=Metal gpu_layers=%d\n", n_gpu_layers);
+            return b;
+        }
     }
 #endif
 #ifdef GGML_USE_VULKAN
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_vk_init(0);
         if (b) {
-            if (v) {
-                char desc[256] = {0};
-                ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
-                fprintf(stderr, "%s: using Vulkan backend (device 0: %s)\n", __func__, desc);
-            }
+            char desc[256] = {0};
+            ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
+            fprintf(stderr, "tts event=backend role=t3 backend=Vulkan gpu_layers=%d device=%s\n", n_gpu_layers, desc);
             return b;
         }
+        fprintf(stderr, "tts event=backend role=t3 backend=CPU fallback=vulkan_init_failed gpu_layers=%d\n", n_gpu_layers);
     }
 #endif
 #ifdef GGML_USE_OPENCL
@@ -322,23 +326,20 @@ ggml_backend_t init_backend(int n_gpu_layers) {
         if (ocl_reg && ggml_backend_reg_dev_count(ocl_reg) > 0) {
             auto * b = ggml_backend_opencl_init();
             if (b) {
-                if (v) {
-                    fprintf(stderr, "%s: using OpenCL backend\n", __func__);
-                }
+                fprintf(stderr, "tts event=backend role=t3 backend=OpenCL gpu_layers=%d\n", n_gpu_layers);
                 return b;
             }
-        } else if (v && ocl_reg) {
-            if (ggml_backend_reg_dev_count(ocl_reg) == 0) {
-                fprintf(stderr, "%s: no OpenCL device; using CPU\n", __func__);
-            } else {
-                fprintf(stderr, "%s: OpenCL init failed; using CPU\n", __func__);
-            }
         }
+        fprintf(stderr, "tts event=backend role=t3 backend=CPU fallback=opencl_init_failed gpu_layers=%d\n", n_gpu_layers);
     }
 #endif
     auto * b = ggml_backend_cpu_init();
     if (!b) throw std::runtime_error("ggml_backend_cpu_init() failed");
-    if (v) fprintf(stderr, "%s: using CPU backend\n", __func__);
+    if (n_gpu_layers > 0) {
+        fprintf(stderr, "tts event=backend role=t3 backend=CPU fallback=no_gpu_backend gpu_layers=%d\n", n_gpu_layers);
+    } else {
+        fprintf(stderr, "tts event=backend role=t3 backend=CPU gpu_layers=0\n");
+    }
     return b;
 }
 
@@ -823,14 +824,19 @@ int32_t sample_next_token_ex(
     return dist(rng);
 }
 
-// Log filter: when --verbose is off, drop everything below ERROR.  This
-// silences ggml-metal's per-kernel "compiling pipeline" spam, ggml_vulkan's
-// device enumeration, ggml-metal's "tensor API disabled" one-liner, etc. —
-// none of which a non-debugging user cares about.  Errors still go through
-// so real failures are never hidden.
+// Log filter: when --verbose is off, drop ggml kernel spam.  Always keep
+// ERROR and the Vulkan device banner (fp16 / warp / matrix cores).
 // (g_log_verbose is declared near init_backend; see above.)
 void chatterbox_log_cb(ggml_log_level level, const char * text, void * /*ud*/) {
     if (g_log_verbose || level >= GGML_LOG_LEVEL_ERROR) {
+        fputs(text, stderr);
+        return;
+    }
+    if (!text) return;
+    // Keep the Vulkan device banner (fp16=0 / warp / matrix cores) without
+    // per-kernel compile spam.
+    if (std::strstr(text, "ggml_vulkan: Found") || std::strstr(text, "ggml_vulkan: 0 =") ||
+        std::strstr(text, "ggml_vulkan: 1 =")) {
         fputs(text, stderr);
     }
 }

@@ -872,6 +872,24 @@ bool run_prompt_pass(const chatterbox_model & model,
     return true;
 }
 
+static bool copy_b2_logits(ggml_tensor * logits, int vocab,
+                           std::vector<float> & cond, std::vector<float> & uncond) {
+    if (!logits) return false;
+    // The sampler is CPU-side, so one logits readback per generated token is
+    // still required.  Keep the B=2 CFG transfer to one readback and reuse
+    // its storage rather than allocating on every autoregressive step.
+    thread_local std::vector<float> both;
+    both.resize((size_t) ggml_nelements(logits));
+    const size_t want = both.size() * sizeof(float);
+    if (want > ggml_nbytes(logits) || both.size() < (size_t) 2 * (size_t) vocab) {
+        return false;
+    }
+    ggml_backend_tensor_get(logits, both.data(), 0, want);
+    cond.assign(both.begin(), both.begin() + vocab);
+    uncond.assign(both.begin() + vocab, both.begin() + 2 * vocab);
+    return true;
+}
+
 // Run the prompt graph as a single batch=2 forward (cond on b=0, uncond
 // on b=1).  Output logits shape: (n_speech_vocab, 1, 2); we read the
 // cond half into logits_cond and the uncond half into logits_uncond.
@@ -934,13 +952,7 @@ bool run_prompt_pass_b2(const chatterbox_model & model,
     ggml_backend_graph_compute(model.backend, gf);
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
-    // logits ne=[n_speech_vocab, 1, 2], contiguous.  Cond at b=0, uncond at b=1.
-    const size_t per_batch_bytes = (size_t) hp.n_speech_vocab * sizeof(float);
-    logits_cond_out.resize(hp.n_speech_vocab);
-    logits_uncond_out.resize(hp.n_speech_vocab);
-    ggml_backend_tensor_get(logits, logits_cond_out.data(),   0,                per_batch_bytes);
-    ggml_backend_tensor_get(logits, logits_uncond_out.data(), per_batch_bytes, per_batch_bytes);
-    return true;
+    return copy_b2_logits(logits, hp.n_speech_vocab, logits_cond_out, logits_uncond_out);
 }
 
 // B=2 step pass: one forward producing both cond + uncond logits.
@@ -967,11 +979,18 @@ bool run_step_pass_b2(const chatterbox_model & model,
         return false;
     }
 
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
+    ggml_tensor * t_tok = ggml_graph_get_tensor(gf, "speech_token");
+    ggml_tensor * t_spos = ggml_graph_get_tensor(gf, "speech_pos");
+    ggml_tensor * t_pos = ggml_graph_get_tensor(gf, "pos_ids");
+    if (!t_tok || !t_spos || !t_pos) {
+        fprintf(stderr, "run_step_pass_b2: missing input tensor\n");
+        return false;
+    }
+    ggml_backend_tensor_set(t_tok, &token, 0, sizeof(token));
     int32_t sp = n_past;
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_pos"), &sp, 0, sizeof(sp));
+    ggml_backend_tensor_set(t_spos, &sp, 0, sizeof(sp));
     int32_t pos = n_past;
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos_ids"), &pos, 0, sizeof(pos));
+    ggml_backend_tensor_set(t_pos, &pos, 0, sizeof(pos));
 
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, n_threads);
@@ -979,12 +998,7 @@ bool run_step_pass_b2(const chatterbox_model & model,
     ggml_backend_graph_compute(model.backend, gf);
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
-    const size_t per_batch_bytes = (size_t) hp.n_speech_vocab * sizeof(float);
-    logits_cond_out.resize(hp.n_speech_vocab);
-    logits_uncond_out.resize(hp.n_speech_vocab);
-    ggml_backend_tensor_get(logits, logits_cond_out.data(),   0,                per_batch_bytes);
-    ggml_backend_tensor_get(logits, logits_uncond_out.data(), per_batch_bytes, per_batch_bytes);
-    return true;
+    return copy_b2_logits(logits, hp.n_speech_vocab, logits_cond_out, logits_uncond_out);
 }
 
 bool run_step_pass(const chatterbox_model & model,

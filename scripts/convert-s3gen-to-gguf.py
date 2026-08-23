@@ -189,7 +189,10 @@ def add_tensor_maybe_q(
 
     qtype = _RQ_QUANT_TYPE[quant]
     if not _SHOULD_QUANTIZE(name, arr.shape, qtype):
-        writer.add_tensor(name, arr)
+        # Quantized S3Gen keeps rank-3 convolution kernels in F16.  Bake
+        # them to F32 at load (TRIDENT_FASTCONV).  Vulkan CONV_TRANSPOSE_1D
+        # is F32-only, so this is required on Xe-LP as well as Pascal.
+        writer.add_tensor(name, np.ascontiguousarray(arr.astype(np.float16)) if arr.ndim == 3 else arr)
         return
 
     qdata = gguf.quants.quantize(np.ascontiguousarray(arr.astype(np.float32)), qtype)
@@ -525,6 +528,14 @@ def main():
                 gguf_name = "s3tokv2/" + rest.replace(".", "/")
             add_tensor_maybe_q(writer, gguf_name, as_numpy(state[k], dtype=torch.float32), args.quant, stats=qstats)
             n_tok += 1
+
+        if "tokenizer._mel_filters" not in state:
+            fb = librosa.filters.mel(
+                sr=16000, n_fft=400, n_mels=128, fmin=0, fmax=8000,
+            ).astype(np.float32)
+            add_tensor_maybe_q(writer, "s3tokv2/mel_fb", np.ascontiguousarray(fb), args.quant, stats=qstats)
+            n_tok += 1
+            print(f"Synthesized s3tokv2/mel_fb {fb.shape} (checkpoint has no tokenizer._mel_filters)")
 
         writer.add_uint32("s3tokv2.n_mels",        128)
         writer.add_uint32("s3tokv2.n_audio_state", 1280)

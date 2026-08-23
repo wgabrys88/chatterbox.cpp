@@ -70,6 +70,7 @@ import gguf
 _DENY_SUBSTRINGS = (
     # Raw-F32 access in the C++ loader
     "flow/input_embedding",     # S3Gen speech embedding table (read as F32 for CPU-side lookup)
+    "flow/spk_embed_affine/w",  # S3Gen speaker affine: fetched as bytes into std::vector<float>
     "/builtin/",                # voice conditioning tensors, loaded directly
     # Embedding tables (accessed via ggml_get_rows — safer as F16/F32)
     "text_emb",                 # T3 text token embedding

@@ -205,19 +205,25 @@ def main() -> None:
     print(f"Loading checkpoint from {ckpt_dir}")
     state = load_file(ckpt_dir / "t3_turbo_v1.safetensors")
     conds = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)
+    layer_ids = {int(m.group(1)) for name in state if (m := LAYER_RE.match(name))}
+    n_embd = int(state["tfmr.ln_f.weight"].shape[0])
+    n_layer = max(layer_ids) + 1 if layer_ids else N_LAYER
+    if n_embd % 64:
+        raise SystemExit(f"n_embd {n_embd} is not divisible by head dim 64")
+    n_head = n_embd // 64
 
     writer = gguf.GGUFWriter(str(args.out), "chatterbox")
     writer.add_name("Chatterbox Turbo T3")
     writer.add_description("Chatterbox Turbo text-to-speech token generator for ggml.")
     writer.add_context_length(N_CTX)
-    writer.add_embedding_length(N_EMBD)
-    writer.add_block_count(N_LAYER)
-    writer.add_head_count(N_HEAD)
+    writer.add_embedding_length(n_embd)
+    writer.add_block_count(n_layer)
+    writer.add_head_count(n_head)
     writer.add_vocab_size(TEXT_VOCAB_SIZE)
     writer.add_uint32("chatterbox.n_ctx", N_CTX)
-    writer.add_uint32("chatterbox.n_embd", N_EMBD)
-    writer.add_uint32("chatterbox.n_head", N_HEAD)
-    writer.add_uint32("chatterbox.n_layer", N_LAYER)
+    writer.add_uint32("chatterbox.n_embd", n_embd)
+    writer.add_uint32("chatterbox.n_head", n_head)
+    writer.add_uint32("chatterbox.n_layer", n_layer)
     writer.add_uint32("chatterbox.text_vocab_size", TEXT_VOCAB_SIZE)
     writer.add_uint32("chatterbox.speech_vocab_size", SPEECH_VOCAB_SIZE)
     writer.add_uint32("chatterbox.start_speech_token", START_SPEECH_TOKEN)
