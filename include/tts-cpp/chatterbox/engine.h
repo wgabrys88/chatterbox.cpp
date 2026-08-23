@@ -55,6 +55,7 @@ struct EngineOptions {
     int stream_cfm_steps          = 0;
 
 
+    bool fastconv = false;
     bool verbose = false;
 };
 

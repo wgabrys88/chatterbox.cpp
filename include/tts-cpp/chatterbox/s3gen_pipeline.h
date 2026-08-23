@@ -65,6 +65,7 @@ struct s3gen_synthesize_opts {
 
 
     bool                 cfm_f16_kv_attn       = false;
+    bool                 fastconv              = false;
 };
 
 
@@ -73,7 +74,7 @@ int s3gen_synthesize_to_wav(
     const s3gen_synthesize_opts & opts);
 
 
-int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers);
+int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers, bool fastconv = false);
 
 
 void s3gen_unload();

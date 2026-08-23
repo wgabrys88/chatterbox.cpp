@@ -131,10 +131,10 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
 }
 
 
-static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose);
+static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose, bool fastconv);
 
 namespace {
-struct s3gen_cache_entry { std::string path; int gpu = 0; std::unique_ptr<model_ctx> m; };
+struct s3gen_cache_entry { std::string path; int gpu = 0; bool fastconv = false; std::unique_ptr<model_ctx> m; };
 static std::mutex                            g_s3gen_cache_mu;
 static std::unique_ptr<s3gen_cache_entry>    g_s3gen_cache_entry;
 static double                                g_s3gen_cache_last_load_ms = 0.0;
@@ -154,11 +154,12 @@ static void s3gen_model_cache_release() {
     g_s3gen_cache_entry.reset();
 }
 
-static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_layers, bool verbose) {
+static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_layers, bool verbose, bool fastconv) {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
     if (g_s3gen_cache_entry &&
         g_s3gen_cache_entry->path == path &&
-        g_s3gen_cache_entry->gpu  == n_gpu_layers) {
+        g_s3gen_cache_entry->gpu  == n_gpu_layers &&
+        g_s3gen_cache_entry->fastconv == fastconv) {
         if (verbose) {
             fprintf(stderr, "  %zu tensors (cached — skip GGUF load)\n",
                     g_s3gen_cache_entry->m->tensors.size());
@@ -168,11 +169,11 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
     }
     if (verbose) fprintf(stderr, "Loading %s\n", path.c_str());
     double t0 = now_ms();
-    auto m = std::make_unique<model_ctx>(load_s3gen_gguf(path, n_gpu_layers, verbose));
+    auto m = std::make_unique<model_ctx>(load_s3gen_gguf(path, n_gpu_layers, verbose, fastconv));
     g_s3gen_cache_last_load_ms = now_ms() - t0;
     if (verbose) fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m->tensors.size(), g_s3gen_cache_last_load_ms);
     g_s3gen_cache_entry = std::make_unique<s3gen_cache_entry>(
-        s3gen_cache_entry{path, n_gpu_layers, std::move(m)});
+        s3gen_cache_entry{path, n_gpu_layers, fastconv, std::move(m)});
 
 
     static bool registered = false;
@@ -185,12 +186,10 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
 
 static double s3gen_model_cache_last_load_ms() { return g_s3gen_cache_last_load_ms; }
 
-static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose) {
+static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose, bool fastconv) {
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = {  false,  &tmp_ctx };
-    const char * fc_env = std::getenv("TRIDENT_FASTCONV");
-    const bool fastconv = fc_env && fc_env[0] != '0';
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) throw std::runtime_error("gguf_init_from_file failed: " + path);
     m.backend = s3gen_init_backend(n_gpu_layers);
@@ -1641,7 +1640,7 @@ int s3gen_synthesize_to_wav(
     }
 
 
-    model_ctx & m = *s3gen_model_cache_get(gguf_path, opts.n_gpu_layers, verbose);
+    model_ctx & m = *s3gen_model_cache_get(gguf_path, opts.n_gpu_layers, verbose, opts.fastconv);
     {
         const double load_ms = s3gen_model_cache_last_load_ms();
 
@@ -2113,9 +2112,9 @@ int s3gen_synthesize_to_wav(
     return 0;
 }
 
-int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers) {
+int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers, bool fastconv) {
     try {
-        (void)s3gen_model_cache_get(s3gen_gguf_path, n_gpu_layers, false);
+        (void)s3gen_model_cache_get(s3gen_gguf_path, n_gpu_layers, false, fastconv);
         return 0;
     } catch (const std::exception & e) {
         fprintf(stderr, "s3gen_preload: %s\n", e.what());

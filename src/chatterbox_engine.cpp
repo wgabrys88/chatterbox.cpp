@@ -147,9 +147,8 @@ struct Engine::Impl {
                 "Engine: unknown chatterbox.variant in " + opts.t3_gguf_path);
         }
 
-        s3gen_preload_thread = std::thread([path = opts.s3gen_gguf_path,
-                                            ngpu = opts.n_gpu_layers]() {
-            s3gen_preload(path, ngpu);
+        s3gen_preload_thread = std::thread([path = opts.s3gen_gguf_path, ngpu = opts.n_gpu_layers, fastconv = opts.fastconv]() {
+            s3gen_preload(path, ngpu, fastconv);
         });
 
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
@@ -571,6 +570,7 @@ struct Engine::Impl {
         sopts.n_threads       = resolve_thread_count(opts.n_threads);
         sopts.verbose         = opts.verbose;
         sopts.n_gpu_layers    = opts.n_gpu_layers;
+        sopts.fastconv        = opts.fastconv;
 
         if (!s3gen_prompt_feat.empty()) {
             sopts.prompt_feat_override      = s3gen_prompt_feat;
