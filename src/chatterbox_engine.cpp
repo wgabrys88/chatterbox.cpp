@@ -488,7 +488,6 @@ struct Engine::Impl {
             int32_t current = sample_next_token_mtl(
                 logits_c, logits_u, generated, sp, rng, model.hparams.stop_speech_token);
             generated.push_back(current);
-            fprintf(stderr, "tts event=tok step=0 id=%d\n", (int) current);
             for (int i = 0; i < opts.n_predict; ++i) {
                 if (cancel_flag.load(std::memory_order_relaxed)) {
                     throw std::runtime_error("Engine: synthesis cancelled during T3 decode");
@@ -502,13 +501,11 @@ struct Engine::Impl {
                 current = sample_next_token_mtl(
                     logits_c, logits_u, generated, sp, rng, model.hparams.stop_speech_token);
                 generated.push_back(current);
-                fprintf(stderr, "tts event=tok step=%d id=%d\n", i + 1, (int) current);
             }
             const bool eos = !generated.empty() && generated.back() == model.hparams.stop_speech_token;
-            const bool cap = !eos && (int) generated.size() >= opts.n_predict;
-            fprintf(stderr, "tts event=t3_decode speech_tokens=%zu eos=%d cap=%d max=%d\n",
-                    generated.size(), (int) eos, (int) cap, opts.n_predict);
-            if (eos) generated.pop_back();
+            if (!eos) throw std::runtime_error("Engine: T3 speech generation stopped without EOS");
+            fprintf(stderr, "tts event=t3_decode speech_tokens=%zu eos=1\n", generated.size());
+            generated.pop_back();
 
             if (generated.size() > 1) generated.pop_back();
             tts_log_tokens("speech_final_mtl", generated);
@@ -527,7 +524,6 @@ struct Engine::Impl {
 
         int32_t current = sample_next_token_ex(logits, generated, sp, rng);
         generated.push_back(current);
-        fprintf(stderr, "tts event=tok step=0 id=%d\n", (int) current);
 
         for (int i = 0; i < opts.n_predict; ++i) {
             if (cancel_flag.load(std::memory_order_relaxed)) {
@@ -541,15 +537,13 @@ struct Engine::Impl {
             ++n_past;
             current = sample_next_token_ex(logits, generated, sp, rng);
             generated.push_back(current);
-            fprintf(stderr, "tts event=tok step=%d id=%d\n", i + 1, (int) current);
         }
 
         {
             const bool eos = !generated.empty() && generated.back() == model.hparams.stop_speech_token;
-            const bool cap = !eos && (int) generated.size() >= opts.n_predict;
-            fprintf(stderr, "tts event=t3_decode speech_tokens=%zu eos=%d cap=%d max=%d\n",
-                    generated.size(), (int) eos, (int) cap, opts.n_predict);
-            if (eos) generated.pop_back();
+            if (!eos) throw std::runtime_error("Engine: T3 speech generation stopped without EOS");
+            fprintf(stderr, "tts event=t3_decode speech_tokens=%zu eos=1\n", generated.size());
+            generated.pop_back();
         }
         {
             const int32_t oov = model.hparams.start_speech_token;
