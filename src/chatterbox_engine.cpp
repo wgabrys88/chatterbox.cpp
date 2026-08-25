@@ -3,11 +3,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cmath>
-#include <cstdint>
-#include <set>
-#include <cstdio>
-#include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -43,48 +38,6 @@ void wait_for_preload(std::thread & t) {
 }
 
 
-std::uint64_t tts_fnv1a(const void * data, size_t bytes) {
-    const unsigned char * p = (const unsigned char *) data;
-    std::uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < bytes; ++i) { h ^= p[i]; h *= 1099511628211ull; }
-    return h;
-}
-
-void tts_log_vec(const char * tag, const std::vector<float> & v) {
-    float mn = 0.0f, mx = 0.0f, l2 = 0.0f;
-    bool finite = true;
-    for (float x : v) {
-        if (!std::isfinite(x)) finite = false;
-        mn = std::min(mn, x);
-        mx = std::max(mx, x);
-        l2 += x * x;
-    }
-    fprintf(stderr,
-            "tts event=vec tag=%s dim=%zu l2=%.6e min=%.6e max=%.6e fnv=%016llx finite=%d\n",
-            tag, v.size(), (double) std::sqrt(l2), (double) mn, (double) mx,
-            (unsigned long long) tts_fnv1a(v.data(), v.size() * sizeof(float)),
-            finite ? 1 : 0);
-}
-
-void tts_log_tokens(const char * tag, const std::vector<int32_t> & t) {
-    fprintf(stderr,
-            "tts event=tokens tag=%s n=%zu first=%d mid=%d last=%d fnv=%016llx\n",
-            tag, t.size(),
-            t.empty() ? -1 : t.front(),
-            t.empty() ? -1 : t[t.size() / 2],
-            t.empty() ? -1 : t.back(),
-            (unsigned long long) tts_fnv1a(t.data(), t.size() * sizeof(int32_t)));
-}
-
-int tts_count_mismatch(const std::vector<float> & a, const std::vector<float> & b) {
-    size_t n = std::min(a.size(), b.size());
-    int bad = (int) (a.size() != b.size());
-    for (size_t i = 0; i < n; ++i) {
-        if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) ++bad;
-    }
-    return bad;
-}
-
 
 }
 
@@ -96,7 +49,6 @@ struct Engine::Impl {
     std::thread          s3gen_preload_thread;
 
 
-    bool                 voice_overridden = false;
     std::vector<float>   s3gen_prompt_feat;
     int                  s3gen_prompt_feat_rows = 0;
     std::vector<float>   s3gen_embedding;
@@ -169,13 +121,6 @@ struct Engine::Impl {
             throw;
         }
         wait_for_preload(s3gen_preload_thread);
-        const char * variant = model.hparams.variant == CHBX_VARIANT_MTL ? "t3_mtl" : "t3_turbo";
-        fprintf(stderr,
-                "tts event=engine variant=%s gpu_layers=%d ctx=%d lang=%s voice_overridden=%d "
-                "prompt_tok=%zu feat_rows=%d embed=%zu ref=%s\n",
-                variant, opts.n_gpu_layers, model.hparams.n_ctx, opts.language.c_str(),
-                (int) voice_overridden, s3gen_prompt_token.size(), s3gen_prompt_feat_rows,
-                s3gen_embedding.size(), opts.reference_audio.c_str());
     }
 
     ~Impl() {
@@ -273,33 +218,13 @@ struct Engine::Impl {
             if (!wav_load(opts.reference_audio, wav, sr)) {
                 throw std::runtime_error("Engine: failed to load reference_audio");
             }
-            fprintf(stderr,
-                    "tts event=voice_bake stage=se_wav ref=%s sr=%d samples=%zu seconds=%.3f\n",
-                    opts.reference_audio.c_str(), sr, wav.size(),
-                    sr > 0 ? (double) wav.size() / (double) sr : 0.0);
-            const double lufs_in = measure_lufs(wav, sr);
             normalise_lufs(wav, sr, -27.0);
-            fprintf(stderr,
-                    "tts event=voice_bake stage=se_lufs in=%.3f out=%.3f target=-27.000\n",
-                    lufs_in, measure_lufs(wav, sr));
-            if (sr != 16000) {
-                const size_t before = wav.size();
-                wav = resample_sinc(wav, sr, 16000);
-                fprintf(stderr,
-                        "tts event=voice_bake stage=se_resample from=%d to=16000 before=%zu after=%zu\n",
-                        sr, before, wav.size());
-            }
+            if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
             const size_t kVeMaxSamples = (size_t) 30 * 16000;
-            if (wav.size() > kVeMaxSamples) {
-                fprintf(stderr,
-                        "tts event=voice_bake stage=se_cap seconds=30 before=%zu after=%zu\n",
-                        wav.size(), kVeMaxSamples);
-                wav.resize(kVeMaxSamples);
-            }
+            if (wav.size() > kVeMaxSamples) wav.resize(kVeMaxSamples);
             if (!voice_encoder_embed(wav, vew, model.backend, se_data)) {
                 throw std::runtime_error("Engine: VoiceEncoder forward failed");
             }
-            tts_log_vec("se_ref", se_data);
             have_se = true;
         }
 
@@ -318,14 +243,6 @@ struct Engine::Impl {
             if (prompt_token_from_ref.empty() || ct_data.empty()) {
                 throw std::runtime_error("Engine: S3TokenizerV2 returned empty conditioning");
             }
-            tts_log_tokens("ct_ref", ct_data);
-            {
-                int32_t mn = *std::min_element(ct_data.begin(), ct_data.end());
-                int32_t mx = *std::max_element(ct_data.begin(), ct_data.end());
-                std::set<int32_t> uniq(ct_data.begin(), ct_data.end());
-                fprintf(stderr, "tts event=tokens tag=ct_stats n=%zu min=%d max=%d distinct=%zu\n",
-                        ct_data.size(), (int) mn, (int) mx, uniq.size());
-            }
         }
 
         if (have_se) {
@@ -333,23 +250,9 @@ struct Engine::Impl {
                 throw std::runtime_error(
                     "Engine: speaker_emb size mismatch with builtin tensor");
             }
-            std::vector<float> se_builtin(ggml_nelements(model.builtin_speaker_emb));
-            ggml_backend_tensor_get(
-                model.builtin_speaker_emb, se_builtin.data(), 0,
-                ggml_nbytes(model.builtin_speaker_emb));
-            tts_log_vec("se_builtin", se_builtin);
             ggml_backend_tensor_set(
                 model.builtin_speaker_emb, se_data.data(), 0,
                 ggml_nbytes(model.builtin_speaker_emb));
-            voice_overridden = true;
-            std::vector<float> se_readback(se_data.size());
-            ggml_backend_tensor_get(
-                model.builtin_speaker_emb, se_readback.data(), 0,
-                ggml_nbytes(model.builtin_speaker_emb));
-            tts_log_vec("se_readback", se_readback);
-            fprintf(stderr,
-                    "tts event=voice_bake stage=se_write mismatches=%d dims=%zu\n",
-                    tts_count_mismatch(se_data, se_readback), se_data.size());
         }
 
         if (have_ct) {
@@ -377,7 +280,6 @@ struct Engine::Impl {
                 model.builtin_cond_prompt_tokens = new_ct;
                 model.hparams.cond_prompt_len = (int32_t) ct_data.size();
             }
-            voice_overridden = true;
         }
 
         if (!opts.reference_audio.empty()) {
@@ -393,9 +295,6 @@ struct Engine::Impl {
                 }
                 s3gen_prompt_feat_rows = rows;
             }
-            tts_log_vec("s3_prompt_feat", s3gen_prompt_feat);
-            fprintf(stderr, "tts event=voice_bake stage=prompt_feat rows=%d\n",
-                    s3gen_prompt_feat_rows);
             if (s3gen_embedding.empty()) {
                 if (!compute_embedding_native(
                         opts.reference_audio, opts.s3gen_gguf_path,
@@ -407,14 +306,12 @@ struct Engine::Impl {
                     throw std::runtime_error("Engine: CAMPPlus embedding is empty");
                 }
             }
-            tts_log_vec("campplus_emb", s3gen_embedding);
             if (s3gen_prompt_token.empty() && !prompt_token_from_ref.empty()) {
                 s3gen_prompt_token = std::move(prompt_token_from_ref);
             }
             if (s3gen_prompt_token.empty()) {
                 throw std::runtime_error("Engine: prompt_token unavailable");
             }
-            tts_log_tokens("s3_prompt_token", s3gen_prompt_token);
             if (s3gen_prompt_feat.empty()) {
                 throw std::runtime_error("Engine: prompt_feat unavailable");
             }
@@ -452,12 +349,6 @@ struct Engine::Impl {
             padded.push_back(model.hparams.start_text_token);
             padded.insert(padded.end(), text_tokens.begin(), text_tokens.end());
             padded.push_back(model.hparams.stop_text_token);
-            fprintf(stderr, "tts event=text_tokens tokenizer=mtl lang=%s raw=%zu padded=%zu sot=%d eot=%d ids=",
-                    opts.language.c_str(), text_tokens.size(), padded.size(),
-                    model.hparams.start_text_token, model.hparams.stop_text_token);
-            const size_t show = padded.size() < 12 ? padded.size() : 12;
-            for (size_t i = 0; i < show; ++i) fprintf(stderr, "%d ", padded[i]);
-            fprintf(stderr, "%s\n", padded.size() > show ? "..." : "");
             text_tokens = std::move(padded);
         } else {
             if (model.tok_tokens.empty()) {
@@ -468,12 +359,10 @@ struct Engine::Impl {
             gpt2_bpe bpe;
             bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
             text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
-            fprintf(stderr, "tts event=text_tokens tokenizer=gpt2 tokens=%zu\n", text_tokens.size());
         }
         if (text_tokens.empty()) {
             throw std::runtime_error("Engine: text tokenised to empty sequence");
         }
-        tts_log_tokens("text", text_tokens);
 
         if (model.hparams.variant == CHBX_VARIANT_MTL) {
             std::vector<float> logits_c, logits_u;
@@ -504,11 +393,9 @@ struct Engine::Impl {
             }
             const bool eos = !generated.empty() && generated.back() == model.hparams.stop_speech_token;
             if (!eos) throw std::runtime_error("Engine: T3 speech generation stopped without EOS");
-            fprintf(stderr, "tts event=t3_decode speech_tokens=%zu eos=1\n", generated.size());
             generated.pop_back();
 
             if (generated.size() > 1) generated.pop_back();
-            tts_log_tokens("speech_final_mtl", generated);
             return generated;
         }
 
@@ -542,7 +429,6 @@ struct Engine::Impl {
         {
             const bool eos = !generated.empty() && generated.back() == model.hparams.stop_speech_token;
             if (!eos) throw std::runtime_error("Engine: T3 speech generation stopped without EOS");
-            fprintf(stderr, "tts event=t3_decode speech_tokens=%zu eos=1\n", generated.size());
             generated.pop_back();
         }
         {
@@ -552,7 +438,6 @@ struct Engine::Impl {
                 if (generated[r] >= 0 && generated[r] < oov) generated[w++] = generated[r];
             generated.resize(w);
         }
-        tts_log_tokens("speech_final", generated);
         return generated;
     }
 

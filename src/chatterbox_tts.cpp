@@ -1124,30 +1124,6 @@ static void cfm_estimator_forward_b2(
         throw std::runtime_error("cfm b2 out size mismatch");
     }
     ggml_backend_tensor_get(out_t, both.data(), 0, want);
-    {
-        static bool cfm_fp_once = false;
-        if (!cfm_fp_once && T > 0 && half > 0) {
-            const unsigned char * p = (const unsigned char *) both.data();
-            const size_t bytes = half * sizeof(float);
-            unsigned long long h = 1469598103934665603ull;
-            float mn = both[0], mx = both[0];
-            double l2 = 0.0;
-            bool fin = true;
-            for (size_t i = 0; i < half; ++i) {
-                const float x = both[i];
-                if (!std::isfinite(x)) fin = false;
-                if (x < mn) mn = x;
-                if (x > mx) mx = x;
-                l2 += (double) x * x;
-            }
-            for (size_t i = 0; i < bytes; ++i) { h ^= p[i]; h *= 1099511628211ull; }
-            fprintf(stderr,
-                    "tts event=vec tag=dxdt_step0 dim=%zu l2=%.6e min=%.6e max=%.6e fnv=%016llx finite=%d\n",
-                    (size_t) half, std::sqrt(l2), (double) mn, (double) mx, h, fin ? 1 : 0);
-            fflush(stderr);
-            cfm_fp_once = true;
-        }
-    }
     out_c.assign(both.begin(), both.begin() + half);
     out_u.assign(both.begin() + half, both.begin() + 2 * half);
 }
