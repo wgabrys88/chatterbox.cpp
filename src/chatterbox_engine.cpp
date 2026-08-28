@@ -55,6 +55,8 @@ struct Engine::Impl {
     std::vector<int32_t> s3gen_prompt_token;
 
     std::atomic<bool>    cancel_flag{false};
+    double last_t3_ms = 0.0;
+    int    last_t3_tokens = 0;
 
     explicit Impl(const EngineOptions & o)
         : opts(o) {
@@ -507,8 +509,17 @@ struct Engine::Impl {
         std::vector<int> boundaries = {0};
         int cursor = std::min(first_chunk_n, total_n);
         boundaries.push_back(cursor);
+        int adaptive_chunk = chunk_n;
         while (cursor < total_n) {
-            cursor = std::min(cursor + chunk_n, total_n);
+            int next = cursor + adaptive_chunk;
+            if (next > total_n) next = total_n;
+            int remaining = total_n - next;
+            if (remaining > 0 && remaining < adaptive_chunk / 2) {
+                next = total_n;
+            } else if (adaptive_chunk < chunk_n * 2) {
+                adaptive_chunk = std::min(adaptive_chunk + std::max(1, chunk_n / 4), chunk_n * 2);
+            }
+            cursor = next;
             boundaries.push_back(cursor);
         }
 
@@ -543,7 +554,7 @@ struct Engine::Impl {
             copts.append_lookahead_silence  = false;
             copts.finalize                  = is_last_in_seg;
             copts.skip_mel_frames           = prev_mels_emitted;
-            copts.apply_trim_fade           = (k == 1);
+            copts.apply_trim_fade           = true;
             copts.hift_cache_source         = hift_cache_source;
             std::vector<float> tail_out;
             copts.hift_source_tail_out      = &tail_out;
@@ -600,6 +611,152 @@ struct Engine::Impl {
     SynthesisResult synthesize(const std::string & text) {
         return synthesize(text, StreamCallback{});
     }
+
+    std::vector<SynthesisResult> do_synthesize_pieces(
+        const std::vector<std::string> & texts,
+        const PieceCallback & on_piece_chunk) {
+        cancel_flag.store(false, std::memory_order_relaxed);
+        std::vector<SynthesisResult> results;
+        results.reserve(texts.size());
+        for (size_t i = 0; i < texts.size(); ++i) {
+            if (texts[i].empty()) {
+                SynthesisResult r;
+                r.sample_rate = 24000;
+                results.push_back(r);
+                if (on_piece_chunk) on_piece_chunk((int) i, nullptr, 0, 0, true);
+                continue;
+            }
+            const auto t3_t0 = std::chrono::steady_clock::now();
+            std::vector<int32_t> speech_tokens = run_t3(texts[i]);
+            const auto t3_t1 = std::chrono::steady_clock::now();
+            double t3_ms = std::chrono::duration<double, std::milli>(t3_t1 - t3_t0).count();
+            last_t3_ms = t3_ms;
+            last_t3_tokens = (int) speech_tokens.size();
+            wait_for_preload(s3gen_preload_thread);
+            SynthesisResult partial;
+            partial.t3_ms = t3_ms;
+            const bool use_streaming = on_piece_chunk && opts.stream_chunk_tokens > 0;
+            SynthesisResult r = use_streaming
+                ? synthesize_streaming(speech_tokens,
+                    [i, on_piece_chunk](const float * pcm, std::size_t n, int ci, bool last) {
+                        if (on_piece_chunk) on_piece_chunk((int) i, pcm, n, ci, last);
+                    },
+                    std::move(partial))
+                : synthesize_batch(speech_tokens, std::move(partial));
+            if (!on_piece_chunk || opts.stream_chunk_tokens <= 0) {
+                if (on_piece_chunk) on_piece_chunk((int) i, r.pcm.data(), r.pcm.size(), 0, true);
+            }
+            results.push_back(std::move(r));
+        }
+        return results;
+    }
+
+    bool rebake_voice_from_reference(const std::string & wav_path) {
+        if (wav_path.empty() || !std::filesystem::exists(wav_path)) return false;
+        if (!validate_reference_audio(wav_path)) return false;
+        std::vector<float>   se_data;
+        std::vector<int32_t> ct_data;
+        std::vector<int32_t> prompt_token_from_ref;
+        std::vector<float>   pf_data;
+        int                  pf_rows = 0;
+        std::vector<float>   emb_data;
+        const int n_threads = resolve_thread_count(opts.n_threads);
+        voice_encoder_weights vew;
+        if (!voice_encoder_load(opts.t3_gguf_path, vew)) return false;
+        std::vector<float> wav;
+        int sr = 0;
+        if (!wav_load(wav_path, wav, sr)) return false;
+        normalise_lufs(wav, sr, -27.0);
+        if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
+        const size_t kVeMaxSamples = (size_t) 30 * 16000;
+        if (wav.size() > kVeMaxSamples) wav.resize(kVeMaxSamples);
+        if (!voice_encoder_embed(wav, vew, model.backend, se_data)) return false;
+        if (!compute_speech_tokens_native(
+                wav_path, opts.s3gen_gguf_path,
+                 model.hparams.cond_prompt_len,
+                prompt_token_from_ref, ct_data,
+                n_threads,  model.backend, opts.verbose)) return false;
+        if (!compute_prompt_feat_native(
+                wav_path, opts.s3gen_gguf_path,
+                pf_data, pf_rows, opts.verbose)) return false;
+        if (!compute_embedding_native(
+                wav_path, opts.s3gen_gguf_path,
+                emb_data,
+                 model.backend, opts.verbose)) return false;
+        if ((int64_t) se_data.size() != ggml_nelements(model.builtin_speaker_emb)) return false;
+        ggml_backend_tensor_set(model.builtin_speaker_emb, se_data.data(), 0,
+            ggml_nbytes(model.builtin_speaker_emb));
+        if (!ct_data.empty()) {
+            if ((int64_t) ct_data.size() == ggml_nelements(model.builtin_cond_prompt_tokens)) {
+                ggml_backend_tensor_set(model.builtin_cond_prompt_tokens, ct_data.data(), 0,
+                    ggml_nbytes(model.builtin_cond_prompt_tokens));
+            } else {
+                if (model.ctx_override) { ggml_free(model.ctx_override); model.ctx_override = nullptr; }
+                if (model.buffer_override) { ggml_backend_buffer_free(model.buffer_override); model.buffer_override = nullptr; }
+                ggml_init_params op = { ggml_tensor_overhead() * 2, nullptr, true };
+                model.ctx_override = ggml_init(op);
+                if (!model.ctx_override) return false;
+                ggml_tensor * new_ct = ggml_new_tensor_1d(
+                    model.ctx_override, GGML_TYPE_I32, (int64_t) ct_data.size());
+                ggml_set_name(new_ct, "chatterbox/builtin/cond_prompt_speech_tokens_override");
+                model.buffer_override = ggml_backend_alloc_ctx_tensors(
+                    model.ctx_override, model.backend);
+                if (!model.buffer_override) return false;
+                ggml_backend_tensor_set(new_ct, ct_data.data(), 0, ct_data.size() * sizeof(int32_t));
+                model.builtin_cond_prompt_tokens = new_ct;
+                model.hparams.cond_prompt_len = (int32_t) ct_data.size();
+            }
+        }
+        s3gen_prompt_feat = std::move(pf_data);
+        s3gen_prompt_feat_rows = pf_rows;
+        s3gen_embedding = std::move(emb_data);
+        s3gen_prompt_token = std::move(prompt_token_from_ref);
+        opts.reference_audio = wav_path;
+        return true;
+    }
+
+    bool rebake_voice_from_dir(const std::string & dir) {
+        if (dir.empty() || !std::filesystem::is_directory(dir)) return false;
+        const std::string se_path = dir + "/speaker_emb.npy";
+        const std::string ct_path = dir + "/cond_prompt_speech_tokens.npy";
+        const std::string emb_path = dir + "/embedding.npy";
+        const std::string pt_path  = dir + "/prompt_token.npy";
+        const std::string pf_path  = dir + "/prompt_feat.npy";
+        std::vector<float>   se_data, pf_data, emb_data;
+        std::vector<int32_t> ct_data, pt_data;
+        int pf_rows = 0;
+        npy_array a;
+        if (std::filesystem::exists(se_path)) { a = npy_load(se_path); se_data.assign((const float*) a.data.data(), (const float*) a.data.data() + a.n_elements()); }
+        if (std::filesystem::exists(ct_path)) { a = npy_load(ct_path); ct_data.assign((const int32_t*) a.data.data(), (const int32_t*) a.data.data() + a.n_elements()); }
+        if (std::filesystem::exists(emb_path)) { a = npy_load(emb_path); emb_data.assign((const float*) a.data.data(), (const float*) a.data.data() + a.n_elements()); }
+        if (std::filesystem::exists(pt_path)) { a = npy_load(pt_path); pt_data.assign((const int32_t*) a.data.data(), (const int32_t*) a.data.data() + a.n_elements()); }
+        if (std::filesystem::exists(pf_path)) { a = npy_load(pf_path); pf_data.assign((const float*) a.data.data(), (const float*) a.data.data() + a.n_elements()); if (a.shape.size() >= 1) pf_rows = (int) a.shape[0]; }
+        if (!se_data.empty() && (int64_t) se_data.size() == ggml_nelements(model.builtin_speaker_emb)) {
+            ggml_backend_tensor_set(model.builtin_speaker_emb, se_data.data(), 0, ggml_nbytes(model.builtin_speaker_emb));
+        }
+        if (!ct_data.empty() && (int64_t) ct_data.size() == ggml_nelements(model.builtin_cond_prompt_tokens)) {
+            ggml_backend_tensor_set(model.builtin_cond_prompt_tokens, ct_data.data(), 0, ggml_nbytes(model.builtin_cond_prompt_tokens));
+        } else if (!ct_data.empty()) {
+            if (model.ctx_override) { ggml_free(model.ctx_override); model.ctx_override = nullptr; }
+            if (model.buffer_override) { ggml_backend_buffer_free(model.buffer_override); model.buffer_override = nullptr; }
+            ggml_init_params op = { ggml_tensor_overhead() * 2, nullptr, true };
+            model.ctx_override = ggml_init(op);
+            if (!model.ctx_override) return false;
+            ggml_tensor * new_ct = ggml_new_tensor_1d(model.ctx_override, GGML_TYPE_I32, (int64_t) ct_data.size());
+            ggml_set_name(new_ct, "chatterbox/builtin/cond_prompt_speech_tokens_override");
+            model.buffer_override = ggml_backend_alloc_ctx_tensors(model.ctx_override, model.backend);
+            if (!model.buffer_override) return false;
+            ggml_backend_tensor_set(new_ct, ct_data.data(), 0, ct_data.size() * sizeof(int32_t));
+            model.builtin_cond_prompt_tokens = new_ct;
+            model.hparams.cond_prompt_len = (int32_t) ct_data.size();
+        }
+        s3gen_prompt_feat = std::move(pf_data);
+        s3gen_prompt_feat_rows = pf_rows;
+        s3gen_embedding = std::move(emb_data);
+        s3gen_prompt_token = std::move(pt_data);
+        opts.voice_dir = dir;
+        return true;
+    }
 };
 
 Engine::Engine(const EngineOptions & opts)
@@ -616,6 +773,46 @@ SynthesisResult Engine::synthesize(const std::string & text) {
 SynthesisResult Engine::synthesize(const std::string & text,
                                    const StreamCallback & on_chunk) {
     return pimpl_->synthesize(text, on_chunk);
+}
+
+std::vector<Engine::PieceResult> Engine::synthesize_pieces(
+    const std::vector<std::string> & texts,
+    const PieceCallback & on_piece_chunk) {
+    if (!pimpl_) return {};
+    auto raw = pimpl_->do_synthesize_pieces(texts, on_piece_chunk);
+    std::vector<PieceResult> out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) {
+        PieceResult pr;
+        pr.piece_index = (int) i;
+        pr.pcm = std::move(raw[i].pcm);
+        pr.sample_rate = raw[i].sample_rate;
+        pr.t3_ms = raw[i].t3_ms;
+        pr.s3gen_ms = raw[i].s3gen_ms;
+        pr.t3_tokens = raw[i].t3_tokens;
+        pr.audio_samples = raw[i].audio_samples;
+        out.push_back(std::move(pr));
+    }
+    return out;
+}
+
+bool Engine::set_reference_audio(const std::string & path) {
+    if (!pimpl_) return false;
+    return pimpl_->rebake_voice_from_reference(path);
+}
+
+bool Engine::set_voice_dir(const std::string & dir) {
+    if (!pimpl_) return false;
+    return pimpl_->rebake_voice_from_dir(dir);
+}
+
+Engine::TokenTiming Engine::timing_hint() const {
+    TokenTiming t;
+    if (pimpl_) {
+        t.total_speech_tokens = pimpl_->last_t3_tokens;
+        t.ms_per_token_estimate = pimpl_->last_t3_tokens > 0 ? pimpl_->last_t3_ms / pimpl_->last_t3_tokens : 0.0;
+    }
+    return t;
 }
 
 void Engine::cancel() {

@@ -63,6 +63,9 @@ struct EngineOptions {
 using StreamCallback = std::function<void(
     const float * pcm, std::size_t samples, int chunk_index, bool is_last)>;
 
+using PieceCallback = std::function<void(
+    int piece_index, const float * pcm, std::size_t samples, int chunk_index, bool is_last)>;
+
 struct SynthesisResult {
 
     std::vector<float> pcm;
@@ -97,6 +100,29 @@ public:
     SynthesisResult synthesize(const std::string & text,
                                const StreamCallback & on_chunk);
 
+
+    struct PieceResult {
+        int piece_index = -1;
+        std::vector<float> pcm;
+        int sample_rate = 24000;
+        double t3_ms = 0.0;
+        double s3gen_ms = 0.0;
+        int    t3_tokens = 0;
+        int    audio_samples = 0;
+    };
+
+    std::vector<PieceResult> synthesize_pieces(
+        const std::vector<std::string> & texts,
+        const PieceCallback & on_piece_chunk);
+
+    bool set_reference_audio(const std::string & path);
+    bool set_voice_dir(const std::string & dir);
+
+    struct TokenTiming {
+        int    total_speech_tokens = 0;
+        double ms_per_token_estimate = 0.0;
+    };
+    TokenTiming timing_hint() const;
 
     void cancel();
 
