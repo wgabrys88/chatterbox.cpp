@@ -58,6 +58,16 @@ struct Engine::Impl {
     double last_t3_ms = 0.0;
     int    last_t3_tokens = 0;
 
+    bool cancelled() const {
+        return cancel_flag.load(std::memory_order_relaxed);
+    }
+
+    void ensure_not_cancelled(const char * where) const {
+        if (cancelled()) {
+            throw std::runtime_error(std::string("Engine: synthesis cancelled ") + where);
+        }
+    }
+
     explicit Impl(const EngineOptions & o)
         : opts(o) {
         if (opts.t3_gguf_path.empty()) {
@@ -324,6 +334,7 @@ struct Engine::Impl {
     }
 
     std::vector<int32_t> run_t3(const std::string & text) {
+        ensure_not_cancelled("before T3");
         const int n_threads = resolve_thread_count(opts.n_threads);
         std::mt19937 rng(opts.seed);
         chatterbox_sampling_params sp;
@@ -467,6 +478,7 @@ struct Engine::Impl {
 
     SynthesisResult synthesize_batch(const std::vector<int32_t> & speech_tokens,
                                      SynthesisResult && partial) {
+        ensure_not_cancelled("before S3Gen");
         s3gen_synthesize_opts sopts;
         fill_common_s3gen_opts(sopts);
         sopts.cfm_steps = opts.cfm_steps;
@@ -481,6 +493,7 @@ struct Engine::Impl {
             throw std::runtime_error("Engine: s3gen_synthesize_to_wav failed with code "
                                      + std::to_string(rc));
         }
+        ensure_not_cancelled("after S3Gen");
 
         result.sample_rate   = 24000;
         result.t3_tokens     = (int) speech_tokens.size();
@@ -619,6 +632,7 @@ struct Engine::Impl {
         std::vector<SynthesisResult> results;
         results.reserve(texts.size());
         for (size_t i = 0; i < texts.size(); ++i) {
+            ensure_not_cancelled("before piece");
             if (texts[i].empty()) {
                 SynthesisResult r;
                 r.sample_rate = 24000;
@@ -629,10 +643,12 @@ struct Engine::Impl {
             const auto t3_t0 = std::chrono::steady_clock::now();
             std::vector<int32_t> speech_tokens = run_t3(texts[i]);
             const auto t3_t1 = std::chrono::steady_clock::now();
+            ensure_not_cancelled("after T3");
             double t3_ms = std::chrono::duration<double, std::milli>(t3_t1 - t3_t0).count();
             last_t3_ms = t3_ms;
             last_t3_tokens = (int) speech_tokens.size();
             wait_for_preload(s3gen_preload_thread);
+            ensure_not_cancelled("before vocoder");
             SynthesisResult partial;
             partial.t3_ms = t3_ms;
             const bool use_streaming = on_piece_chunk && opts.stream_chunk_tokens > 0;
@@ -643,6 +659,7 @@ struct Engine::Impl {
                     },
                     std::move(partial))
                 : synthesize_batch(speech_tokens, std::move(partial));
+            ensure_not_cancelled("before audio emit");
             if (!on_piece_chunk || opts.stream_chunk_tokens <= 0) {
                 if (on_piece_chunk) on_piece_chunk((int) i, r.pcm.data(), r.pcm.size(), 0, true);
             }
