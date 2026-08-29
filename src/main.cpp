@@ -1,3 +1,4 @@
+#include "tts-cpp/chatterbox/log.h"
 #include "gpt2_bpe.h"
 #include "mtl_tokenizer.h"
 #include "ggml.h"
@@ -195,7 +196,7 @@ ggml_backend_t init_backend(int n_gpu_layers) {
     if (!b) throw std::runtime_error("Vulkan backend init failed");
     char desc[256] = {0};
     ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
-    fprintf(stderr, "tts event=backend role=t3 backend=Vulkan gpu_layers=%d device=%s\n", n_gpu_layers, desc);
+    tts_emit("tts.backend", ",\"role\":\"t3\",\"backend\":\"Vulkan\",\"gpu_layers\":" + std::to_string(n_gpu_layers) + ",\"device\":" + tts_json_escape(desc));
     return b;
 }
 bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
@@ -569,14 +570,6 @@ int32_t sample_next_token_ex(
     return dist(rng);
 }
 void chatterbox_log_cb(ggml_log_level level, const char * text, void * ) {
-    if (g_log_verbose || level >= GGML_LOG_LEVEL_ERROR) {
-        fputs(text, stderr);
-        return;
-    }
-    if (!text) return;
-    if (std::strstr(text, "ggml_vulkan: Found") || std::strstr(text, "ggml_vulkan: 0 =") ||
-        std::strstr(text, "ggml_vulkan: 1 =")) {
-        fputs(text, stderr);
-    }
+    if (level >= GGML_LOG_LEVEL_ERROR && text) fputs(text, stderr);
 }
 }

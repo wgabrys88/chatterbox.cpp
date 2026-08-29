@@ -1,9 +1,12 @@
 #include "tts-cpp/chatterbox/engine.h"
+#include "tts-cpp/chatterbox/log.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 #include "chatterbox_t3_internal.h"
@@ -174,7 +177,14 @@ struct Engine::Impl {
     }
     void piece(const std::string& text, int index, const PieceCallback& cb) {
         if (text.empty()) return;
+        const auto t0 = std::chrono::steady_clock::now();
         auto tokens = t3(text);
+        const double t3_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        tts_emit("t3", ",\"index\":" + std::to_string(index)
+            + ",\"chars\":" + std::to_string(text.size())
+            + ",\"tokens\":" + std::to_string(tokens.size())
+            + ",\"ms\":" + std::to_string((int)(t3_ms + 0.5))
+            + ",\"text\":" + tts_json_escape(text));
         check();
         s3gen_synthesize_opts s;
         s.s3gen_gguf_path = opts.s3gen_gguf_path;

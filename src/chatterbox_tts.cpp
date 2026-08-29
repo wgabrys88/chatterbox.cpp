@@ -1,3 +1,4 @@
+#include "tts-cpp/chatterbox/log.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -45,7 +46,7 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
     if (!b) throw std::runtime_error("Vulkan S3Gen backend init failed");
     char desc[256] = {0};
     ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
-    fprintf(stderr, "tts event=backend role=s3gen backend=Vulkan gpu_layers=%d device=%s\n", n_gpu_layers, desc);
+    tts_emit("tts.backend", ",\"role\":\"s3gen\",\"backend\":\"Vulkan\",\"gpu_layers\":" + std::to_string(n_gpu_layers) + ",\"device\":" + tts_json_escape(desc));
     return b;
 }
 static model_ctx load_s3gen_gguf(const std::string&, int, bool);
@@ -1198,7 +1199,6 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     padded.insert(padded.end(), pre_lookahead_len, 4299);
     model_ctx& m = *s3gen_model_cache_get(opts.s3gen_gguf_path, opts.n_gpu_layers, opts.fastconv);
     const double load_ms = s3gen_model_cache_last_load_ms();
-    if (load_ms > 0.0) fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
     const model_ctx& m_hift = m;
     double pipeline_t0 = now_ms();
     const int D = 512;
@@ -1325,7 +1325,17 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     }
     const double pipeline_total = now_ms() - pipeline_t0;
     const double audio_ms = 1000.0 * wav.size() / sr;
-    fprintf(stderr, "BENCH: S3GEN_INFER_MS=%.0f AUDIO_MS=%.0f\n", pipeline_total, audio_ms);
+    char rtf[32];
+    std::snprintf(rtf, sizeof(rtf), "%.3f", audio_ms > 0.0 ? pipeline_total / audio_ms : 0.0);
+    tts_emit("s3gen",
+        ",\"infer_ms\":" + std::to_string((int)(pipeline_total + 0.5)) +
+        ",\"audio_ms\":" + std::to_string((int)(audio_ms + 0.5)) +
+        ",\"rtf\":" + rtf +
+        ",\"tokens\":" + std::to_string(speech_tokens.size()) +
+        ",\"cfm_steps\":" + std::to_string(cfm_steps) +
+        ",\"meanflow\":" + std::string(meanflow ? "true" : "false") +
+        ",\"load_ms\":" + std::to_string((int)(load_ms + 0.5)) +
+        ",\"samples\":" + std::to_string(wav.size()));
     *opts.pcm_out = std::move(wav);
 }
 void s3gen_preload(const std::string& path, int n_gpu_layers, bool fastconv) {
