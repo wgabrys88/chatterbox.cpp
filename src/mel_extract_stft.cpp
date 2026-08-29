@@ -8,8 +8,21 @@
 #include <cstring>
 #include <vector>
 #include <limits>
-void reflect_pad_1d(const std::vector<float> & in, int p_left, int p_right,
-                    std::vector<float> & out);
+static void reflect_pad_1d(const std::vector<float> & in, int p_left, int p_right,
+                           std::vector<float> & out)
+{
+    const int L = (int)in.size();
+    out.resize((size_t)(L + p_left + p_right));
+    for (int i = 0; i < p_left; ++i) {
+        const int src = p_left - i;
+        out[i] = (src >= 0 && src < L) ? in[src] : 0.0f;
+    }
+    if (L > 0) std::memcpy(out.data() + p_left, in.data(), (size_t)L * sizeof(float));
+    for (int i = 0; i < p_right; ++i) {
+        const int src = L - 2 - i;
+        out[(size_t)(L + p_left + i)] = (src >= 0 && src < L) ? in[src] : 0.0f;
+    }
+}
 namespace {
 struct ggml_ctx {
     ggml_backend_t backend = nullptr;
