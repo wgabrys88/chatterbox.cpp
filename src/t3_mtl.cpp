@@ -1016,6 +1016,7 @@ bool load_model_gguf_mtl(const std::string & path,
         }
         {
             const int64_t jk = gguf_find_key(gguf_ctx, "tokenizer.ggml.mtl_json");
+            const int64_t ck = gguf_find_key(gguf_ctx, "tokenizer.ggml.cangjie_json");
             const int64_t lk = gguf_find_key(gguf_ctx, "tokenizer.ggml.mtl_languages");
             if (jk < 0) {
                 fprintf(stderr, "load_model_gguf_mtl: GGUF missing tokenizer.ggml.mtl_json; "
@@ -1040,6 +1041,10 @@ bool load_model_gguf_mtl(const std::string & path,
                 return false;
             }
             model.mtl_tokenizer_json = jv;
+            if (ck >= 0 && gguf_get_kv_type(gguf_ctx, ck) == GGUF_TYPE_STRING) {
+                const char * cv = gguf_get_val_str(gguf_ctx, ck);
+                if (cv) model.mtl_cangjie_json = cv;
+            }
             if (lk >= 0 && gguf_get_kv_type(gguf_ctx, lk) == GGUF_TYPE_ARRAY &&
                 gguf_get_arr_type(gguf_ctx, lk) == GGUF_TYPE_STRING) {
                 const size_t n = gguf_get_arr_n(gguf_ctx, lk);

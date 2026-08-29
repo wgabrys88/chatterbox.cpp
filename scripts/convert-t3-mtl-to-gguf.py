@@ -11,7 +11,7 @@ from safetensors.torch import load_file
 from quant_policy import QUANT_TYPE as _RQ_QUANT_TYPE, should_quantize as _SHOULD_QUANTIZE
 REPO_ID = "ResembleAI/chatterbox"
 REPO_REV = "ef85ce7bef2f3f1a74d0d837d379d2fcb68203cd"
-COMMON_PATTERNS = ["ve.pt", "grapheme_mtl_merged_expanded_v1.json", "conds.pt"]
+COMMON_PATTERNS = ["ve.pt", "grapheme_mtl_merged_expanded_v1.json", "Cangjie5_TC.json", "conds.pt"]
 MODEL_FILE = "t3_mtl23ls_v3.safetensors"
 ALL_KNOWN_LANGUAGES = [
     "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi",
@@ -176,11 +176,14 @@ def write_metadata(writer: gguf.GGUFWriter, quant: str) -> None:
     writer.add_string("chatterbox.quantization", quant)
 def write_tokenizer(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
     tok_path = ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"
+    cangjie_path = ckpt_dir / "Cangjie5_TC.json"
     text = tok_path.read_text(encoding="utf-8")
+    cangjie = cangjie_path.read_text(encoding="utf-8")
     writer.add_string("tokenizer.ggml.model", "mtl_grapheme")
     writer.add_string("tokenizer.ggml.mtl_json", text)
+    writer.add_string("tokenizer.ggml.cangjie_json", cangjie)
     writer.add_array("tokenizer.ggml.mtl_languages", ALL_KNOWN_LANGUAGES)
-    print(f"Embedded tokenizer JSON ({len(text)} bytes), {len(ALL_KNOWN_LANGUAGES)} languages")
+    print(f"Embedded tokenizer JSON ({len(text)} bytes), Cangjie ({len(cangjie)} bytes), {len(ALL_KNOWN_LANGUAGES)} languages")
 def write_voice_encoder(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
     ve_path = ckpt_dir / "ve.pt"
     if not ve_path.exists():

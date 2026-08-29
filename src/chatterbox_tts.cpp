@@ -4,6 +4,7 @@
 #include "gguf.h"
 #include "ggml-vulkan.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -22,6 +23,9 @@ static int g_n_threads = 1;
 static double now_ms() {
     using clock = std::chrono::steady_clock;
     return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
+}
+static void check_cancel(const std::atomic<bool>* cancel) {
+    if (cancel && cancel->load(std::memory_order_relaxed)) throw std::runtime_error("synthesis cancelled");
 }
 static void compute(ggml_backend_t backend, ggml_cgraph * gf) {
     ggml_backend_graph_compute(backend, gf);
@@ -1175,6 +1179,7 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
 }
 #include "s3gen_pipeline.h"
 void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_synthesize_opts& opts) {
+    check_cancel(opts.cancel);
     if (speech_tokens.empty()) throw std::runtime_error("S3Gen speech tokens empty");
     if (!opts.pcm_out) throw std::runtime_error("S3Gen PCM output missing");
     if (opts.prompt_token.empty() || opts.embedding.empty() || opts.prompt_feat.empty() || opts.prompt_rows <= 0)
@@ -1214,6 +1219,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)tok * D, D * sizeof(float));
     }
     std::vector<float> mu_T = run_encoder(m, input_embed, n_total, D);
+    check_cancel(opts.cancel);
     int T_mu = 2 * n_total;
     std::vector<float> mu(T_mu * MEL);
     for (int m2 = 0; m2 < MEL; ++m2)
@@ -1265,6 +1271,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     const std::vector<float> zeros_tm(T_mu * MEL, 0.0f), zeros_m(MEL, 0.0f);
     cfm_estimator_cache cfm_cache;
     for (size_t step = 0; step + 1 < t_span.size(); ++step) {
+        check_cancel(opts.cancel);
         const float t = t_span[step], r = t_span[step + 1], dt = r - t;
         auto t_emb = compute_time_mlp(m, t);
         if (meanflow) t_emb = compute_time_mixed(m, t_emb, compute_time_mlp(m, r));
@@ -1277,8 +1284,10 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         } else {
             dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, false);
         }
+        check_cancel(opts.cancel);
         for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
     }
+    check_cancel(opts.cancel);
     const int T_mel = T_mu - mel_len1;
     std::vector<float> mel(MEL * T_mel);
     const int mel_off = mel_len1;
@@ -1286,6 +1295,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         for (int t = 0; t < T_mel; ++t)
             mel[m2 * T_mel + t] = z[m2 * T_mu + (t + mel_off)];
     auto f0 = run_f0_predictor(m_hift, mel, T_mel);
+    check_cancel(opts.cancel);
     int upsample = 8 * 5 * 3 * 4;
     int T_wav = T_mel * upsample;
     std::vector<float> f0_up(T_wav);
@@ -1299,8 +1309,10 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     ggml_backend_tensor_get(llb, &l_linear_b, 0, sizeof(float));
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, l_linear_w, l_linear_b, (uint32_t)(seed + 1));
     auto s_stft = run_stft(m_hift, src);
+    check_cancel(opts.cancel);
     int T_stft = (int)(s_stft.size() / 18);
     auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft);
+    check_cancel(opts.cancel);
     const int n_trim = sr / 50;
     const int fade_len = 2 * n_trim;
     if ((int)wav.size() >= fade_len) {

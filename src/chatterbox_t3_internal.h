@@ -151,6 +151,7 @@ struct chatterbox_model {
     std::vector<std::string> tok_tokens;
     std::vector<std::string> tok_merges;
     std::string mtl_tokenizer_json;
+    std::string mtl_cangjie_json;
     std::vector<std::string> mtl_languages;
 };
 struct chatterbox_sampling_params {

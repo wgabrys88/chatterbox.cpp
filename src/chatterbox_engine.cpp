@@ -35,6 +35,7 @@ struct Engine::Impl {
     int prompt_rows = 0;
     std::vector<float> embedding;
     std::vector<int32_t> prompt_token;
+    std::unique_ptr<mtl_tokenizer> mtl_tok;
     std::atomic<bool> cancelled{false};
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void init() {
@@ -46,6 +47,11 @@ struct Engine::Impl {
         ggml_log_set(chatterbox_log_cb, nullptr);
         if (!load_model_gguf(opts.t3_gguf_path, model, opts.n_ctx, opts.n_gpu_layers)) throw std::runtime_error("T3 load failed");
         if (model.hparams.variant != CHBX_VARIANT_TURBO && model.hparams.variant != CHBX_VARIANT_MTL) throw std::runtime_error("unsupported T3 variant");
+        if (model.hparams.variant == CHBX_VARIANT_MTL) {
+            mtl_tok = std::make_unique<mtl_tokenizer>();
+            if (model.mtl_tokenizer_json.empty() || !mtl_tok->load_from_json(model.mtl_tokenizer_json)) throw std::runtime_error("MTL tokenizer missing");
+            if (opts.language == "zh" && (model.mtl_cangjie_json.empty() || !mtl_tok->load_cangjie_json(model.mtl_cangjie_json))) throw std::runtime_error("MTL Cangjie mapping missing or invalid");
+        }
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!allocr) throw std::runtime_error("T3 allocator failed");
         preload = std::thread([this] { s3gen_preload(opts.s3gen_gguf_path, opts.n_gpu_layers, opts.fastconv); });
@@ -120,9 +126,8 @@ struct Engine::Impl {
         sp.cfg_weight = opts.cfg_weight;
         std::vector<int32_t> text_tokens;
         if (model.hparams.variant == CHBX_VARIANT_MTL) {
-            mtl_tokenizer tok;
-            if (model.mtl_tokenizer_json.empty() || !tok.load_from_json(model.mtl_tokenizer_json)) throw std::runtime_error("MTL tokenizer missing");
-            text_tokens = tok.encode(text, opts.language);
+            if (!mtl_tok) throw std::runtime_error("MTL tokenizer missing");
+            text_tokens = mtl_tok->encode(text, opts.language);
             text_tokens.insert(text_tokens.begin(), model.hparams.start_text_token);
             text_tokens.push_back(model.hparams.stop_text_token);
         } else {
@@ -182,6 +187,7 @@ struct Engine::Impl {
         s.prompt_rows = prompt_rows;
         s.embedding = embedding;
         s.prompt_token = prompt_token;
+        s.cancel = &cancelled;
         std::vector<float> pcm;
         s.pcm_out = &pcm;
         s3gen_synthesize(tokens, s);

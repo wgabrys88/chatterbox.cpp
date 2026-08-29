@@ -373,7 +373,8 @@ struct json_parser {
 }
 const std::vector<std::string> & mtl_tokenizer::supported_languages() {
     static const std::vector<std::string> k_supported = {
-        "en","es","fr","de","it","pt","nl","pl","tr","sv","da","fi","no","el","ms","sw","ar","ko"
+        "ar","da","de","el","en","es","fi","fr","he","hi","it","ja",
+        "ko","ms","nl","no","pl","pt","ru","sv","sw","tr","zh"
     };
     return k_supported;
 }
@@ -481,6 +482,62 @@ bool mtl_tokenizer::load_from_file(const std::string & path) {
     ss << f.rdbuf();
     return load_from_json(ss.str());
 }
+bool mtl_tokenizer::load_cangjie_json(const std::string & json_blob) {
+    json_parser jp{json_blob.data(), json_blob.data() + json_blob.size()};
+    json_value root;
+    try {
+        root = jp.parse_value();
+    } catch (const std::exception & e) {
+        fprintf(stderr, "mtl_tokenizer: failed to parse Cangjie JSON: %s\n", e.what());
+        return false;
+    }
+    if (root.kind != json_value::J_ARR) return false;
+    m_cangjie_word_to_code.clear();
+    m_cangjie_code_to_words.clear();
+    for (const auto & item : root.arr) {
+        if (item.kind != json_value::J_STR) continue;
+        const size_t tab = item.str.find('\t');
+        if (tab == std::string::npos || tab == 0 || tab + 1 >= item.str.size()) continue;
+        const std::string word = item.str.substr(0, tab);
+        const size_t tab2 = item.str.find('\t', tab + 1);
+        const std::string code = item.str.substr(tab + 1, tab2 == std::string::npos ? std::string::npos : tab2 - tab - 1);
+        if (code.empty()) continue;
+        m_cangjie_word_to_code[word] = code;
+        m_cangjie_code_to_words[code].push_back(word);
+    }
+    return !m_cangjie_word_to_code.empty();
+}
+std::string mtl_tokenizer::cangjie_normalize(const std::string & text) const {
+    std::string out;
+    out.reserve(text.size() * 2);
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t start = pos;
+        uint32_t cp;
+        utf8_decode(text.data(), text.size(), pos, cp);
+        const std::string glyph(text.data() + start, pos - start);
+        auto it = m_cangjie_word_to_code.find(glyph);
+        if (it == m_cangjie_word_to_code.end()) {
+            out += glyph;
+            continue;
+        }
+        std::string encoded = it->second;
+        auto ri = m_cangjie_code_to_words.find(it->second);
+        if (ri != m_cangjie_code_to_words.end()) {
+            const auto wi = std::find(ri->second.begin(), ri->second.end(), glyph);
+            if (wi != ri->second.end() && wi != ri->second.begin()) {
+                encoded += std::to_string((size_t) std::distance(ri->second.begin(), wi));
+            }
+        }
+        for (char c : encoded) {
+            out += "[cj_";
+            out.push_back(c);
+            out += "]";
+        }
+        out += "[cj_.]";
+    }
+    return out;
+}
 void mtl_tokenizer::bpe_word(const std::string & word, std::vector<int32_t> & out) const {
     std::vector<std::string> parts;
     size_t pos = 0;
@@ -527,21 +584,17 @@ void mtl_tokenizer::bpe_word(const std::string & word, std::vector<int32_t> & ou
 std::vector<int32_t> mtl_tokenizer::encode(const std::string & text,
                                             const std::string & language_id) const {
     std::string txt = text;
-    if (!language_id.empty()) {
-        if (language_id == "ja" || language_id == "he" || language_id == "ru" ||
-            language_id == "zh" || language_id == "hi") {
-            throw std::runtime_error(
-                "mtl_tokenizer: language '" + language_id + "' requires preprocessing not "
-                "included in this build (pykakasi / dicta / russian_text_stresser / "
-                "Cangjie mapping). Pre-process the text externally before passing it in.");
-        }
-        if (!is_language_supported(language_id)) {
-            throw std::runtime_error("mtl_tokenizer: unsupported language '" + language_id + "'");
-        }
+    if (!language_id.empty() && !is_language_supported(language_id)) {
+        throw std::runtime_error("mtl_tokenizer: unsupported language '" + language_id + "'");
     }
     txt = utf8_lowercase(txt);
     txt = nfkd_normalize(txt);
-    if (language_id == "ko") {
+    if (language_id == "zh") {
+        if (m_cangjie_word_to_code.empty()) {
+            throw std::runtime_error("mtl_tokenizer: Chinese Cangjie mapping missing from GGUF");
+        }
+        txt = cangjie_normalize(txt);
+    } else if (language_id == "ko") {
         txt = korean_normalize(txt);
     }
     if (!language_id.empty()) {
