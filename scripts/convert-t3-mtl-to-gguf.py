@@ -1,56 +1,23 @@
 #!/usr/bin/env python3
-
-
 import argparse
-import importlib.util
 import json
 import os
 import re
-import sys
 from pathlib import Path
-
 import gguf
 import numpy as np
 import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
-
-
-def _load_requantize_policy():
-    path = Path(__file__).resolve().parent / "requantize-gguf.py"
-    spec = importlib.util.spec_from_file_location("_chatterbox_requantize_policy", path)
-    if spec is None or spec.loader is None:
-        print(f"error: could not load quant policy from {path}", file=sys.stderr)
-        sys.exit(1)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.should_quantize, mod._QUANT_TYPE
-
-
-_SHOULD_QUANTIZE, _RQ_QUANT_TYPE = _load_requantize_policy()
-
-
+from quant_policy import QUANT_TYPE as _RQ_QUANT_TYPE, should_quantize as _SHOULD_QUANTIZE
 REPO_ID = "ResembleAI/chatterbox"
-ALLOW_PATTERNS = [
-    "ve.pt",
-    "t3_mtl23ls_v2.safetensors",
-    "s3gen.pt",
-    "grapheme_mtl_merged_expanded_v1.json",
-    "conds.pt",
-    "Cangjie5_TC.json",
-]
-
-
-
-
-
-
+COMMON_PATTERNS = ["ve.pt", "grapheme_mtl_merged_expanded_v1.json", "conds.pt"]
+MODEL_FILE = "t3_mtl23ls_v3.safetensors"
 ALL_KNOWN_LANGUAGES = [
     "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi",
     "it", "ja", "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv",
     "sw", "tr", "zh",
 ]
-
 N_EMBD = 1024
 N_HEAD = 16
 N_KV_HEAD = 16
@@ -76,30 +43,16 @@ ROPE_SCALING_FACTOR = 8.0
 ROPE_LOW_FREQ_FACTOR = 1.0
 ROPE_HIGH_FREQ_FACTOR = 4.0
 ROPE_ORIGINAL_MAX_POS = 8192
-
 N_CTX = MAX_TEXT_TOKENS + MAX_SPEECH_TOKENS + 4
-
 LAYER_RE = re.compile(r"^tfmr\.layers\.(\d+)\.(.+)$")
-
 QUANT_CHOICES = ["f16", "q8_0", "q5_0", "q4_0"]
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Convert Chatterbox multilingual T3 weights to GGUF.")
     p.add_argument("--ckpt-dir", type=Path, help="Local checkpoint dir (downloads from HF if omitted).")
     p.add_argument("--out", type=Path, default=Path("models/chatterbox-t3-mtl.gguf"))
     p.add_argument("--hf-token", default=None)
-    p.add_argument("--quant", choices=QUANT_CHOICES, default="f16",
-                   help="Weight dtype for the big 2-D matmul weights.  f16 keeps "
-                        "the GGUF byte-identical to the legacy default.  q8_0/q5_0/q4_0 "
-                        "block-quantise eligible tensors per scripts/requantize-gguf.py "
-                        "(same deny-list as the S3Gen converter and the offline "
-                        "requantize tool: keeps embeddings, position embeddings, "
-                        "norms/biases, voice-encoder weights, and built-in voice "
-                        "conditioning at full precision).")
+    p.add_argument("--quant", choices=QUANT_CHOICES, default="f16", help="Quantize eligible weights.")
     return p.parse_args()
-
-
 def as_numpy(tensor: torch.Tensor, *, dtype=None, transpose: bool = False) -> np.ndarray:
     if dtype is not None:
         tensor = tensor.to(dtype)
@@ -107,8 +60,6 @@ def as_numpy(tensor: torch.Tensor, *, dtype=None, transpose: bool = False) -> np
     if transpose:
         arr = arr.T
     return np.ascontiguousarray(arr)
-
-
 def add_maybe_quantized(writer: "gguf.GGUFWriter", name: str, array: np.ndarray, quant: str) -> str:
     if quant == "f16":
         writer.add_tensor(name, array)
@@ -123,18 +74,12 @@ def add_maybe_quantized(writer: "gguf.GGUFWriter", name: str, array: np.ndarray,
     qdata = gguf.quants.quantize(np.ascontiguousarray(array.astype(np.float32)), qtype)
     writer.add_tensor(name, qdata, raw_shape=qdata.shape, raw_dtype=qtype)
     return qtype.name
-
-
 def map_llama_layer(name: str):
     m = LAYER_RE.match(name)
     if not m:
         return None
     idx = int(m.group(1))
     suffix = m.group(2)
-
-
-
-
     table = {
         "input_layernorm.weight":          ("model/h{}/ln_attn/g", torch.float32, False),
         "post_attention_layernorm.weight": ("model/h{}/ln_mlp/g",  torch.float32, False),
@@ -150,13 +95,10 @@ def map_llama_layer(name: str):
         return None
     fmt, dtype, transpose = table[suffix]
     return fmt.format(idx), dtype, transpose
-
-
 def map_tensor(name: str):
     mapped = map_llama_layer(name)
     if mapped is not None:
         return mapped
-
     if name == "tfmr.norm.weight":
         return "model/norm/g", torch.float32, False
     if name == "text_emb.weight":
@@ -171,15 +113,12 @@ def map_tensor(name: str):
         return "chatterbox/text_pos_emb", torch.float32, False
     if name == "speech_pos_emb.emb.weight":
         return "chatterbox/speech_pos_emb", torch.float32, False
-
     if name == "cond_enc.spkr_enc.weight":
         return "chatterbox/cond_spkr/w", torch.float32, False
     if name == "cond_enc.spkr_enc.bias":
         return "chatterbox/cond_spkr/b", torch.float32, False
-
     if name == "cond_enc.emotion_adv_fc.weight":
         return "chatterbox/emotion_adv_fc/w", torch.float32, False
-
     if name.startswith("cond_enc.perceiver."):
         rest = name[len("cond_enc.perceiver."):]
         if rest == "pre_attention_query":
@@ -193,22 +132,14 @@ def map_tensor(name: str):
                 return f"chatterbox/perceiver/attn/{proj}/w", torch.float32, False
             if rest == f"attn.{proj}.bias":
                 return f"chatterbox/perceiver/attn/{proj}/b", torch.float32, False
-
     return None
-
-
 def write_metadata(writer: gguf.GGUFWriter, quant: str) -> None:
-    writer.add_name("Chatterbox Multilingual T3")
-    writer.add_description("Chatterbox multilingual text-to-speech token generator (23 languages) for ggml.")
+    writer.add_name("Chatterbox Multilingual T3 V3")
+    writer.add_description("Chatterbox Multilingual V3 text-to-speech token generator (23 languages) for ggml.")
     writer.add_context_length(N_CTX)
     writer.add_embedding_length(N_EMBD)
     writer.add_block_count(N_LAYER)
     writer.add_head_count(N_HEAD)
-
-
-
-
-
     writer.add_string("chatterbox.variant", "t3_mtl")
     writer.add_string("chatterbox.backbone", "llama_520m")
     writer.add_uint32("chatterbox.n_ctx", N_CTX)
@@ -240,9 +171,8 @@ def write_metadata(writer: gguf.GGUFWriter, quant: str) -> None:
     writer.add_float32("chatterbox.rope.high_freq_factor", ROPE_HIGH_FREQ_FACTOR)
     writer.add_uint32("chatterbox.rope.original_max_position", ROPE_ORIGINAL_MAX_POS)
     writer.add_string("chatterbox.reference_repo", REPO_ID)
+    writer.add_string("chatterbox.multilingual_version", "v3")
     writer.add_string("chatterbox.quantization", quant)
-
-
 def write_tokenizer(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
     tok_path = ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"
     text = tok_path.read_text(encoding="utf-8")
@@ -250,14 +180,11 @@ def write_tokenizer(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
     writer.add_string("tokenizer.ggml.mtl_json", text)
     writer.add_array("tokenizer.ggml.mtl_languages", ALL_KNOWN_LANGUAGES)
     print(f"Embedded tokenizer JSON ({len(text)} bytes), {len(ALL_KNOWN_LANGUAGES)} languages")
-
-
 def write_voice_encoder(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
     ve_path = ckpt_dir / "ve.pt"
     if not ve_path.exists():
         print(f"warning: no ve.pt at {ve_path}, skipping VoiceEncoder weights")
         return
-
     ve_state = torch.load(ve_path, map_location="cpu", weights_only=True)
     VE_HIDDEN = 256
     VE_INPUT = 40
@@ -273,7 +200,6 @@ def write_voice_encoder(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
     writer.add_float32("voice_encoder.overlap",      0.5)
     writer.add_float32("voice_encoder.rate",         1.3)
     writer.add_float32("voice_encoder.min_coverage", 0.8)
-
     n = 0
     for k, t in ve_state.items():
         if k.startswith("similarity_"):
@@ -281,15 +207,12 @@ def write_voice_encoder(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
         writer.add_tensor(f"voice_encoder/{k.replace('.', '/')}",
                           as_numpy(t, dtype=torch.float32))
         n += 1
-
     import librosa
     ve_mel_fb = librosa.filters.mel(
         sr=16000, n_fft=400, n_mels=40, fmin=0, fmax=8000,
     ).astype(np.float32)
     writer.add_tensor("voice_encoder/mel_fb", np.ascontiguousarray(ve_mel_fb))
     print(f"Embedded VoiceEncoder: {n} tensors + mel_fb {ve_mel_fb.shape}")
-
-
 def main() -> None:
     args = parse_args()
     if args.ckpt_dir:
@@ -298,20 +221,17 @@ def main() -> None:
         ckpt_dir = Path(snapshot_download(
             repo_id=REPO_ID,
             token=args.hf_token or os.getenv("HF_TOKEN"),
-            allow_patterns=ALLOW_PATTERNS,
+            allow_patterns=COMMON_PATTERNS + [MODEL_FILE],
         ))
     args.out.parent.mkdir(parents=True, exist_ok=True)
-
-    print(f"Loading checkpoint from {ckpt_dir}")
-    state = load_file(ckpt_dir / "t3_mtl23ls_v2.safetensors")
+    print(f"Loading V3 checkpoint from {ckpt_dir / MODEL_FILE}")
+    state = load_file(ckpt_dir / MODEL_FILE)
     if "model" in state and not torch.is_tensor(state["model"]):
         state = state["model"][0]
     conds = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)
-
     writer = gguf.GGUFWriter(str(args.out), "chatterbox")
     write_metadata(writer, args.quant)
     write_tokenizer(writer, ckpt_dir)
-
     exported = 0
     quantized = 0
     ignored = []
@@ -327,20 +247,16 @@ def main() -> None:
         if written not in ("float32", "float16"):
             quantized += 1
         print(f"{gguf_name:46s} {str(tuple(arr.shape)):22s} {written}")
-
     builtin_speaker = conds["t3"]["speaker_emb"].reshape(1, SPEAKER_EMBED_SIZE)
     builtin_tokens = conds["t3"]["cond_prompt_speech_tokens"].reshape(-1).to(torch.int32)
     writer.add_uint32("chatterbox.cond_prompt_length", int(builtin_tokens.numel()))
     writer.add_tensor("chatterbox/builtin/speaker_emb", as_numpy(builtin_speaker, dtype=torch.float32))
     writer.add_tensor("chatterbox/builtin/cond_prompt_speech_tokens", as_numpy(builtin_tokens))
-
     write_voice_encoder(writer, ckpt_dir)
-
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
-
     out_size = args.out.stat().st_size
     print(f"\nWrote {exported + 2} mapped tensors to {args.out} ({out_size / 1e6:.1f} MB)")
     print(f"  --quant {args.quant}: {quantized}/{exported} weight tensors quantized")
@@ -350,7 +266,5 @@ def main() -> None:
             print(f"  {n}")
         if len(ignored) > 20:
             print(f"  ... and {len(ignored) - 20} more")
-
-
 if __name__ == "__main__":
     main()

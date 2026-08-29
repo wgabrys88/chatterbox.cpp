@@ -1,15 +1,10 @@
 #pragma once
-
-
 #include <cstdint>
 #include <string>
 #include <vector>
-
 struct ggml_context;
 struct ggml_tensor;
 typedef struct ggml_backend * ggml_backend_t;
-
-
 struct voice_encoder_lstm_layer {
     std::vector<float> w_ih;
     std::vector<float> w_hh;
@@ -18,7 +13,6 @@ struct voice_encoder_lstm_layer {
     int H = 0;
     int I = 0;
 };
-
 struct voice_encoder_weights {
     int n_layers  = 3;
     int n_mels    = 40;
@@ -28,19 +22,13 @@ struct voice_encoder_weights {
     std::vector<float> proj_w;
     std::vector<float> proj_b;
     std::vector<float> mel_fb;
-
-
     int   partial_frames = 160;
     float overlap        = 0.5f;
     float rate           = 1.3f;
     float min_coverage   = 0.8f;
 };
-
-
 bool voice_encoder_load(const std::string & t3_gguf_path,
                         voice_encoder_weights & out);
-
-
 bool voice_encoder_embed(const std::vector<float> & wav_16k,
                          const voice_encoder_weights & w,
                          ggml_backend_t backend,

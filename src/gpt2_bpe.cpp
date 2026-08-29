@@ -1,5 +1,4 @@
 #include "gpt2_bpe.h"
-
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
@@ -9,8 +8,6 @@
 #include <regex>
 #include <sstream>
 #include <unordered_set>
-
-
 static std::unordered_map<uint8_t, std::string> build_byte_to_unicode() {
     std::unordered_map<uint8_t, std::string> m;
     auto cpt_to_utf8 = [](uint32_t cp) -> std::string {
@@ -33,31 +30,25 @@ static std::unordered_map<uint8_t, std::string> build_byte_to_unicode() {
     }
     return m;
 }
-
 static const std::unordered_map<uint8_t, std::string> & byte_to_unicode() {
     static auto m = build_byte_to_unicode();
     return m;
 }
-
 static std::string bytes_to_unicode_str(const std::string & raw) {
     std::string out;
     auto & b2u = byte_to_unicode();
     for (unsigned char c : raw) out += b2u.at(c);
     return out;
 }
-
-
 bool gpt2_bpe::load_from_arrays(const std::vector<std::string> & tokens,
                                 const std::vector<std::string> & merges) {
     if (tokens.empty()) return false;
-
     id_to_token = tokens;
     token_to_id.clear();
     token_to_id.reserve(tokens.size());
     for (size_t i = 0; i < tokens.size(); ++i) {
         token_to_id[tokens[i]] = (int32_t) i;
     }
-
     bpe_ranks.clear();
     bpe_ranks.reserve(merges.size());
     for (size_t i = 0; i < merges.size(); ++i) {
@@ -65,13 +56,10 @@ bool gpt2_bpe::load_from_arrays(const std::vector<std::string> & tokens,
     }
     return true;
 }
-
-
 static std::vector<std::string> gpt2_regex_split(const std::string & text) {
     static const std::regex re(
         R"('s|'t|'re|'ve|'m|'ll|'d| ?[[:alpha:]]+| ?[[:digit:]]+| ?[^\s[:alpha:][:digit:]]+|\s+(?!\S)|\s+)",
         std::regex::optimize);
-
     std::vector<std::string> words;
     auto begin = std::sregex_iterator(text.begin(), text.end(), re);
     auto end = std::sregex_iterator();
@@ -80,17 +68,13 @@ static std::vector<std::string> gpt2_regex_split(const std::string & text) {
     }
     return words;
 }
-
-
 static int find_rank(const std::unordered_map<std::string, int> & ranks,
                      const std::string & left, const std::string & right) {
     auto it = ranks.find(left + " " + right);
     return it != ranks.end() ? it->second : -1;
 }
-
 static std::vector<std::string> bpe_merge(const std::string & token,
                                           const std::unordered_map<std::string, int> & ranks) {
-
     std::vector<std::string> parts;
     for (size_t i = 0; i < token.size(); ) {
         size_t len = 1;
@@ -101,7 +85,6 @@ static std::vector<std::string> bpe_merge(const std::string & token,
         parts.push_back(token.substr(i, len));
         i += len;
     }
-
     while (parts.size() >= 2) {
         int best_rank = INT32_MAX;
         size_t best_i = 0;
@@ -115,13 +98,9 @@ static std::vector<std::string> bpe_merge(const std::string & token,
     }
     return parts;
 }
-
-
 std::vector<int32_t> gpt2_bpe::tokenize(const std::string & text) const {
     std::vector<int32_t> ids;
     if (text.empty()) return ids;
-
-
     struct added_span { size_t start; size_t len; int32_t id; };
     std::vector<added_span> spans;
     for (auto & [tok, id] : token_to_id) {
@@ -133,14 +112,11 @@ std::vector<int32_t> gpt2_bpe::tokenize(const std::string & text) const {
         }
     }
     std::sort(spans.begin(), spans.end(), [](const added_span & a, const added_span & b) { return a.start < b.start; });
-
-
     std::vector<added_span> clean;
     size_t last_end = 0;
     for (auto & sp : spans) {
         if (sp.start >= last_end) { clean.push_back(sp); last_end = sp.start + sp.len; }
     }
-
     auto tokenize_fragment = [&](const std::string & frag) {
         auto words = gpt2_regex_split(frag);
         for (auto & word : words) {
@@ -160,7 +136,6 @@ std::vector<int32_t> gpt2_bpe::tokenize(const std::string & text) const {
             }
         }
     };
-
     size_t cursor = 0;
     for (auto & sp : clean) {
         if (sp.start > cursor) tokenize_fragment(text.substr(cursor, sp.start - cursor));
@@ -168,20 +143,12 @@ std::vector<int32_t> gpt2_bpe::tokenize(const std::string & text) const {
         cursor = sp.start + sp.len;
     }
     if (cursor < text.size()) tokenize_fragment(text.substr(cursor));
-
     return ids;
 }
-
-
 std::string gpt2_bpe::punc_norm(const std::string & text) {
     if (text.empty()) return "You need to add some text for me to talk.";
-
     std::string t = text;
-
-
     if (t[0] >= 'a' && t[0] <= 'z') t[0] = t[0] - 'a' + 'A';
-
-
     {
         std::string r;
         bool prev_space = false;
@@ -191,8 +158,6 @@ std::string gpt2_bpe::punc_norm(const std::string & text) {
         }
         t = r;
     }
-
-
     auto replace_all = [](std::string & s, const std::string & from, const std::string & to) {
         size_t pos = 0;
         while ((pos = s.find(from, pos)) != std::string::npos) {
@@ -209,20 +174,15 @@ std::string gpt2_bpe::punc_norm(const std::string & text) {
     replace_all(t, "\xe2\x80\x9d", "\"");
     replace_all(t, "\xe2\x80\x98", "'");
     replace_all(t, "\xe2\x80\x99", "'");
-
-
     while (!t.empty()) {
         char b = t.back();
         if (b == ' ' || b == '\t' || b == '\n' || b == '\r') t.pop_back();
         else break;
     }
-
-
     if (!t.empty()) {
         char last = t.back();
         if (last != '.' && last != '!' && last != '?' && last != '-' && last != ',')
             t += '.';
     }
-
     return t;
 }

@@ -2,18 +2,15 @@
 // Covers NFKD decomposition, lowercase mapping, and canonical
 // combining classes for tier-1 languages.
 // Hangul syllables (U+AC00..U+D7A3) are decomposed algorithmically.
-
 struct mtl_unicode_entry {
     uint32_t cp;
     uint32_t offset;
     uint32_t length;
 };
-
 struct mtl_ccc_entry {
     uint32_t cp;
     uint8_t  ccc;
 };
-
 static const uint32_t k_mtl_nfkd_data[] = {
     0x00020, 0x00020, 0x00308, 0x00061, 0x00020, 0x00304, 0x00032, 0x00033,
     0x00020, 0x00301, 0x003BC, 0x00020, 0x00327, 0x00031, 0x0006F, 0x00031,
@@ -612,7 +609,6 @@ static const uint32_t k_mtl_nfkd_data[] = {
     0x000A5, 0x020A9, 0x02502, 0x02190, 0x02191, 0x02192, 0x02193, 0x025A0,
     0x025CB,
 };
-
 static const mtl_unicode_entry k_mtl_nfkd_table[] = {
     {0x000A0, 0, 1},
     {0x000A8, 1, 2},
@@ -3133,7 +3129,6 @@ static const mtl_unicode_entry k_mtl_nfkd_table[] = {
     {0x0FFED, 4759, 1},
     {0x0FFEE, 4760, 1},
 };
-
 static const uint32_t k_mtl_lower_data[] = {
     0x000E0, 0x000E1, 0x000E2, 0x000E3, 0x000E4, 0x000E5, 0x000E6, 0x000E7,
     0x000E8, 0x000E9, 0x000EA, 0x000EB, 0x000EC, 0x000ED, 0x000EE, 0x000EF,
@@ -3224,7 +3219,6 @@ static const uint32_t k_mtl_lower_data[] = {
     0x0FF50, 0x0FF51, 0x0FF52, 0x0FF53, 0x0FF54, 0x0FF55, 0x0FF56, 0x0FF57,
     0x0FF58, 0x0FF59, 0x0FF5A,
 };
-
 static const mtl_unicode_entry k_mtl_lower_table[] = {
     {0x000C0, 0, 1},
     {0x000C1, 1, 1},
@@ -3925,7 +3919,6 @@ static const mtl_unicode_entry k_mtl_lower_table[] = {
     {0x0FF39, 697, 1},
     {0x0FF3A, 698, 1},
 };
-
 static const mtl_ccc_entry k_mtl_ccc_table[] = {
     {0x00300, 230},
     {0x00301, 230},
@@ -4850,7 +4843,6 @@ static const mtl_ccc_entry k_mtl_ccc_table[] = {
     {0x1E949, 230},
     {0x1E94A, 7},
 };
-
 static const size_t k_mtl_nfkd_table_len = 2518;
 static const size_t k_mtl_lower_table_len = 698;
 static const size_t k_mtl_ccc_table_len   = 922;

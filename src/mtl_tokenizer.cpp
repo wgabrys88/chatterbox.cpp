@@ -1,5 +1,4 @@
 #include "mtl_tokenizer.h"
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -13,14 +12,9 @@
 #include <unordered_set>
 #include <variant>
 #include <vector>
-
 #include "mtl_unicode_tables.inc"
-
 namespace tts_cpp::chatterbox::detail {
-
 namespace {
-
-
 static bool utf8_decode(const char * s, size_t len, size_t & pos, uint32_t & cp) {
     if (pos >= len) {
         return false;
@@ -45,7 +39,6 @@ static bool utf8_decode(const char * s, size_t len, size_t & pos, uint32_t & cp)
     pos += 1 + extra;
     return true;
 }
-
 static void utf8_append(uint32_t cp, std::string & out) {
     if (cp < 0x80) {
         out.push_back((char) cp);
@@ -63,7 +56,6 @@ static void utf8_append(uint32_t cp, std::string & out) {
         out.push_back((char) (0x80 | (cp & 0x3F)));
     }
 }
-
 static std::vector<uint32_t> utf8_to_cps(const std::string & s) {
     std::vector<uint32_t> out;
     out.reserve(s.size());
@@ -74,15 +66,12 @@ static std::vector<uint32_t> utf8_to_cps(const std::string & s) {
     }
     return out;
 }
-
 static std::string cps_to_utf8(const std::vector<uint32_t> & cps) {
     std::string out;
     out.reserve(cps.size() * 2);
     for (auto cp : cps) utf8_append(cp, out);
     return out;
 }
-
-
 static bool cp_is_space(uint32_t cp) {
     if (cp == 0x09 || cp == 0x0A || cp == 0x0B || cp == 0x0C || cp == 0x0D || cp == 0x20) return true;
     if (cp == 0x85 || cp == 0xA0 || cp == 0x1680) return true;
@@ -90,8 +79,6 @@ static bool cp_is_space(uint32_t cp) {
     if (cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000) return true;
     return false;
 }
-
-
 static bool cp_is_word(uint32_t cp) {
     if (cp == 0x5F) return true;
     if (cp >= 0x30 && cp <= 0x39) return true;
@@ -140,8 +127,6 @@ static bool cp_is_word(uint32_t cp) {
     }
     return false;
 }
-
-
 static const mtl_unicode_entry * find_entry(const mtl_unicode_entry * table, size_t n, uint32_t cp) {
     size_t lo = 0, hi = n;
     while (lo < hi) {
@@ -153,7 +138,6 @@ static const mtl_unicode_entry * find_entry(const mtl_unicode_entry * table, siz
     }
     return nullptr;
 }
-
 static void append_lowercase_cp(uint32_t cp, std::vector<uint32_t> & out) {
     if (cp >= 0x41 && cp <= 0x5A) {
         out.push_back(cp + 0x20);
@@ -166,9 +150,7 @@ static void append_lowercase_cp(uint32_t cp, std::vector<uint32_t> & out) {
         out.push_back(cp);
     }
 }
-
 static void append_nfkd_cp(uint32_t cp, std::vector<uint32_t> & out) {
-
     if (cp >= 0xAC00 && cp <= 0xD7A3) {
         uint32_t base = cp - 0xAC00;
         uint32_t l = 0x1100 + base / (21 * 28);
@@ -181,8 +163,6 @@ static void append_nfkd_cp(uint32_t cp, std::vector<uint32_t> & out) {
     }
     const auto * e = find_entry(k_mtl_nfkd_table, k_mtl_nfkd_table_len, cp);
     if (e) {
-
-
         for (uint32_t i = 0; i < e->length; ++i) {
             out.push_back(k_mtl_nfkd_data[e->offset + i]);
         }
@@ -190,8 +170,6 @@ static void append_nfkd_cp(uint32_t cp, std::vector<uint32_t> & out) {
         out.push_back(cp);
     }
 }
-
-
 static int combining_class(uint32_t cp) {
     if (cp < 0x0300) return 0;
     size_t lo = 0, hi = k_mtl_ccc_table_len;
@@ -204,7 +182,6 @@ static int combining_class(uint32_t cp) {
     }
     return 0;
 }
-
 static void canonical_reorder(std::vector<uint32_t> & cps) {
     for (size_t i = 0; i < cps.size();) {
         size_t start = i;
@@ -219,7 +196,6 @@ static void canonical_reorder(std::vector<uint32_t> & cps) {
         else { i = end; }
     }
 }
-
 static std::string nfkd_normalize(const std::string & s) {
     auto cps = utf8_to_cps(s);
     std::vector<uint32_t> out;
@@ -228,7 +204,6 @@ static std::string nfkd_normalize(const std::string & s) {
     canonical_reorder(out);
     return cps_to_utf8(out);
 }
-
 static std::string utf8_lowercase(const std::string & s) {
     auto cps = utf8_to_cps(s);
     std::vector<uint32_t> out;
@@ -236,8 +211,6 @@ static std::string utf8_lowercase(const std::string & s) {
     for (auto cp : cps) append_lowercase_cp(cp, out);
     return cps_to_utf8(out);
 }
-
-
 static std::string korean_normalize(const std::string & s) {
     auto cps = utf8_to_cps(s);
     std::vector<uint32_t> out;
@@ -253,14 +226,11 @@ static std::string korean_normalize(const std::string & s) {
             out.push_back(cp);
         }
     }
-
     size_t lo = 0, hi = out.size();
     while (lo < hi && cp_is_space(out[lo])) ++lo;
     while (hi > lo && cp_is_space(out[hi - 1])) --hi;
     return cps_to_utf8(std::vector<uint32_t>(out.begin() + lo, out.begin() + hi));
 }
-
-
 struct json_value {
     enum kind_t { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } kind = J_NULL;
     bool                                               boolean = false;
@@ -268,21 +238,16 @@ struct json_value {
     std::string                                        str;
     std::vector<json_value>                            arr;
     std::map<std::string, json_value>                  obj;
-
     const json_value * find(const std::string & k) const {
         auto it = obj.find(k);
         return it == obj.end() ? nullptr : &it->second;
     }
 };
-
 struct json_parser {
     const char * p;
     const char * end;
-
     void skip_ws() { while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) ++p; }
-
     [[noreturn]] void fail(const char * msg) { throw std::runtime_error(std::string("JSON: ") + msg); }
-
     std::string parse_string() {
         if (p >= end || *p != '"') fail("expected string");
         ++p;
@@ -302,8 +267,6 @@ struct json_parser {
                     case 'r': out.push_back('\r'); break;
                     case 't': out.push_back('\t'); break;
                     case 'u': {
-
-
                         auto try_parse_hex4 = [](const char * q, uint32_t & out_cp) -> bool {
                             uint32_t v = 0;
                             for (int i = 0; i < 4; ++i) {
@@ -317,14 +280,11 @@ struct json_parser {
                             out_cp = v;
                             return true;
                         };
-
                         if (p + 4 > end) fail("short \\u");
                         uint32_t cp = 0;
                         if (!try_parse_hex4(p, cp)) fail("bad hex");
                         p += 4;
                         if (cp >= 0xD800 && cp <= 0xDBFF) {
-
-
                             uint32_t cp2 = 0;
                             const bool have_continuation =
                                 p + 6 <= end &&
@@ -338,7 +298,6 @@ struct json_parser {
                             p += 6;
                             cp = 0x10000 + ((cp - 0xD800) << 10) + (cp2 - 0xDC00);
                         } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
-
                             utf8_append(0xFFFD, out);
                             break;
                         }
@@ -355,7 +314,6 @@ struct json_parser {
         ++p;
         return out;
     }
-
     json_value parse_value() {
         skip_ws();
         if (p >= end) fail("unexpected eof");
@@ -412,18 +370,13 @@ struct json_parser {
         return v;
     }
 };
-
-
 }
-
-
 const std::vector<std::string> & mtl_tokenizer::supported_languages() {
     static const std::vector<std::string> k_supported = {
         "en","es","fr","de","it","pt","nl","pl","tr","sv","da","fi","no","el","ms","sw","ar","ko"
     };
     return k_supported;
 }
-
 const std::vector<std::string> & mtl_tokenizer::all_known_languages() {
     static const std::vector<std::string> k_all_known = {
         "en","es","fr","de","it","pt","nl","pl","tr","sv","da","fi","no","el",
@@ -431,17 +384,14 @@ const std::vector<std::string> & mtl_tokenizer::all_known_languages() {
     };
     return k_all_known;
 }
-
 bool mtl_tokenizer::is_language_supported(const std::string & lang) const {
     for (const auto & s : supported_languages()) if (s == lang) return true;
     return false;
 }
-
 int32_t mtl_tokenizer::sot_id() const { return m_sot_id; }
 int32_t mtl_tokenizer::eot_id() const { return m_eot_id; }
 int32_t mtl_tokenizer::unk_id() const { return m_unk_id; }
 int32_t mtl_tokenizer::vocab_size() const { return (int32_t) m_id_to_token.size(); }
-
 void mtl_tokenizer::index_vocab() {
     int32_t max_id = -1;
     for (const auto & kv : m_vocab) if (kv.second > max_id) max_id = kv.second;
@@ -454,7 +404,6 @@ void mtl_tokenizer::index_vocab() {
         if (t.id >= 0 && t.id <= max_id) m_id_to_token[t.id] = t.content;
     }
 }
-
 bool mtl_tokenizer::load_from_json(const std::string & json_blob) {
     json_parser jp{json_blob.data(), json_blob.data() + json_blob.size()};
     json_value root;
@@ -464,9 +413,7 @@ bool mtl_tokenizer::load_from_json(const std::string & json_blob) {
         fprintf(stderr, "mtl_tokenizer: failed to parse JSON: %s\n", e.what());
         return false;
     }
-
     if (root.kind != json_value::J_OBJ) return false;
-
     const auto * model = root.find("model");
     if (!model || model->kind != json_value::J_OBJ) return false;
     const auto * type = model->find("type");
@@ -475,7 +422,6 @@ bool mtl_tokenizer::load_from_json(const std::string & json_blob) {
                 type ? type->str.c_str() : "<missing>");
         return false;
     }
-
     const auto * vocab = model->find("vocab");
     if (!vocab || vocab->kind != json_value::J_OBJ) return false;
     m_vocab.clear();
@@ -484,7 +430,6 @@ bool mtl_tokenizer::load_from_json(const std::string & json_blob) {
         if (kv.second.kind != json_value::J_NUM) continue;
         m_vocab[kv.first] = (int32_t) kv.second.number;
     }
-
     const auto * merges = model->find("merges");
     if (!merges || merges->kind != json_value::J_ARR) return false;
     m_bpe_ranks.clear();
@@ -493,10 +438,8 @@ bool mtl_tokenizer::load_from_json(const std::string & json_blob) {
         if (merges->arr[i].kind != json_value::J_STR) continue;
         m_bpe_ranks[merges->arr[i].str] = (int32_t) i;
     }
-
     const auto * unk = model->find("unk_token");
     if (unk && unk->kind == json_value::J_STR) m_unk_token = unk->str;
-
     m_added_tokens.clear();
     const auto * added = root.find("added_tokens");
     if (added && added->kind == json_value::J_ARR) {
@@ -509,32 +452,25 @@ bool mtl_tokenizer::load_from_json(const std::string & json_blob) {
             m_added_tokens.push_back({c->str, (int32_t) idv->number});
         }
     }
-
-
     std::sort(m_added_tokens.begin(), m_added_tokens.end(),
         [](const added_token & a, const added_token & b) { return a.content.size() > b.content.size(); });
-
     auto find_added_id = [&](const std::string & c) -> int32_t {
         for (const auto & t : m_added_tokens) if (t.content == c) return t.id;
         auto it = m_vocab.find(c);
         return it == m_vocab.end() ? -1 : it->second;
     };
-
     m_sot_id = find_added_id("[START]");
     m_eot_id = find_added_id("[STOP]");
     m_unk_id = find_added_id(m_unk_token);
     m_space_id = find_added_id("[SPACE]");
-
     if (m_sot_id < 0 || m_eot_id < 0 || m_unk_id < 0) {
         fprintf(stderr, "mtl_tokenizer: missing required special tokens (sot=%d eot=%d unk=%d)\n",
                 m_sot_id, m_eot_id, m_unk_id);
         return false;
     }
-
     index_vocab();
     return true;
 }
-
 bool mtl_tokenizer::load_from_file(const std::string & path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
@@ -545,8 +481,6 @@ bool mtl_tokenizer::load_from_file(const std::string & path) {
     ss << f.rdbuf();
     return load_from_json(ss.str());
 }
-
-
 void mtl_tokenizer::bpe_word(const std::string & word, std::vector<int32_t> & out) const {
     std::vector<std::string> parts;
     size_t pos = 0;
@@ -557,7 +491,6 @@ void mtl_tokenizer::bpe_word(const std::string & word, std::vector<int32_t> & ou
         parts.emplace_back(word.data() + start, pos - start);
     }
     if (parts.empty()) return;
-
     while (parts.size() >= 2) {
         int best_rank = INT32_MAX;
         size_t best_idx = 0;
@@ -582,7 +515,6 @@ void mtl_tokenizer::bpe_word(const std::string & word, std::vector<int32_t> & ou
         }
         parts = std::move(merged);
     }
-
     for (const auto & t : parts) {
         auto it = m_vocab.find(t);
         if (it == m_vocab.end()) {
@@ -592,12 +524,9 @@ void mtl_tokenizer::bpe_word(const std::string & word, std::vector<int32_t> & ou
         }
     }
 }
-
-
 std::vector<int32_t> mtl_tokenizer::encode(const std::string & text,
                                             const std::string & language_id) const {
     std::string txt = text;
-
     if (!language_id.empty()) {
         if (language_id == "ja" || language_id == "he" || language_id == "ru" ||
             language_id == "zh" || language_id == "hi") {
@@ -610,18 +539,14 @@ std::vector<int32_t> mtl_tokenizer::encode(const std::string & text,
             throw std::runtime_error("mtl_tokenizer: unsupported language '" + language_id + "'");
         }
     }
-
     txt = utf8_lowercase(txt);
     txt = nfkd_normalize(txt);
-
     if (language_id == "ko") {
         txt = korean_normalize(txt);
     }
-
     if (!language_id.empty()) {
         txt = std::string("[") + language_id + "]" + txt;
     }
-
     {
         std::string r;
         r.reserve(txt.size() + 16);
@@ -631,8 +556,6 @@ std::vector<int32_t> mtl_tokenizer::encode(const std::string & text,
         }
         txt = std::move(r);
     }
-
-
     std::vector<std::pair<std::string, int32_t>> segments;
     {
         size_t i = 0;
@@ -659,16 +582,13 @@ std::vector<int32_t> mtl_tokenizer::encode(const std::string & text,
         }
         if (!buf.empty()) segments.emplace_back(std::move(buf), -1);
     }
-
     std::vector<int32_t> out;
     out.reserve(txt.size());
-
     for (const auto & seg : segments) {
         if (seg.second >= 0) {
             out.push_back(seg.second);
             continue;
         }
-
         const std::string & s = seg.first;
         auto cps = utf8_to_cps(s);
         size_t i = 0;
@@ -683,11 +603,8 @@ std::vector<int32_t> mtl_tokenizer::encode(const std::string & text,
             bpe_word(chunk_utf8, out);
         }
     }
-
     return out;
 }
-
-
 std::string mtl_tokenizer::decode(const std::vector<int32_t> & ids) const {
     std::string out;
     out.reserve(ids.size() * 2);
@@ -705,5 +622,4 @@ std::string mtl_tokenizer::decode(const std::vector<int32_t> & ids) const {
     }
     return out;
 }
-
 }

@@ -1,15 +1,10 @@
-
-
-
 #include "chatterbox_t3_internal.h"
 #include "t3_mtl.h"
-
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -20,12 +15,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
 namespace tts_cpp::chatterbox::detail {
-
 namespace {
-
-
 struct t3_stack_entry {
     ggml_backend_buffer_t buffer = nullptr;
     ggml_context *        ctx    = nullptr;
@@ -33,7 +24,6 @@ struct t3_stack_entry {
 std::mutex                  t3_stack_mu;
 std::vector<t3_stack_entry> t3_stack_registry;
 bool                        t3_stack_atexit_registered = false;
-
 void t3_stack_release_atexit() {
     std::lock_guard<std::mutex> lk(t3_stack_mu);
     for (auto & e : t3_stack_registry) {
@@ -48,9 +38,7 @@ void t3_stack_release_atexit() {
     }
     t3_stack_registry.clear();
 }
-
 }
-
 void t3_stack_register(ggml_backend_buffer_t buf, ggml_context * ctx) {
     std::lock_guard<std::mutex> lk(t3_stack_mu);
     t3_stack_registry.push_back({buf, ctx});
@@ -59,8 +47,6 @@ void t3_stack_register(ggml_backend_buffer_t buf, ggml_context * ctx) {
         t3_stack_atexit_registered = true;
     }
 }
-
-
 void t3_stack_unregister(ggml_backend_buffer_t buf, ggml_context * ctx) {
     std::lock_guard<std::mutex> lk(t3_stack_mu);
     for (auto it = t3_stack_registry.begin(); it != t3_stack_registry.end(); ) {
@@ -71,15 +57,12 @@ void t3_stack_unregister(ggml_backend_buffer_t buf, ggml_context * ctx) {
         }
     }
 }
-
 namespace {
-
 int64_t require_key(const gguf_context * ctx, const char * key) {
     int64_t id = gguf_find_key(ctx, key);
     if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + key);
     return id;
 }
-
 ggml_tensor * require_tensor(const chatterbox_model & m, const char * name) {
     auto it = m.tensors.find(name);
     if (it == m.tensors.end() || !it->second) {
@@ -87,7 +70,6 @@ ggml_tensor * require_tensor(const chatterbox_model & m, const char * name) {
     }
     return it->second;
 }
-
 uint32_t get_u32(const gguf_context * ctx, const char * key) {
     return gguf_get_val_u32(ctx, require_key(ctx, key));
 }
@@ -97,21 +79,16 @@ float get_f32(const gguf_context * ctx, const char * key) {
 bool get_bool(const gguf_context * ctx, const char * key) {
     return gguf_get_val_bool(ctx, require_key(ctx, key));
 }
-
-
 std::vector<float> compute_llama3_freq_factors(int head_dim, float theta,
                                                float factor, float low_freq,
                                                float high_freq, int orig_max_pos) {
     const int half = head_dim / 2;
     std::vector<float> ff(half, 1.0f);
-
     const float low_wavelen  = (float) orig_max_pos / low_freq;
     const float high_wavelen = (float) orig_max_pos / high_freq;
-
     for (int i = 0; i < half; ++i) {
         const float base = 1.0f / std::pow(theta, (float)(2 * i) / (float) head_dim);
         const float wavelen = 2.0f * (float) M_PI / base;
-
         float effective;
         if (wavelen > low_wavelen) {
             effective = base / factor;
@@ -127,8 +104,6 @@ std::vector<float> compute_llama3_freq_factors(int head_dim, float theta,
     }
     return ff;
 }
-
-
 ggml_tensor * build_perceiver_attn(ggml_context * ctx,
                                    const perceiver_weights & w,
                                    const chatterbox_hparams & hp,
@@ -137,53 +112,38 @@ ggml_tensor * build_perceiver_attn(ggml_context * ctx,
     const int n_embd  = hp.n_embd;
     const int n_heads = hp.perceiver_heads;
     const int head_dim = n_embd / n_heads;
-
     const int T_q  = perc_q->ne[1];
     const int T_kv = perc_kv->ne[1];
-
-
     auto ln = [&](ggml_tensor * x) {
         ggml_tensor * n = ggml_norm(ctx, x, 1e-5f);
         return ggml_add(ctx, ggml_mul(ctx, n, w.norm_g), w.norm_b);
     };
     ggml_tensor * q_norm = ln(perc_q);
     ggml_tensor * kv_norm = ln(perc_kv);
-
     ggml_tensor * q_lin = ggml_add(ctx, ggml_mul_mat(ctx, w.to_q_w, q_norm),  w.to_q_b);
     ggml_tensor * k_lin = ggml_add(ctx, ggml_mul_mat(ctx, w.to_k_w, kv_norm), w.to_k_b);
     ggml_tensor * v_lin = ggml_add(ctx, ggml_mul_mat(ctx, w.to_v_w, kv_norm), w.to_v_b);
-
-
     ggml_tensor * Q = ggml_reshape_3d(ctx, q_lin, head_dim, n_heads, T_q);
     Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
     ggml_tensor * K = ggml_reshape_3d(ctx, k_lin, head_dim, n_heads, T_kv);
     K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
     ggml_tensor * V = ggml_reshape_3d(ctx, v_lin, head_dim, n_heads, T_kv);
     V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
-
     const float scale = 1.0f / std::sqrt((float) head_dim);
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, nullptr,
                                              scale, 0.0f, 0.0f);
-
     attn = ggml_reshape_2d(ctx, attn, n_embd, T_q);
-
     ggml_tensor * proj = ggml_add(ctx, ggml_mul_mat(ctx, w.proj_out_w, attn), w.proj_out_b);
     return ggml_add(ctx, perc_q, proj);
 }
-
-
 ggml_tensor * build_perceiver(ggml_context * ctx,
                               const chatterbox_model & m,
                               ggml_tensor * h) {
-
-
     ggml_tensor * query = ggml_reshape_2d(ctx, m.perceiver.pre_attention_query, m.hparams.n_embd, m.hparams.perceiver_queries);
     ggml_tensor * pre_att = build_perceiver_attn(ctx, m.perceiver, m.hparams, query, h);
     ggml_tensor * out     = build_perceiver_attn(ctx, m.perceiver, m.hparams, pre_att, pre_att);
     return out;
 }
-
-
 ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
                                 const chatterbox_model & m,
                                 int il,
@@ -201,8 +161,6 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
     const int NKV = hp.n_kv_head;
     const int n_ctx = hp.n_ctx;
     const int64_t L = n_past + N;
-
-
     const size_t kv_ts = ggml_type_size(memory_k->type);
     const size_t kv_head_stride   = (size_t) HD * n_ctx * kv_ts;
     const size_t kv_pos_stride    = (size_t) HD * kv_ts;
@@ -211,12 +169,8 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
     const size_t kv_layer_stride  = (size_t) 2 * kv_batch_stride;
     const size_t layer_off = (size_t) il * kv_layer_stride
                            + b_offset_elems * kv_ts;
-
-
     ggml_tensor * cur = ggml_rms_norm(ctx, inpL, hp.eps);
     cur = ggml_mul(ctx, cur, l.ln_attn_g);
-
-
     const int n_embd_t = hp.n_embd;
     ggml_tensor * Qlin;
     ggml_tensor * Klin;
@@ -245,8 +199,6 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
         Klin = ggml_mul_mat(ctx, l.wk, cur);
         Vlin = ggml_mul_mat(ctx, l.wv, cur);
     }
-
-
     ggml_tensor * Q;
     ggml_tensor * K;
     ggml_tensor * V;
@@ -263,8 +215,6 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
         }
     }
     (void) used_stacked_qkv;
-
-
     const int rope_mode = GGML_ROPE_TYPE_NEOX;
     Q = ggml_rope_ext(ctx, Q, pos_ids, m.rope_freq_factors,
                       HD, rope_mode, hp.rope_orig_max_pos,
@@ -272,13 +222,9 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
     K = ggml_rope_ext(ctx, K, pos_ids, m.rope_freq_factors,
                       HD, rope_mode, hp.rope_orig_max_pos,
                       hp.rope_theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-
-
     Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
     K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
     V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
-
-
     {
         ggml_tensor * k_dst;
         ggml_tensor * v_dst;
@@ -304,8 +250,6 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
         ggml_build_forward_expand(gf, ggml_cpy(ctx, K, k_dst));
         ggml_build_forward_expand(gf, ggml_cpy(ctx, V, v_dst));
     }
-
-
     ggml_tensor * Kfull;
     ggml_tensor * Vfull;
     if (B == 1) {
@@ -327,22 +271,16 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
             kv_pos_stride, kv_head_stride, kv_batch_stride,
             layer_off);
     }
-
     const float scale = 1.0f / std::sqrt((float) HD);
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, Kfull, Vfull, kq_mask,
                                              scale, 0.0f, 0.0f);
-
     if (B == 1) {
         cur = ggml_reshape_2d(ctx, attn, hp.n_embd, N);
     } else {
         cur = ggml_reshape_3d(ctx, attn, hp.n_embd, N, B);
     }
-
-
     cur = ggml_mul_mat(ctx, l.wo, cur);
     cur = ggml_add(ctx, cur, inpL);
-
-
     ggml_tensor * inpFF = cur;
     ggml_tensor * norm2 = ggml_mul(ctx, ggml_rms_norm(ctx, cur, hp.eps), l.ln_mlp_g);
     ggml_tensor * gate = ggml_mul_mat(ctx, l.mlp_gate, norm2);
@@ -351,19 +289,13 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
     ggml_tensor * down = ggml_mul_mat(ctx, l.mlp_down, mlp);
     return ggml_add(ctx, inpFF, down);
 }
-
-
 ggml_tensor * build_cond_emb(ggml_context * ctx,
                              const chatterbox_model & m,
                              ggml_tensor * exaggeration) {
     const auto & hp = m.hparams;
-
-
     ggml_tensor * spkr_raw = ggml_mul_mat(ctx, m.cond_spkr_w, m.builtin_speaker_emb);
     ggml_tensor * spkr = ggml_add(ctx, spkr_raw,
                                    ggml_reshape_2d(ctx, m.cond_spkr_b, hp.n_embd, 1));
-
-
     ggml_tensor * cond_tok_emb = ggml_get_rows(ctx, m.speech_emb, m.builtin_cond_prompt_tokens);
     const int cond_prompt_len = m.builtin_cond_prompt_tokens->ne[0];
     ggml_tensor * cond_pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, cond_prompt_len);
@@ -371,61 +303,39 @@ ggml_tensor * build_cond_emb(ggml_context * ctx,
     ggml_set_input(cond_pos_ids);
     ggml_tensor * cond_pos = ggml_get_rows(ctx, m.speech_pos_emb, cond_pos_ids);
     ggml_tensor * cond_prompt_emb = ggml_add(ctx, cond_tok_emb, cond_pos);
-
-
     ggml_tensor * perc = build_perceiver(ctx, m, cond_prompt_emb);
-
-
     ggml_tensor * emot = ggml_mul_mat(ctx, m.emotion_adv_w, exaggeration);
-
-
     ggml_tensor * cond_emb = ggml_concat(ctx, spkr, perc, 1);
     cond_emb = ggml_concat(ctx, cond_emb, emot, 1);
     return cond_emb;
 }
-
-
 ggml_cgraph * build_prompt_graph_mtl(const chatterbox_model & model,
                                      int n_text_tokens,
                                      bool is_uncond) {
     const auto & hp = model.hparams;
     const int len_cond = 1 + hp.perceiver_queries + (hp.emotion_adv ? 1 : 0);
     const int N = len_cond + n_text_tokens + 2;
-
     static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
                              ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
     thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
-
-
     ggml_tensor * text_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_text_tokens);
     ggml_set_name(text_tokens, "text_tokens");  ggml_set_input(text_tokens);
-
     ggml_tensor * speech_bos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_name(speech_bos, "speech_bos");  ggml_set_input(speech_bos);
-
     ggml_tensor * pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
     ggml_set_name(pos_ids, "pos_ids");  ggml_set_input(pos_ids);
-
     ggml_tensor * text_pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_text_tokens);
     ggml_set_name(text_pos_ids, "text_pos_ids");  ggml_set_input(text_pos_ids);
-
     ggml_tensor * speech_pos0 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_name(speech_pos0, "speech_pos0");  ggml_set_input(speech_pos0);
-
     ggml_tensor * exaggeration = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
     ggml_set_name(exaggeration, "exaggeration");  ggml_set_input(exaggeration);
-
-
     ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, N, N);
     ggml_set_name(kq_mask, "kq_mask");  ggml_set_input(kq_mask);
-
-
     ggml_tensor * cond_emb = build_cond_emb(ctx, model, exaggeration);
-
-
     ggml_tensor * text_pos_emb_seq = ggml_get_rows(ctx, model.text_pos_emb, text_pos_ids);
     ggml_tensor * text_emb_out;
     if (is_uncond) {
@@ -434,18 +344,12 @@ ggml_cgraph * build_prompt_graph_mtl(const chatterbox_model & model,
         ggml_tensor * text_tok_emb = ggml_get_rows(ctx, model.text_emb, text_tokens);
         text_emb_out = ggml_add(ctx, text_tok_emb, text_pos_emb_seq);
     }
-
-
     ggml_tensor * speech_tok_emb = ggml_get_rows(ctx, model.speech_emb, speech_bos);
     ggml_tensor * speech_pos_emb_0 = ggml_get_rows(ctx, model.speech_pos_emb, speech_pos0);
     ggml_tensor * speech_emb_out = ggml_add(ctx, speech_tok_emb, speech_pos_emb_0);
-
-
     ggml_tensor * inp = ggml_concat(ctx, cond_emb, text_emb_out, 1);
     inp = ggml_concat(ctx, inp, speech_emb_out, 1);
     inp = ggml_concat(ctx, inp, speech_emb_out, 1);
-
-
     const size_t kv_layer_elems = (size_t) hp.head_dim * hp.n_kv_head * hp.n_ctx;
     const size_t b_off = is_uncond ? kv_layer_elems : 0;
     ggml_tensor * cur = inp;
@@ -455,71 +359,49 @@ ggml_cgraph * build_prompt_graph_mtl(const chatterbox_model & model,
                                 model.memory_k, model.memory_v,
                                 pos_ids, kq_mask);
     }
-
-
     cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, hp.eps), model.norm_g);
-
     ggml_tensor * last = ggml_view_2d(ctx, cur, hp.n_embd, 1,
                                       cur->nb[1],
                                       (size_t)(N - 1) * cur->nb[1]);
     ggml_tensor * logits = ggml_mul_mat(ctx, model.speech_head, last);
     ggml_set_name(logits, "logits");  ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
-
     ggml_free(ctx);
     return gf;
 }
-
-
 ggml_cgraph * build_prompt_graph_mtl_b2(const chatterbox_model & model,
                                         int n_text_tokens) {
     const auto & hp = model.hparams;
     const int len_cond = 1 + hp.perceiver_queries + (hp.emotion_adv ? 1 : 0);
     const int N = len_cond + n_text_tokens + 2;
-
     static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
                              ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
     thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
-
     ggml_tensor * text_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_text_tokens);
     ggml_set_name(text_tokens, "text_tokens");  ggml_set_input(text_tokens);
-
     ggml_tensor * speech_bos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_name(speech_bos, "speech_bos");  ggml_set_input(speech_bos);
-
     ggml_tensor * pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
     ggml_set_name(pos_ids, "pos_ids");  ggml_set_input(pos_ids);
-
     ggml_tensor * text_pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_text_tokens);
     ggml_set_name(text_pos_ids, "text_pos_ids");  ggml_set_input(text_pos_ids);
-
     ggml_tensor * speech_pos0 = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_name(speech_pos0, "speech_pos0");  ggml_set_input(speech_pos0);
-
     ggml_tensor * exaggeration = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
     ggml_set_name(exaggeration, "exaggeration");  ggml_set_input(exaggeration);
-
     ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, N, N);
     ggml_set_name(kq_mask, "kq_mask");  ggml_set_input(kq_mask);
-
-
     ggml_tensor * cond_emb = build_cond_emb(ctx, model, exaggeration);
-
-
     ggml_tensor * text_pos_emb_seq = ggml_get_rows(ctx, model.text_pos_emb, text_pos_ids);
     ggml_tensor * text_tok_emb     = ggml_get_rows(ctx, model.text_emb, text_tokens);
     ggml_tensor * text_cond   = ggml_add(ctx, text_tok_emb, text_pos_emb_seq);
     ggml_tensor * text_uncond = text_pos_emb_seq;
-
-
     ggml_tensor * speech_tok_emb    = ggml_get_rows(ctx, model.speech_emb, speech_bos);
     ggml_tensor * speech_pos_emb_0  = ggml_get_rows(ctx, model.speech_pos_emb, speech_pos0);
     ggml_tensor * speech_emb_out    = ggml_add(ctx, speech_tok_emb, speech_pos_emb_0);
-
-
     auto assemble_one = [&](ggml_tensor * text) {
         ggml_tensor * inp = ggml_concat(ctx, cond_emb, text, 1);
         inp = ggml_concat(ctx, inp, speech_emb_out, 1);
@@ -528,13 +410,10 @@ ggml_cgraph * build_prompt_graph_mtl_b2(const chatterbox_model & model,
     };
     ggml_tensor * inp_cond   = assemble_one(text_cond);
     ggml_tensor * inp_uncond = assemble_one(text_uncond);
-
-
     ggml_tensor * inp_b2 = ggml_concat(ctx,
         ggml_reshape_3d(ctx, inp_cond,   hp.n_embd, N, 1),
         ggml_reshape_3d(ctx, inp_uncond, hp.n_embd, N, 1),
         2);
-
     ggml_tensor * cur = inp_b2;
     for (int il = 0; il < hp.n_layer; ++il) {
         cur = build_llama_block(ctx, gf, model, il, cur, 0, N,
@@ -542,8 +421,6 @@ ggml_cgraph * build_prompt_graph_mtl_b2(const chatterbox_model & model,
                                 model.memory_k, model.memory_v,
                                 pos_ids, kq_mask);
     }
-
-
     cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, hp.eps), model.norm_g);
     ggml_tensor * last = ggml_view_3d(ctx, cur,
         hp.n_embd, 1, 2,
@@ -553,39 +430,29 @@ ggml_cgraph * build_prompt_graph_mtl_b2(const chatterbox_model & model,
     ggml_tensor * logits = ggml_mul_mat(ctx, model.speech_head, last);
     ggml_set_name(logits, "logits");  ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
-
     ggml_free(ctx);
     return gf;
 }
-
-
 ggml_cgraph * build_step_graph_mtl_b2(const chatterbox_model & model,
                                       int n_past) {
     const auto & hp = model.hparams;
-
     static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
                              ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
     thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
-
     ggml_tensor * speech_token = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_name(speech_token, "speech_token"); ggml_set_input(speech_token);
-
     ggml_tensor * speech_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_name(speech_pos, "speech_pos"); ggml_set_input(speech_pos);
-
     ggml_tensor * pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_name(pos_ids, "pos_ids"); ggml_set_input(pos_ids);
-
-
     ggml_tensor * inp_b1 = ggml_add(ctx,
         ggml_get_rows(ctx, model.speech_emb,     speech_token),
         ggml_get_rows(ctx, model.speech_pos_emb, speech_pos));
     ggml_tensor * inp_b1_3d = ggml_reshape_3d(ctx, inp_b1, hp.n_embd, 1, 1);
     ggml_tensor * inp = ggml_concat(ctx, inp_b1_3d, inp_b1_3d, 2);
-
     ggml_tensor * cur = inp;
     for (int il = 0; il < hp.n_layer; ++il) {
         cur = build_llama_block(ctx, gf, model, il, cur, n_past, 1,
@@ -594,44 +461,33 @@ ggml_cgraph * build_step_graph_mtl_b2(const chatterbox_model & model,
                                 pos_ids, nullptr);
     }
     cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, hp.eps), model.norm_g);
-
-
     ggml_tensor * logits = ggml_mul_mat(ctx, model.speech_head, cur);
     ggml_set_name(logits, "logits"); ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
-
     ggml_free(ctx);
     return gf;
 }
-
 ggml_cgraph * build_step_graph_mtl(const chatterbox_model & model,
                                    int n_past,
                                    bool is_uncond) {
     const auto & hp = model.hparams;
-
     static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
                              ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
     thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
-
     ggml_tensor * speech_token = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_name(speech_token, "speech_token"); ggml_set_input(speech_token);
-
     ggml_tensor * speech_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_name(speech_pos, "speech_pos"); ggml_set_input(speech_pos);
-
     ggml_tensor * pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_name(pos_ids, "pos_ids"); ggml_set_input(pos_ids);
-
     ggml_tensor * inp = ggml_add(ctx,
         ggml_get_rows(ctx, model.speech_emb, speech_token),
         ggml_get_rows(ctx, model.speech_pos_emb, speech_pos));
-
     const size_t kv_layer_elems = (size_t) hp.head_dim * hp.n_kv_head * hp.n_ctx;
     const size_t b_off = is_uncond ? kv_layer_elems : 0;
-
     ggml_tensor * cur = inp;
     for (int il = 0; il < hp.n_layer; ++il) {
         cur = build_llama_block(ctx, gf, model, il, cur, n_past, 1,
@@ -640,15 +496,12 @@ ggml_cgraph * build_step_graph_mtl(const chatterbox_model & model,
                                 pos_ids, nullptr);
     }
     cur = ggml_mul(ctx, ggml_rms_norm(ctx, cur, hp.eps), model.norm_g);
-
     ggml_tensor * logits = ggml_mul_mat(ctx, model.speech_head, cur);
     ggml_set_name(logits, "logits"); ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
-
     ggml_free(ctx);
     return gf;
 }
-
 void fill_causal_mask_f16(std::vector<ggml_fp16_t> & out, int N) {
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
@@ -659,7 +512,6 @@ void fill_causal_mask_f16(std::vector<ggml_fp16_t> & out, int N) {
         }
     }
 }
-
 bool run_prompt_pass(const chatterbox_model & model,
                      ggml_gallocr_t allocr,
                      int n_threads,
@@ -672,15 +524,11 @@ bool run_prompt_pass(const chatterbox_model & model,
     const int len_cond = 1 + hp.perceiver_queries + (hp.emotion_adv ? 1 : 0);
     const int N = len_cond + (int) text_tokens.size() + 2;
     prompt_len_out = N;
-
     ggml_cgraph * gf = build_prompt_graph_mtl(model, (int) text_tokens.size(), is_uncond);
-
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "run_prompt_pass: gallocr_alloc_graph failed (graph topology exceeded reserved budget?)\n");
         return false;
     }
-
-
     auto set_in = [&](const char * name, const void * data, size_t bytes) {
         ggml_tensor * t = ggml_graph_get_tensor(gf, name);
         if (t) ggml_backend_tensor_set(t, data, 0, bytes);
@@ -688,47 +536,35 @@ bool run_prompt_pass(const chatterbox_model & model,
     set_in("text_tokens", text_tokens.data(), text_tokens.size() * sizeof(int32_t));
     int32_t bos = hp.start_speech_token;
     set_in("speech_bos", &bos, sizeof(bos));
-
     std::vector<int32_t> pos(N);
     for (int i = 0; i < N; ++i) pos[i] = i;
     set_in("pos_ids", pos.data(), pos.size() * sizeof(int32_t));
-
     std::vector<int32_t> text_pos(text_tokens.size());
     for (size_t i = 0; i < text_tokens.size(); ++i) text_pos[i] = (int32_t) i;
     set_in("text_pos_ids", text_pos.data(), text_pos.size() * sizeof(int32_t));
-
     int32_t sp0 = 0;
     set_in("speech_pos0", &sp0, sizeof(sp0));
-
     const int cond_prompt_len = hp.cond_prompt_len;
     std::vector<int32_t> cond_pos(cond_prompt_len);
     for (int i = 0; i < cond_prompt_len; ++i) cond_pos[i] = i;
     set_in("cond_prompt_pos_ids", cond_pos.data(), cond_pos.size() * sizeof(int32_t));
-
     float exag = exaggeration;
     set_in("exaggeration", &exag, sizeof(exag));
-
-
     std::vector<ggml_fp16_t> mask;
     fill_causal_mask_f16(mask, N);
     set_in("kq_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t));
-
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, n_threads);
     }
     ggml_backend_graph_compute(model.backend, gf);
-
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(ggml_nelements(logits));
     ggml_backend_tensor_get(logits, logits_out.data(), 0, ggml_nbytes(logits));
     return true;
 }
-
 static bool copy_b2_logits(ggml_tensor * logits, int vocab,
                            std::vector<float> & cond, std::vector<float> & uncond) {
     if (!logits) return false;
-
-
     thread_local std::vector<float> both;
     both.resize((size_t) ggml_nelements(logits));
     const size_t want = both.size() * sizeof(float);
@@ -740,8 +576,6 @@ static bool copy_b2_logits(ggml_tensor * logits, int vocab,
     uncond.assign(both.begin() + vocab, both.begin() + 2 * vocab);
     return true;
 }
-
-
 bool run_prompt_pass_b2(const chatterbox_model & model,
                         ggml_gallocr_t allocr,
                         int n_threads,
@@ -754,15 +588,11 @@ bool run_prompt_pass_b2(const chatterbox_model & model,
     const int len_cond = 1 + hp.perceiver_queries + (hp.emotion_adv ? 1 : 0);
     const int N = len_cond + (int) text_tokens.size() + 2;
     prompt_len_out = N;
-
     ggml_cgraph * gf = build_prompt_graph_mtl_b2(model, (int) text_tokens.size());
-
-
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "run_prompt_pass_b2: gallocr_alloc_graph failed (graph topology exceeded reserved budget?)\n");
         return false;
     }
-
     auto set_in = [&](const char * name, const void * data, size_t bytes) {
         ggml_tensor * t = ggml_graph_get_tensor(gf, name);
         if (t) ggml_backend_tensor_set(t, data, 0, bytes);
@@ -770,40 +600,30 @@ bool run_prompt_pass_b2(const chatterbox_model & model,
     set_in("text_tokens", text_tokens.data(), text_tokens.size() * sizeof(int32_t));
     int32_t bos = hp.start_speech_token;
     set_in("speech_bos", &bos, sizeof(bos));
-
     std::vector<int32_t> pos(N);
     for (int i = 0; i < N; ++i) pos[i] = i;
     set_in("pos_ids", pos.data(), pos.size() * sizeof(int32_t));
-
     std::vector<int32_t> text_pos(text_tokens.size());
     for (size_t i = 0; i < text_tokens.size(); ++i) text_pos[i] = (int32_t) i;
     set_in("text_pos_ids", text_pos.data(), text_pos.size() * sizeof(int32_t));
-
     int32_t sp0 = 0;
     set_in("speech_pos0", &sp0, sizeof(sp0));
-
     const int cond_prompt_len = hp.cond_prompt_len;
     std::vector<int32_t> cond_pos(cond_prompt_len);
     for (int i = 0; i < cond_prompt_len; ++i) cond_pos[i] = i;
     set_in("cond_prompt_pos_ids", cond_pos.data(), cond_pos.size() * sizeof(int32_t));
-
     float exag = exaggeration;
     set_in("exaggeration", &exag, sizeof(exag));
-
     std::vector<ggml_fp16_t> mask;
     fill_causal_mask_f16(mask, N);
     set_in("kq_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t));
-
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, n_threads);
     }
     ggml_backend_graph_compute(model.backend, gf);
-
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     return copy_b2_logits(logits, hp.n_speech_vocab, logits_cond_out, logits_uncond_out);
 }
-
-
 bool run_step_pass_b2(const chatterbox_model & model,
                       ggml_gallocr_t allocr,
                       int n_threads,
@@ -812,15 +632,11 @@ bool run_step_pass_b2(const chatterbox_model & model,
                       std::vector<float> & logits_cond_out,
                       std::vector<float> & logits_uncond_out) {
     const auto & hp = model.hparams;
-
     ggml_cgraph * gf = build_step_graph_mtl_b2(model, n_past);
-
-
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "run_step_pass_b2: gallocr_alloc_graph failed (n_past=%d)\n", n_past);
         return false;
     }
-
     ggml_tensor * t_tok = ggml_graph_get_tensor(gf, "speech_token");
     ggml_tensor * t_spos = ggml_graph_get_tensor(gf, "speech_pos");
     ggml_tensor * t_pos = ggml_graph_get_tensor(gf, "pos_ids");
@@ -833,16 +649,13 @@ bool run_step_pass_b2(const chatterbox_model & model,
     ggml_backend_tensor_set(t_spos, &sp, 0, sizeof(sp));
     int32_t pos = n_past;
     ggml_backend_tensor_set(t_pos, &pos, 0, sizeof(pos));
-
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, n_threads);
     }
     ggml_backend_graph_compute(model.backend, gf);
-
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     return copy_b2_logits(logits, hp.n_speech_vocab, logits_cond_out, logits_uncond_out);
 }
-
 bool run_step_pass(const chatterbox_model & model,
                    ggml_gallocr_t allocr,
                    int n_threads,
@@ -851,32 +664,25 @@ bool run_step_pass(const chatterbox_model & model,
                    bool is_uncond,
                    std::vector<float> & logits_out) {
     ggml_cgraph * gf = build_step_graph_mtl(model, n_past, is_uncond);
-
     if (!ggml_gallocr_alloc_graph(allocr, gf)) {
         fprintf(stderr, "run_step_pass: gallocr_alloc_graph failed (n_past=%d)\n", n_past);
         return false;
     }
-
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
     int32_t sp = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_pos"), &sp, 0, sizeof(sp));
     int32_t pos = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos_ids"), &pos, 0, sizeof(pos));
-
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, n_threads);
     }
     ggml_backend_graph_compute(model.backend, gf);
-
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(ggml_nelements(logits));
     ggml_backend_tensor_get(logits, logits_out.data(), 0, ggml_nbytes(logits));
     return true;
 }
-
 }
-
-
 ggml_cgraph * build_stage_cond_emb_graph(const chatterbox_model & m) {
     static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
                              ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
@@ -884,10 +690,8 @@ ggml_cgraph * build_stage_cond_emb_graph(const chatterbox_model & m) {
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
-
     ggml_tensor * exag = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
     ggml_set_name(exag, "exaggeration"); ggml_set_input(exag);
-
     ggml_tensor * out = build_cond_emb(ctx, m, exag);
     ggml_set_name(out, "cond_emb");
     ggml_set_output(out);
@@ -895,7 +699,6 @@ ggml_cgraph * build_stage_cond_emb_graph(const chatterbox_model & m) {
     ggml_free(ctx);
     return gf;
 }
-
 ggml_cgraph * build_stage_text_emb_graph(const chatterbox_model & m, int T_text) {
     static size_t buf_size = ggml_tensor_overhead() * 256 +
                              ggml_graph_overhead_custom(256, false);
@@ -903,12 +706,10 @@ ggml_cgraph * build_stage_text_emb_graph(const chatterbox_model & m, int T_text)
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 256, false);
-
     ggml_tensor * text_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_text);
     ggml_set_name(text_tokens, "text_tokens"); ggml_set_input(text_tokens);
     ggml_tensor * text_pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_text);
     ggml_set_name(text_pos_ids, "text_pos_ids"); ggml_set_input(text_pos_ids);
-
     ggml_tensor * tok = ggml_get_rows(ctx, m.text_emb, text_tokens);
     ggml_tensor * pos = ggml_get_rows(ctx, m.text_pos_emb, text_pos_ids);
     ggml_tensor * out = ggml_add(ctx, tok, pos);
@@ -918,20 +719,17 @@ ggml_cgraph * build_stage_text_emb_graph(const chatterbox_model & m, int T_text)
     ggml_free(ctx);
     return gf;
 }
-
 ggml_cgraph * build_stage_inputs_graph(const chatterbox_model & m, int T_text,
                                        bool is_uncond) {
     const auto & hp = m.hparams;
     const int len_cond = 1 + hp.perceiver_queries + (hp.emotion_adv ? 1 : 0);
     const int N = len_cond + T_text + 2;
-
     static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
                              ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
     thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
-
     ggml_tensor * text_tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_text);
     ggml_set_name(text_tokens, "text_tokens"); ggml_set_input(text_tokens);
     ggml_tensor * text_pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T_text);
@@ -942,9 +740,7 @@ ggml_cgraph * build_stage_inputs_graph(const chatterbox_model & m, int T_text,
     ggml_set_name(speech_pos0, "speech_pos0"); ggml_set_input(speech_pos0);
     ggml_tensor * exag = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
     ggml_set_name(exag, "exaggeration"); ggml_set_input(exag);
-
     ggml_tensor * cond_emb = build_cond_emb(ctx, m, exag);
-
     ggml_tensor * text_pos = ggml_get_rows(ctx, m.text_pos_emb, text_pos_ids);
     ggml_tensor * text_emb_out;
     if (is_uncond) {
@@ -953,11 +749,9 @@ ggml_cgraph * build_stage_inputs_graph(const chatterbox_model & m, int T_text,
         ggml_tensor * tok = ggml_get_rows(ctx, m.text_emb, text_tokens);
         text_emb_out = ggml_add(ctx, tok, text_pos);
     }
-
     ggml_tensor * semb = ggml_get_rows(ctx, m.speech_emb, speech_bos);
     ggml_tensor * spos = ggml_get_rows(ctx, m.speech_pos_emb, speech_pos0);
     ggml_tensor * speech_emb_out = ggml_add(ctx, semb, spos);
-
     ggml_tensor * inp = ggml_concat(ctx, cond_emb, text_emb_out, 1);
     inp = ggml_concat(ctx, inp, speech_emb_out, 1);
     inp = ggml_concat(ctx, inp, speech_emb_out, 1);
@@ -968,7 +762,6 @@ ggml_cgraph * build_stage_inputs_graph(const chatterbox_model & m, int T_text,
     ggml_free(ctx);
     return gf;
 }
-
 ggml_cgraph * build_stage_layers_graph(const chatterbox_model & m, int N,
                                        int n_layers, bool is_uncond) {
     const auto & hp = m.hparams;
@@ -978,22 +771,17 @@ ggml_cgraph * build_stage_layers_graph(const chatterbox_model & m, int N,
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
-
     ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, N);
     ggml_set_name(inp, "inputs_embeds"); ggml_set_input(inp);
-
     ggml_tensor * pos_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
     ggml_set_name(pos_ids, "pos_ids"); ggml_set_input(pos_ids);
-
     ggml_tensor * kq_mask = nullptr;
     if (N > 1) {
         kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, N, N);
         ggml_set_name(kq_mask, "kq_mask"); ggml_set_input(kq_mask);
     }
-
     const size_t kv_layer_elems = (size_t) hp.head_dim * hp.n_kv_head * hp.n_ctx;
     const size_t b_off = is_uncond ? kv_layer_elems : 0;
-
     ggml_tensor * cur = inp;
     const int actual_layers = std::min(n_layers, hp.n_layer);
     for (int il = 0; il < actual_layers; ++il) {
@@ -1007,7 +795,6 @@ ggml_cgraph * build_stage_layers_graph(const chatterbox_model & m, int N,
     ggml_free(ctx);
     return gf;
 }
-
 ggml_cgraph * build_stage_head_graph(const chatterbox_model & m, int N) {
     const auto & hp = m.hparams;
     static size_t buf_size = ggml_tensor_overhead() * 64 +
@@ -1016,10 +803,8 @@ ggml_cgraph * build_stage_head_graph(const chatterbox_model & m, int N) {
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
-
     ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hp.n_embd, N);
     ggml_set_name(inp, "inputs_embeds"); ggml_set_input(inp);
-
     ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, inp, hp.eps), m.norm_g);
     ggml_tensor * last = ggml_view_2d(ctx, cur, hp.n_embd, 1,
                                       cur->nb[1],
@@ -1031,8 +816,6 @@ ggml_cgraph * build_stage_head_graph(const chatterbox_model & m, int N) {
     ggml_free(ctx);
     return gf;
 }
-
-
 bool load_model_gguf_mtl(const std::string & path,
                          chatterbox_model & model,
                          int requested_ctx,
@@ -1045,7 +828,6 @@ bool load_model_gguf_mtl(const std::string & path,
         fprintf(stderr, "load_model_gguf_mtl: failed to open '%s'\n", path.c_str());
         return false;
     }
-
     try {
         auto & hp = model.hparams;
         hp.variant           = CHBX_VARIANT_MTL;
@@ -1076,7 +858,6 @@ bool load_model_gguf_mtl(const std::string & path,
         hp.rope_low_freq     = get_f32(gguf_ctx, KEY_ROPE_LOW_FREQ);
         hp.rope_high_freq    = get_f32(gguf_ctx, KEY_ROPE_HIGH_FREQ);
         hp.rope_orig_max_pos = (int32_t) get_u32(gguf_ctx, KEY_ROPE_ORIG_MAX_POS);
-
         if (hp.rope_high_freq <= hp.rope_low_freq) {
             throw std::runtime_error("invalid llama3 rope freq config: high_freq_factor (" +
                                      std::to_string(hp.rope_high_freq) +
@@ -1090,20 +871,14 @@ bool load_model_gguf_mtl(const std::string & path,
         if (hp.rope_orig_max_pos <= 0) {
             throw std::runtime_error("invalid rope.original_max_position: must be > 0");
         }
-
         if (requested_ctx > 0) hp.n_ctx = std::min(hp.n_ctx, requested_ctx);
-
         model.backend = init_backend(n_gpu_layers);
-
         const int64_t num_tensors = gguf_get_n_tensors(gguf_ctx);
         ggml_init_params p = { ggml_tensor_overhead() * (size_t)(num_tensors + 1), nullptr, true };
         model.ctx_w = ggml_init(p);
         if (!model.ctx_w) throw std::runtime_error("ggml_init failed");
-
         for (int64_t i = 0; i < num_tensors; ++i) {
             const char * name = gguf_get_tensor_name(gguf_ctx, i);
-
-
             if (model.tensors.find(name) != model.tensors.end()) {
                 throw std::runtime_error(std::string("duplicate tensor name in GGUF: ") + name);
             }
@@ -1112,31 +887,26 @@ bool load_model_gguf_mtl(const std::string & path,
             ggml_set_name(dst, name);
             model.tensors[name] = dst;
         }
-
         const int half_hd = hp.head_dim / 2;
         ggml_tensor * freq_factors = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, half_hd);
         ggml_set_name(freq_factors, "rope_freq_factors");
         model.rope_freq_factors = freq_factors;
-
         model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
         if (!model.buffer_w) {
             throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
                                      "weights buffer (backend out of memory?)");
         }
-
         for (ggml_tensor * cur = ggml_get_first_tensor(model.ctx_w); cur; cur = ggml_get_next_tensor(model.ctx_w, cur)) {
             if (cur == freq_factors) continue;
             ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
             ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
         }
-
         {
             std::vector<float> ff = compute_llama3_freq_factors(
                 hp.head_dim, hp.rope_theta, hp.rope_scale_factor,
                 hp.rope_low_freq, hp.rope_high_freq, hp.rope_orig_max_pos);
             ggml_backend_tensor_set(freq_factors, ff.data(), 0, ff.size() * sizeof(float));
         }
-
         model.text_emb        = require_tensor(model, "chatterbox/text_emb");
         model.speech_emb      = require_tensor(model, "chatterbox/speech_emb");
         model.text_pos_emb    = require_tensor(model, "chatterbox/text_pos_emb");
@@ -1147,7 +917,6 @@ bool load_model_gguf_mtl(const std::string & path,
         model.cond_spkr_w     = require_tensor(model, "chatterbox/cond_spkr/w");
         model.cond_spkr_b     = require_tensor(model, "chatterbox/cond_spkr/b");
         model.emotion_adv_w   = require_tensor(model, "chatterbox/emotion_adv_fc/w");
-
         model.perceiver.pre_attention_query = require_tensor(model, "chatterbox/perceiver/pre_attention_query");
         model.perceiver.norm_g = require_tensor(model, "chatterbox/perceiver/attn/norm/g");
         model.perceiver.norm_b = require_tensor(model, "chatterbox/perceiver/attn/norm/b");
@@ -1159,10 +928,8 @@ bool load_model_gguf_mtl(const std::string & path,
         model.perceiver.to_v_b = require_tensor(model, "chatterbox/perceiver/attn/to_v/b");
         model.perceiver.proj_out_w = require_tensor(model, "chatterbox/perceiver/attn/proj_out/w");
         model.perceiver.proj_out_b = require_tensor(model, "chatterbox/perceiver/attn/proj_out/b");
-
         model.builtin_speaker_emb        = require_tensor(model, "chatterbox/builtin/speaker_emb");
         model.builtin_cond_prompt_tokens = require_tensor(model, "chatterbox/builtin/cond_prompt_speech_tokens");
-
         model.layers_mtl.resize(hp.n_layer);
         for (int i = 0; i < hp.n_layer; ++i) {
             auto & l = model.layers_mtl[i];
@@ -1177,18 +944,12 @@ bool load_model_gguf_mtl(const std::string & path,
             l.mlp_up   = require_tensor(model, (lp + "/mlp/up/w").c_str());
             l.mlp_down = require_tensor(model, (lp + "/mlp/down/w").c_str());
         }
-
-
         ggml_init_params kv_params = { ggml_tensor_overhead() * 4, nullptr, true };
         model.ctx_kv = ggml_init(kv_params);
         const int64_t kv_elements_b2 =
             (int64_t) 2 * hp.head_dim * hp.n_kv_head * hp.n_ctx * hp.n_layer;
-
-
         model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, kv_elements_b2);
         model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, kv_elements_b2);
-
-
         model.memory_k_uncond = nullptr;
         model.memory_v_uncond = nullptr;
         model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
@@ -1196,20 +957,15 @@ bool load_model_gguf_mtl(const std::string & path,
             throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
                                      "KV-cache buffer (backend out of memory?)");
         }
-
-
         if (!ggml_backend_is_cpu(model.backend)) {
             const int n_embd = hp.n_embd;
             const int n_ff   = hp.intermediate_size;
-
             const size_t stack_meta = ggml_tensor_overhead() * (size_t) (2 * hp.n_layer + 4);
             ggml_init_params sp = { stack_meta, nullptr, true };
             model.ctx_stack = ggml_init(sp);
             if (!model.ctx_stack) {
                 throw std::runtime_error("load_model_gguf_mtl: ggml_init failed for stacked-weights ctx");
             }
-
-
             for (int i = 0; i < hp.n_layer; ++i) {
                 auto & l = model.layers_mtl[i];
                 if (l.wq->type != l.wk->type || l.wq->type != l.wv->type) {
@@ -1229,8 +985,6 @@ bool load_model_gguf_mtl(const std::string & path,
                                          "stacked-weights buffer (backend out of memory?)");
             }
             t3_stack_register(model.buffer_stack, model.ctx_stack);
-
-
             size_t scratch_bytes = 0;
             for (int i = 0; i < hp.n_layer; ++i) {
                 auto & l = model.layers_mtl[i];
@@ -1256,7 +1010,6 @@ bool load_model_gguf_mtl(const std::string & path,
                 copy_into(l.wv, l.wqkv);
             }
         }
-
         {
             const int64_t jk = gguf_find_key(gguf_ctx, "tokenizer.ggml.mtl_json");
             const int64_t lk = gguf_find_key(gguf_ctx, "tokenizer.ggml.mtl_languages");
@@ -1293,7 +1046,6 @@ bool load_model_gguf_mtl(const std::string & path,
                 }
             }
         }
-
         if (g_log_verbose) {
             fprintf(stderr, "load_model_gguf_mtl: ctx=%d embd=%d layers=%d heads=%d kv_heads=%d "
                             "head_dim=%d inter=%d text_vocab=%d speech_vocab=%d cond_prompt=%d\n",
@@ -1311,12 +1063,10 @@ bool load_model_gguf_mtl(const std::string & path,
         gguf_free(gguf_ctx); if (tmp_ctx) ggml_free(tmp_ctx);
         return false;
     }
-
     gguf_free(gguf_ctx);
     ggml_free(tmp_ctx);
     return true;
 }
-
 bool eval_prompt_mtl(const chatterbox_model & model,
                      ggml_gallocr_t allocr,
                      int n_threads,
@@ -1325,15 +1075,12 @@ bool eval_prompt_mtl(const chatterbox_model & model,
                      std::vector<float> & logits_cond_out,
                      std::vector<float> & logits_uncond_out,
                      int & prompt_len) {
-
-
     const bool use_b2 = !ggml_backend_is_cpu(model.backend);
     if (use_b2) {
         return run_prompt_pass_b2(model, allocr, n_threads, text_tokens,
                                   exaggeration, logits_cond_out,
                                   logits_uncond_out, prompt_len);
     }
-
     int plen_c = 0, plen_u = 0;
     if (!run_prompt_pass(model, allocr, n_threads, text_tokens, exaggeration,
                          false, logits_cond_out, plen_c)) return false;
@@ -1341,15 +1088,12 @@ bool eval_prompt_mtl(const chatterbox_model & model,
                          true, logits_uncond_out, plen_u)) return false;
     prompt_len = plen_c;
     if (plen_c != plen_u) {
-
-
         fprintf(stderr, "eval_prompt_mtl: cond/uncond prompt_len mismatch (%d vs %d); "
                         "graph builder is inconsistent across is_uncond\n", plen_c, plen_u);
         return false;
     }
     return true;
 }
-
 bool eval_step_mtl(const chatterbox_model & model,
                    ggml_gallocr_t allocr,
                    int n_threads,
@@ -1357,8 +1101,6 @@ bool eval_step_mtl(const chatterbox_model & model,
                    int32_t token,
                    std::vector<float> & logits_cond_out,
                    std::vector<float> & logits_uncond_out) {
-
-
     if (model.hparams.max_speech_tokens > 0 &&
         n_past >= model.hparams.max_speech_tokens) {
         fprintf(stderr, "eval_step_mtl: n_past=%d exceeds max_speech_tokens=%d; "
@@ -1366,7 +1108,6 @@ bool eval_step_mtl(const chatterbox_model & model,
                 n_past, model.hparams.max_speech_tokens);
         return false;
     }
-
     const bool use_b2 = !ggml_backend_is_cpu(model.backend);
     if (use_b2) {
         return run_step_pass_b2(model, allocr, n_threads, n_past, token,
@@ -1378,8 +1119,6 @@ bool eval_step_mtl(const chatterbox_model & model,
                        logits_uncond_out)) return false;
     return true;
 }
-
-
 int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
                               const std::vector<float> & logits_uncond,
                               const std::vector<int32_t> & generated,
@@ -1391,7 +1130,6 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
     for (size_t i = 0; i < V; ++i) {
         l[i] = logits_cond[i] + p.cfg_weight * (logits_cond[i] - logits_uncond[i]);
     }
-
     if (p.repeat_penalty != 1.0f) {
         for (int32_t t : generated) {
             if (t < 0 || (size_t) t >= V) continue;
@@ -1399,18 +1137,15 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
             else             l[t] *= p.repeat_penalty;
         }
     }
-
     if (p.temp > 0.0f && p.temp != 1.0f) {
         for (float & x : l) x /= p.temp;
     }
-
     if (p.min_p > 0.0f) {
         float maxl = -INFINITY;
         for (float x : l) if (x > maxl) maxl = x;
         const float thresh = maxl + std::log(p.min_p);
         for (float & x : l) if (x < thresh) x = -INFINITY;
     }
-
     if (p.top_p < 1.0f && p.top_p > 0.0f) {
         std::vector<int> idx(V);
         for (size_t i = 0; i < V; ++i) idx[i] = (int) i;
@@ -1432,23 +1167,17 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
             }
         }
     }
-
     if (p.top_k > 0 && (size_t) p.top_k < V) {
         std::vector<int> idx(V);
         for (size_t i = 0; i < V; ++i) idx[i] = (int) i;
-
-
         std::nth_element(idx.begin(), idx.begin() + (p.top_k - 1), idx.end(),
                          [&](int a, int b){ return l[a] > l[b]; });
         const float cut = l[idx[p.top_k - 1]];
         for (float & x : l) if (x < cut) x = -INFINITY;
     }
-
     double maxl = -INFINITY;
     for (float x : l) if (x > maxl) maxl = x;
     if (!std::isfinite(maxl)) {
-
-
         fprintf(stderr, "sample_next_token_mtl: degenerate logits "
                         "(all -inf/NaN); returning stop_token=%d\n", stop_token);
         return stop_token;
@@ -1468,5 +1197,4 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
     }
     return (int32_t)(V - 1);
 }
-
 }
