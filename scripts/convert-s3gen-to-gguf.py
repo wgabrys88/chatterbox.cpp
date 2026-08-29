@@ -10,6 +10,7 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 TURBO_REPO_ID = "ResembleAI/chatterbox-turbo"
 MTL_REPO_ID   = "ResembleAI/chatterbox"
+MTL_REPO_REV  = "ef85ce7bef2f3f1a74d0d837d379d2fcb68203cd"
 VARIANTS = {
     "turbo": {
         "repo_id": TURBO_REPO_ID,
@@ -24,6 +25,7 @@ VARIANTS = {
     },
     "mtl": {
         "repo_id": MTL_REPO_ID,
+        "revision": MTL_REPO_REV,
         "allow_patterns": ["s3gen.pt", "conds.pt"],
         "ckpt_filename": "s3gen.pt",
         "loader": "torch",
@@ -155,7 +157,7 @@ def main():
         ckpt_dir = args.ckpt_dir
     else:
         ckpt_dir = Path(snapshot_download(
-            repo_id=cfg["repo_id"], token=args.hf_token,
+            repo_id=cfg["repo_id"], revision=cfg.get("revision"), token=args.hf_token,
             allow_patterns=cfg["allow_patterns"],
         ))
     args.out.parent.mkdir(parents=True, exist_ok=True)

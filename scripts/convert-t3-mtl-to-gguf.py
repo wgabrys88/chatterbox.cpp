@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import json
 import os
 import re
 from pathlib import Path
@@ -11,6 +10,7 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 from quant_policy import QUANT_TYPE as _RQ_QUANT_TYPE, should_quantize as _SHOULD_QUANTIZE
 REPO_ID = "ResembleAI/chatterbox"
+REPO_REV = "ef85ce7bef2f3f1a74d0d837d379d2fcb68203cd"
 COMMON_PATTERNS = ["ve.pt", "grapheme_mtl_merged_expanded_v1.json", "conds.pt"]
 MODEL_FILE = "t3_mtl23ls_v3.safetensors"
 ALL_KNOWN_LANGUAGES = [
@@ -171,6 +171,7 @@ def write_metadata(writer: gguf.GGUFWriter, quant: str) -> None:
     writer.add_float32("chatterbox.rope.high_freq_factor", ROPE_HIGH_FREQ_FACTOR)
     writer.add_uint32("chatterbox.rope.original_max_position", ROPE_ORIGINAL_MAX_POS)
     writer.add_string("chatterbox.reference_repo", REPO_ID)
+    writer.add_string("chatterbox.reference_revision", REPO_REV)
     writer.add_string("chatterbox.multilingual_version", "v3")
     writer.add_string("chatterbox.quantization", quant)
 def write_tokenizer(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
@@ -220,6 +221,7 @@ def main() -> None:
     else:
         ckpt_dir = Path(snapshot_download(
             repo_id=REPO_ID,
+            revision=REPO_REV,
             token=args.hf_token or os.getenv("HF_TOKEN"),
             allow_patterns=COMMON_PATTERNS + [MODEL_FILE],
         ))

@@ -829,6 +829,10 @@ bool load_model_gguf_mtl(const std::string & path,
         return false;
     }
     try {
+        const int64_t version_key = gguf_find_key(gguf_ctx, "chatterbox.multilingual_version");
+        if (version_key < 0 || gguf_get_kv_type(gguf_ctx, version_key) != GGUF_TYPE_STRING ||
+            std::string(gguf_get_val_str(gguf_ctx, version_key)) != "v3")
+            throw std::runtime_error("Multilingual V3 GGUF required");
         auto & hp = model.hparams;
         hp.variant           = CHBX_VARIANT_MTL;
         hp.n_text_vocab      = (int32_t) get_u32(gguf_ctx, KEY_TEXT_VOCAB_SIZE);
