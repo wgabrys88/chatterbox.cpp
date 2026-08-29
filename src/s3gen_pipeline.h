@@ -16,6 +16,11 @@ struct s3gen_synthesize_opts {
     int cfm_steps = 2;
     bool fastconv = true;
     const std::atomic<bool>* cancel = nullptr;
+    bool final = true;
+    int skip_mel_frames = 0;
+    int chunk_id = 0;
+    std::vector<float> hift_cache_source;
+    std::vector<float>* hift_source_tail = nullptr;
 };
 void s3gen_synthesize(const std::vector<int32_t>&, const s3gen_synthesize_opts&);
 void s3gen_preload(const std::string&, int, bool);

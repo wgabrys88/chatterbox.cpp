@@ -1,7 +1,10 @@
 #pragma once
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <ctime>
+#include <mutex>
 #include <string>
 
 inline std::string tts_json_escape(const std::string& s) {
@@ -29,7 +32,11 @@ inline std::string tts_json_escape(const std::string& s) {
 
 inline void tts_emit(const char* event, const std::string& extra = {}) {
     using namespace std::chrono;
+    static std::mutex mutex;
+    static std::uint64_t sequence = 0;
+    const std::lock_guard lock(mutex);
     const auto now = system_clock::now();
+    const auto mono = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
     const auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
     const std::time_t t = system_clock::to_time_t(now);
     std::tm tm{};
@@ -41,6 +48,6 @@ inline void tts_emit(const char* event, const std::string& extra = {}) {
     char ts[40], tz[8];
     std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm);
     std::strftime(tz, sizeof(tz), "%z", &tm);
-    fprintf(stderr, "{\"ts\":\"%s.%03d%s\",\"event\":%s%s}\n", ts, (int)ms.count(), tz, tts_json_escape(event).c_str(), extra.c_str());
+    fprintf(stderr, "{\"producer_sequence\":%llu,\"producer_mono_ns\":%lld,\"ts\":\"%s.%03d%s\",\"event\":%s%s}\n", (unsigned long long)++sequence, (long long)mono, ts, (int)ms.count(), tz, tts_json_escape(event).c_str(), extra.c_str());
     fflush(stderr);
 }

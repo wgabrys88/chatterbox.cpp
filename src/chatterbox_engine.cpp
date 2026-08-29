@@ -183,8 +183,7 @@ struct Engine::Impl {
         tts_emit("t3", ",\"index\":" + std::to_string(index)
             + ",\"chars\":" + std::to_string(text.size())
             + ",\"tokens\":" + std::to_string(tokens.size())
-            + ",\"ms\":" + std::to_string((int)(t3_ms + 0.5))
-            + ",\"text\":" + tts_json_escape(text));
+            + ",\"ms\":" + std::to_string((int)(t3_ms + 0.5)));
         check();
         s3gen_synthesize_opts s;
         s.s3gen_gguf_path = opts.s3gen_gguf_path;
@@ -198,11 +197,24 @@ struct Engine::Impl {
         s.embedding = embedding;
         s.prompt_token = prompt_token;
         s.cancel = &cancelled;
-        std::vector<float> pcm;
-        s.pcm_out = &pcm;
-        s3gen_synthesize(tokens, s);
-        check();
-        if (cb) cb(index, pcm.data(), pcm.size(), 24000, true);
+        std::vector<float> cache;
+        int emitted = 0;
+        for (int end = 0, chunk = 0; end < (int)tokens.size(); ++chunk) {
+            end = std::min((int)tokens.size(), end + (chunk ? 25 : 12));
+            std::vector<int32_t> prefix(tokens.begin(), tokens.begin() + end);
+            std::vector<float> pcm, tail;
+            s.pcm_out = &pcm;
+            s.final = end == (int)tokens.size();
+            s.skip_mel_frames = emitted;
+            s.chunk_id = chunk;
+            s.hift_cache_source = std::move(cache);
+            s.hift_source_tail = &tail;
+            s3gen_synthesize(prefix, s);
+            check();
+            if (cb) cb(index, pcm.data(), pcm.size(), chunk, s.final);
+            emitted += (int)pcm.size() / 480;
+            cache = std::move(tail);
+        }
     }
     void pieces(const std::vector<std::string>& texts, const PieceCallback& cb) {
         cancelled.store(false, std::memory_order_relaxed);

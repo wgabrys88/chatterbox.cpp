@@ -1221,6 +1221,10 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     std::vector<float> mu_T = run_encoder(m, input_embed, n_total, D);
     check_cancel(opts.cancel);
     int T_mu = 2 * n_total;
+    if (!opts.final) {
+        T_mu -= 2 * pre_lookahead_len;
+        mu_T.resize((size_t)T_mu * MEL);
+    }
     std::vector<float> mu(T_mu * MEL);
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mu; ++t)
@@ -1288,9 +1292,10 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
     }
     check_cancel(opts.cancel);
-    const int T_mel = T_mu - mel_len1;
+    const int T_mel = T_mu - mel_len1 - opts.skip_mel_frames;
+    if (T_mel <= 0) throw std::runtime_error("S3Gen streaming mel range empty");
     std::vector<float> mel(MEL * T_mel);
-    const int mel_off = mel_len1;
+    const int mel_off = mel_len1 + opts.skip_mel_frames;
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mel; ++t)
             mel[m2 * T_mel + t] = z[m2 * T_mu + (t + mel_off)];
@@ -1308,6 +1313,11 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     float l_linear_b;
     ggml_backend_tensor_get(llb, &l_linear_b, 0, sizeof(float));
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, l_linear_w, l_linear_b, (uint32_t)(seed + 1));
+    std::copy_n(opts.hift_cache_source.begin(), std::min(opts.hift_cache_source.size(), src.size()), src.begin());
+    if (opts.hift_source_tail) {
+        const size_t tail = std::min<std::size_t>(480, src.size());
+        opts.hift_source_tail->assign(src.end() - tail, src.end());
+    }
     auto s_stft = run_stft(m_hift, src);
     check_cancel(opts.cancel);
     int T_stft = (int)(s_stft.size() / 18);
@@ -1335,6 +1345,8 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         ",\"cfm_steps\":" + std::to_string(cfm_steps) +
         ",\"meanflow\":" + std::string(meanflow ? "true" : "false") +
         ",\"load_ms\":" + std::to_string((int)(load_ms + 0.5)) +
+        ",\"chunk_id\":" + std::to_string(opts.chunk_id) +
+        ",\"final\":" + std::string(opts.final ? "true" : "false") +
         ",\"samples\":" + std::to_string(wav.size()));
     *opts.pcm_out = std::move(wav);
 }
