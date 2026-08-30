@@ -413,21 +413,11 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 void Engine::synthesize_pieces(const std::vector<std::string>& texts, const PieceCallback& cb) { pimpl_->pieces(texts, cb); }
 void Engine::synthesize_pieces_streaming(const std::vector<std::string>& texts, const PieceCallback& cb) {
     pimpl_->cancelled.store(false, std::memory_order_relaxed);
-    if (texts.empty()) return;
-    if (texts.size() == 1) {
+    for (size_t i = 0; i < texts.size(); ++i) {
+        if (texts[i].empty()) continue;
         pimpl_->check();
-        pimpl_->piece_streaming(texts[0], 0, cb);
-        return;
+        pimpl_->piece_streaming(texts[i], (int)i, cb);
     }
-    std::string joined;
-    for (const auto& text : texts) {
-        if (text.empty()) continue;
-        if (!joined.empty() && !std::isspace(static_cast<unsigned char>(joined.back()))) joined.push_back(' ');
-        joined += text;
-    }
-    if (joined.empty()) return;
-    pimpl_->check();
-    pimpl_->piece_streaming(joined, 0, cb);
 }
 void Engine::cancel() { pimpl_->cancelled.store(true, std::memory_order_relaxed); }
 }
