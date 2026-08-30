@@ -1,6 +1,4 @@
 #include "tts-cpp/chatterbox/log.h"
-#include "gpt2_bpe.h"
-#include "mtl_tokenizer.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -29,12 +27,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include "s3gen_pipeline.h"
 #include "chatterbox_t3_internal.h"
-#include "voice_features.h"
-#include "voice_encoder.h"
-#include "campplus.h"
-#include "s3tokenizer.h"
 #include <sys/stat.h>
 using namespace tts_cpp::chatterbox::detail;
 namespace tts_cpp::chatterbox::detail {
@@ -64,21 +57,15 @@ bool validate_reference_audio(const std::string & path) {
 bool compute_prompt_feat_native(const std::string & wav_path,
                                        const std::string & s3gen_gguf_path,
                                        std::vector<float> & out_feat,
-                                       int & out_rows,
-                                       bool verbose)
+                                       int & out_rows)
 {
-    if (verbose) fprintf(stderr, "voice: loading %s\n", wav_path.c_str());
     std::vector<float> wav;
     int sr = 0;
     if (!wav_load(wav_path, wav, sr)) return false;
-    if (verbose) fprintf(stderr, "voice:   sr=%d samples=%zu (%.2f s)\n", sr, wav.size(), (double)wav.size() / sr);
     if (sr != 24000) {
-        if (verbose) fprintf(stderr, "voice: resampling %d -> 24000\n", sr);
         wav = resample_sinc(wav, sr, 24000);
     }
-    double pre  = measure_lufs(wav, 24000);
-    normalise_lufs(wav, 24000, -27.0);
-    if (verbose) fprintf(stderr, "voice:   loudness %.2f LUFS → -27 LUFS (+%.2f dB)\n", pre, -27.0 - pre);
+    normalise_lufs(wav, 24000);
     const int dec_cond_samples = 10 * 24000;
     if ((int)wav.size() > dec_cond_samples) wav.resize(dec_cond_samples);
     ggml_context * tmp_ctx = nullptr;
@@ -101,13 +88,11 @@ bool compute_prompt_feat_native(const std::string & wav_path,
     out_feat = mel_extract_24k_80(wav, mel_fb);
     if (out_feat.empty()) return false;
     out_rows = (int)(out_feat.size() / 80);
-    if (verbose) fprintf(stderr, "voice: prompt_feat shape=(%d, 80)\n", out_rows);
     return true;
 }
 bool compute_embedding_native(const std::string & wav_path,
                                      const std::string & s3gen_gguf_path,
-                                     std::vector<float> & out_emb,
-                                     bool verbose)
+                                     std::vector<float> & out_emb)
 {
     campplus_weights w;
     if (!campplus_load(s3gen_gguf_path, w)) {
@@ -131,7 +116,7 @@ bool compute_embedding_native(const std::string & wav_path,
     std::vector<float> wav;
     int sr = 0;
     if (!wav_load(wav_path, wav, sr)) return false;
-    normalise_lufs(wav, sr, -27.0);
+    normalise_lufs(wav, sr);
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
     const int dec_cond_samples_16k = 10 * 16000;
     if ((int)wav.size() > dec_cond_samples_16k) wav.resize(dec_cond_samples_16k);
@@ -145,8 +130,6 @@ bool compute_embedding_native(const std::string & wav_path,
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < 80; ++c) fbank[(size_t)t * 80 + c] -= col_mean[c];
     if (!campplus_embed(fbank, T, w, out_emb)) return false;
-    if (verbose) fprintf(stderr, "voice: embedding shape=(%zu,) via CAMPPlus (%d fbank frames)\n",
-            out_emb.size(), T);
     return true;
 }
 bool compute_speech_tokens_native(const std::string & wav_path,
@@ -155,8 +138,7 @@ bool compute_speech_tokens_native(const std::string & wav_path,
                                          std::vector<int32_t> & out_prompt_tokens,
                                          std::vector<int32_t> & out_cond_tokens,
                                          int n_threads,
-                                         ggml_backend_t backend,
-                                         bool verbose = false)
+                                         ggml_backend_t backend)
 {
     s3tokv2_weights w;
     if (!s3tokv2_load(s3gen_gguf_path, w)) {
@@ -167,7 +149,7 @@ bool compute_speech_tokens_native(const std::string & wav_path,
     std::vector<float> wav;
     int sr = 0;
     if (!wav_load(wav_path, wav, sr)) return false;
-    normalise_lufs(wav, sr, -27.0);
+    normalise_lufs(wav, sr);
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
     const int dec_cond_samples = 10 * 16000;
     std::vector<float> prompt_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), dec_cond_samples));
@@ -175,8 +157,6 @@ bool compute_speech_tokens_native(const std::string & wav_path,
     const int enc_cond_samples = 15 * 16000;
     std::vector<float> cond_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), enc_cond_samples));
     if (!s3tokv2_tokenize(cond_wav, w, max_cond_tokens, out_cond_tokens, n_threads, backend)) return false;
-    if (verbose) fprintf(stderr, "voice: prompt_token=(%zu,) cond_prompt_speech_tokens=(%zu,) via S3TokenizerV2\n",
-            out_prompt_tokens.size(), out_cond_tokens.size());
     return true;
 }
 static int64_t require_key(const gguf_context * ctx, const char * key) {
@@ -189,7 +169,6 @@ static ggml_tensor * require_tensor(const chatterbox_model & m, const char * nam
     if (it == m.tensors.end() || !it->second) throw std::runtime_error(std::string("missing tensor: ") + name);
     return it->second;
 }
-int g_log_verbose = 0;
 ggml_backend_t init_backend(int n_gpu_layers) {
     if (n_gpu_layers <= 0) throw std::runtime_error("Vulkan GPU layers required");
     auto * b = ggml_backend_vk_init(0);
@@ -204,20 +183,19 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
         gguf_init_params peek_params = {  true,  nullptr };
         gguf_context * peek_ctx = gguf_init_from_file(path.c_str(), peek_params);
         if (peek_ctx) {
-            std::string variant = "t3_turbo";
             const int64_t vk = gguf_find_key(peek_ctx, KEY_VARIANT);
-            if (vk >= 0 && gguf_get_kv_type(peek_ctx, vk) == GGUF_TYPE_STRING) {
-                const char * v = gguf_get_val_str(peek_ctx, vk);
-                if (v) variant = v;
-            } else if (vk >= 0) {
-                fprintf(stderr, "%s: %s has unexpected GGUF type %d (expected STRING); refusing to load\n",
-                        __func__, KEY_VARIANT, (int) gguf_get_kv_type(peek_ctx, vk));
+            if (vk < 0 || gguf_get_kv_type(peek_ctx, vk) != GGUF_TYPE_STRING) {
+                fprintf(stderr, "%s: required %s string missing\n", __func__, KEY_VARIANT);
                 gguf_free(peek_ctx);
                 return false;
             }
+            const char * v = gguf_get_val_str(peek_ctx, vk);
+            const std::string variant = v ? v : "";
             gguf_free(peek_ctx);
-            if (variant == "t3_mtl") {
-                return load_model_gguf_mtl(path, model, requested_ctx, n_gpu_layers);
+            if (variant == "t3_mtl") return load_model_gguf_mtl(path, model, requested_ctx, n_gpu_layers);
+            if (variant != "t3_turbo") {
+                fprintf(stderr, "%s: unsupported %s=%s\n", __func__, KEY_VARIANT, variant.c_str());
+                return false;
             }
         }
     }
@@ -291,12 +269,6 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
         model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
         model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
         model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
-        if (g_log_verbose) fprintf(stderr, "%s: ctx=%d embd=%d layers=%d heads=%d text_vocab=%d speech_vocab=%d cond_prompt=%d\n",
-                __func__, hp.n_ctx, hp.n_embd, hp.n_layer, hp.n_head,
-                hp.n_text_vocab, hp.n_speech_vocab, hp.cond_prompt_len);
-        if (g_log_verbose) fprintf(stderr, "%s: weights=%.2f MB  KV=%.2f MB\n", __func__,
-                ggml_backend_buffer_get_size(model.buffer_w) / (1024.0*1024.0),
-                ggml_backend_buffer_get_size(model.buffer_kv) / (1024.0*1024.0));
         {
             const int64_t tok_kid = gguf_find_key(gguf_ctx, "tokenizer.ggml.tokens");
             const int64_t mer_kid = gguf_find_key(gguf_ctx, "tokenizer.ggml.merges");
@@ -311,11 +283,8 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
                 for (size_t i = 0; i < n_mer; ++i) {
                     model.tok_merges.emplace_back(gguf_get_arr_str(gguf_ctx, mer_kid, i));
                 }
-                if (g_log_verbose) fprintf(stderr, "%s: tokenizer embedded (%zu tokens, %zu merges)\n",
-                        __func__, n_tok, n_mer);
             } else {
-                fprintf(stderr, "%s: no embedded tokenizer; --tokenizer-dir will be required for --text\n",
-                        __func__);
+                throw std::runtime_error("embedded Turbo tokenizer missing");
             }
         }
     } catch (const std::exception & e) {

@@ -7,18 +7,10 @@ namespace tts_cpp::chatterbox::detail {
 class mtl_tokenizer {
 public:
     bool load_from_json(const std::string & json_blob);
-    bool load_from_file(const std::string & path);
     bool load_cangjie_json(const std::string & json_blob);
-    std::vector<int32_t> encode(const std::string & text,
-                                const std::string & language_id = "") const;
-    std::string decode(const std::vector<int32_t> & ids) const;
+    std::vector<int32_t> encode(const std::string & text, const std::string & language_id) const;
     bool is_language_supported(const std::string & lang) const;
-    int32_t sot_id() const;
-    int32_t eot_id() const;
-    int32_t unk_id() const;
-    int32_t vocab_size() const;
     static const std::vector<std::string> & supported_languages();
-    static const std::vector<std::string> & all_known_languages();
 private:
     struct added_token {
         std::string content;

@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -378,21 +377,10 @@ const std::vector<std::string> & mtl_tokenizer::supported_languages() {
     };
     return k_supported;
 }
-const std::vector<std::string> & mtl_tokenizer::all_known_languages() {
-    static const std::vector<std::string> k_all_known = {
-        "en","es","fr","de","it","pt","nl","pl","tr","sv","da","fi","no","el",
-        "ms","sw","ar","ko","ja","he","ru","zh","hi"
-    };
-    return k_all_known;
-}
 bool mtl_tokenizer::is_language_supported(const std::string & lang) const {
     for (const auto & s : supported_languages()) if (s == lang) return true;
     return false;
 }
-int32_t mtl_tokenizer::sot_id() const { return m_sot_id; }
-int32_t mtl_tokenizer::eot_id() const { return m_eot_id; }
-int32_t mtl_tokenizer::unk_id() const { return m_unk_id; }
-int32_t mtl_tokenizer::vocab_size() const { return (int32_t) m_id_to_token.size(); }
 void mtl_tokenizer::index_vocab() {
     int32_t max_id = -1;
     for (const auto & kv : m_vocab) if (kv.second > max_id) max_id = kv.second;
@@ -471,16 +459,6 @@ bool mtl_tokenizer::load_from_json(const std::string & json_blob) {
     }
     index_vocab();
     return true;
-}
-bool mtl_tokenizer::load_from_file(const std::string & path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        fprintf(stderr, "mtl_tokenizer: failed to open %s\n", path.c_str());
-        return false;
-    }
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return load_from_json(ss.str());
 }
 bool mtl_tokenizer::load_cangjie_json(const std::string & json_blob) {
     json_parser jp{json_blob.data(), json_blob.data() + json_blob.size()};
@@ -655,23 +633,6 @@ std::vector<int32_t> mtl_tokenizer::encode(const std::string & text,
             std::string chunk_utf8 = cps_to_utf8(chunk);
             bpe_word(chunk_utf8, out);
         }
-    }
-    return out;
-}
-std::string mtl_tokenizer::decode(const std::vector<int32_t> & ids) const {
-    std::string out;
-    out.reserve(ids.size() * 2);
-    for (size_t k = 0; k < ids.size(); ++k) {
-        int32_t id = ids[k];
-        if (id < 0 || id >= (int32_t) m_id_to_token.size()) continue;
-        const std::string & tok = m_id_to_token[id];
-        if (tok == "[SPACE]") {
-            out.push_back(' ');
-            continue;
-        }
-        if (tok == "[START]" || tok == "[STOP]" || tok == "[UNK]" || tok == "[PAD]") continue;
-        if (!out.empty()) out.push_back(' ');
-        out += tok;
     }
     return out;
 }

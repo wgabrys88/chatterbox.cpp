@@ -1,5 +1,4 @@
 #include "chatterbox_t3_internal.h"
-#include "t3_mtl.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -820,7 +819,6 @@ bool load_model_gguf_mtl(const std::string & path,
                          chatterbox_model & model,
                          int requested_ctx,
                          int n_gpu_layers) {
-    extern int g_log_verbose;
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params params = {  false,  &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), params);
@@ -1017,7 +1015,6 @@ bool load_model_gguf_mtl(const std::string & path,
         {
             const int64_t jk = gguf_find_key(gguf_ctx, "tokenizer.ggml.mtl_json");
             const int64_t ck = gguf_find_key(gguf_ctx, "tokenizer.ggml.cangjie_json");
-            const int64_t lk = gguf_find_key(gguf_ctx, "tokenizer.ggml.mtl_languages");
             if (jk < 0) {
                 fprintf(stderr, "load_model_gguf_mtl: GGUF missing tokenizer.ggml.mtl_json; "
                                 "re-run scripts/convert-t3-mtl-to-gguf.py.\n");
@@ -1045,27 +1042,6 @@ bool load_model_gguf_mtl(const std::string & path,
                 const char * cv = gguf_get_val_str(gguf_ctx, ck);
                 if (cv) model.mtl_cangjie_json = cv;
             }
-            if (lk >= 0 && gguf_get_kv_type(gguf_ctx, lk) == GGUF_TYPE_ARRAY &&
-                gguf_get_arr_type(gguf_ctx, lk) == GGUF_TYPE_STRING) {
-                const size_t n = gguf_get_arr_n(gguf_ctx, lk);
-                model.mtl_languages.reserve(n);
-                for (size_t i = 0; i < n; ++i) {
-                    const char * s = gguf_get_arr_str(gguf_ctx, lk, i);
-                    if (s) model.mtl_languages.emplace_back(s);
-                }
-            }
-        }
-        if (g_log_verbose) {
-            fprintf(stderr, "load_model_gguf_mtl: ctx=%d embd=%d layers=%d heads=%d kv_heads=%d "
-                            "head_dim=%d inter=%d text_vocab=%d speech_vocab=%d cond_prompt=%d\n",
-                    hp.n_ctx, hp.n_embd, hp.n_layer, hp.n_head, hp.n_kv_head,
-                    hp.head_dim, hp.intermediate_size,
-                    hp.n_text_vocab, hp.n_speech_vocab, hp.cond_prompt_len);
-            fprintf(stderr, "load_model_gguf_mtl: weights=%.2f MB  KV=%.2f MB (cond+uncond unified) "
-                            "tokenizer_json=%zu bytes  languages=%zu\n",
-                    ggml_backend_buffer_get_size(model.buffer_w) / (1024.0*1024.0),
-                    ggml_backend_buffer_get_size(model.buffer_kv) / (1024.0*1024.0),
-                    model.mtl_tokenizer_json.size(), model.mtl_languages.size());
         }
     } catch (const std::exception & e) {
         fprintf(stderr, "load_model_gguf_mtl: %s\n", e.what());

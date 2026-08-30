@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 import argparse
-import os
 import re
 from pathlib import Path
 import gguf
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 from quant_policy import QUANT_TYPE as _RQ_QUANT_TYPE, should_quantize as _SHOULD_QUANTIZE
 REPO_ID = "ResembleAI/chatterbox"
 REPO_REV = "ef85ce7bef2f3f1a74d0d837d379d2fcb68203cd"
-COMMON_PATTERNS = ["ve.pt", "grapheme_mtl_merged_expanded_v1.json", "Cangjie5_TC.json", "conds.pt"]
 MODEL_FILE = "t3_mtl23ls_v3.safetensors"
-ALL_KNOWN_LANGUAGES = [
-    "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi",
-    "it", "ja", "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv",
-    "sw", "tr", "zh",
-]
 N_EMBD = 1024
 N_HEAD = 16
 N_KV_HEAD = 16
@@ -45,13 +37,12 @@ ROPE_HIGH_FREQ_FACTOR = 4.0
 ROPE_ORIGINAL_MAX_POS = 8192
 N_CTX = MAX_TEXT_TOKENS + MAX_SPEECH_TOKENS + 4
 LAYER_RE = re.compile(r"^tfmr\.layers\.(\d+)\.(.+)$")
-QUANT_CHOICES = ["f16", "q8_0", "q5_0", "q4_0"]
+QUANT_CHOICES = ["q4_0"]
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Convert Chatterbox multilingual T3 weights to GGUF.")
-    p.add_argument("--ckpt-dir", type=Path, help="Local checkpoint dir (downloads from HF if omitted).")
-    p.add_argument("--out", type=Path, default=Path("models/chatterbox-t3-mtl.gguf"))
-    p.add_argument("--hf-token", default=None)
-    p.add_argument("--quant", choices=QUANT_CHOICES, default="f16", help="Quantize eligible weights.")
+    p = argparse.ArgumentParser(description="Convert Trident V3 T3 weights to GGUF.")
+    p.add_argument("--ckpt-dir", type=Path, required=True)
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--quant", choices=QUANT_CHOICES, required=True)
     return p.parse_args()
 def as_numpy(tensor: torch.Tensor, *, dtype=None, transpose: bool = False) -> np.ndarray:
     if dtype is not None:
@@ -182,8 +173,7 @@ def write_tokenizer(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
     writer.add_string("tokenizer.ggml.model", "mtl_grapheme")
     writer.add_string("tokenizer.ggml.mtl_json", text)
     writer.add_string("tokenizer.ggml.cangjie_json", cangjie)
-    writer.add_array("tokenizer.ggml.mtl_languages", ALL_KNOWN_LANGUAGES)
-    print(f"Embedded tokenizer JSON ({len(text)} bytes), Cangjie ({len(cangjie)} bytes), {len(ALL_KNOWN_LANGUAGES)} languages")
+    print(f"Embedded tokenizer JSON ({len(text)} bytes), Cangjie ({len(cangjie)} bytes)")
 def write_voice_encoder(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
     ve_path = ckpt_dir / "ve.pt"
     if not ve_path.exists():
@@ -219,15 +209,7 @@ def write_voice_encoder(writer: gguf.GGUFWriter, ckpt_dir: Path) -> None:
     print(f"Embedded VoiceEncoder: {n} tensors + mel_fb {ve_mel_fb.shape}")
 def main() -> None:
     args = parse_args()
-    if args.ckpt_dir:
-        ckpt_dir = args.ckpt_dir
-    else:
-        ckpt_dir = Path(snapshot_download(
-            repo_id=REPO_ID,
-            revision=REPO_REV,
-            token=args.hf_token or os.getenv("HF_TOKEN"),
-            allow_patterns=COMMON_PATTERNS + [MODEL_FILE],
-        ))
+    ckpt_dir = args.ckpt_dir
     args.out.parent.mkdir(parents=True, exist_ok=True)
     print(f"Loading V3 checkpoint from {ckpt_dir / MODEL_FILE}")
     state = load_file(ckpt_dir / MODEL_FILE)

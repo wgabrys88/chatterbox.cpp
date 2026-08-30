@@ -6,10 +6,8 @@ from pathlib import Path
 import gguf
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 REPOS = {"nano": "ResembleAI/chatterbox-nano", "turbo": "ResembleAI/chatterbox-turbo"}
-ASSETS = ["conds.pt", "ve.safetensors", "vocab.json", "merges.txt", "added_tokens.json", "tokenizer_config.json", "special_tokens_map.json"]
 TEXT_VOCAB_SIZE = 50276
 SPEECH_VOCAB_SIZE = 6563
 START_SPEECH_TOKEN = 6561
@@ -19,21 +17,13 @@ N_CTX = 8196
 N_LAYER = 24
 LAYER_NORM_EPS = 1e-5
 LAYER_RE = re.compile(r"^tfmr\.h\.(\d+)\.(.+)$")
-QUANT_CHOICES = ["f16", "q8_0", "q5_0", "q4_0"]
+QUANT_CHOICES = ["q4_0"]
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert Chatterbox Turbo T3 weights to GGUF.")
-    parser.add_argument("--ckpt-dir", type=Path, help="Local checkpoint dir (downloads from HF if omitted).")
-    parser.add_argument("--model", choices=["auto", "nano", "turbo"], default="auto")
-    parser.add_argument("--out", type=Path, default=Path("models/chatterbox-t3-turbo.gguf"), help="Output GGUF path.")
-    parser.add_argument("--hf-token", default=None, help="Optional Hugging Face token.")
-    parser.add_argument("--quant", choices=QUANT_CHOICES, default="f16",
-                        help=("Weight dtype for attention + MLP + speech_head projections. "
-                              "f16 (default, ~730 MB), q8_0 (~385 MB), q5_0 (~250 MB), "
-                              "q4_0 (~205 MB). Biases, layer norms, embeddings and "
-                              "positional embeddings always stay at their original dtype. "
-                              "For K-quants (q4_k / q5_k / q6_k), run the resulting f16 "
-                              "GGUF through llama.cpp's llama-quantize instead — the "
-                              "Python gguf package doesn't implement them yet."))
+    parser = argparse.ArgumentParser(description="Convert Trident Nano/Turbo T3 weights to GGUF.")
+    parser.add_argument("--ckpt-dir", type=Path, required=True)
+    parser.add_argument("--model", choices=["nano", "turbo"], required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--quant", choices=QUANT_CHOICES, required=True)
     return parser.parse_args()
 def as_numpy(tensor: torch.Tensor, *, dtype=None, transpose: bool = False) -> np.ndarray:
     if dtype is not None:
@@ -53,11 +43,7 @@ def _is_quantizable_weight(gguf_name: str) -> bool:
     ):
         return True
     return False
-_QUANT_TYPE = {
-    "q8_0": gguf.GGMLQuantizationType.Q8_0,
-    "q5_0": gguf.GGMLQuantizationType.Q5_0,
-    "q4_0": gguf.GGMLQuantizationType.Q4_0,
-}
+_QUANT_TYPE = {"q4_0": gguf.GGMLQuantizationType.Q4_0}
 def add_maybe_quantized(writer: "gguf.GGUFWriter", name: str, array: np.ndarray, quant: str):
     if quant == "f16" or not _is_quantizable_weight(name):
         writer.add_tensor(name, array)
@@ -138,13 +124,7 @@ def map_tensor_name(name: str):
 def main() -> None:
     args = parse_args()
     model = args.model
-    if args.ckpt_dir:
-        ckpt_dir = args.ckpt_dir
-        if model == "auto": model = "nano" if (ckpt_dir / "t3_nano_v1.safetensors").exists() else "turbo"
-    else:
-        if model == "auto": model = "turbo"
-        ckpt = f"t3_{model}_v1.safetensors"
-        ckpt_dir = Path(snapshot_download(repo_id=REPOS[model], token=args.hf_token, allow_patterns=[ckpt, *ASSETS]))
+    ckpt_dir = args.ckpt_dir
     args.out.parent.mkdir(parents=True, exist_ok=True)
     ckpt = ckpt_dir / f"t3_{model}_v1.safetensors"
     print(f"Loading {model} checkpoint from {ckpt_dir}")

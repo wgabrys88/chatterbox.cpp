@@ -1,5 +1,4 @@
-#include "voice_encoder.h"
-#include "voice_features.h"
+#include "chatterbox_t3_internal.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"

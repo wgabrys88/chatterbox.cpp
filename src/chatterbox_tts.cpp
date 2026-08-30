@@ -1,4 +1,5 @@
 #include "tts-cpp/chatterbox/log.h"
+#include "chatterbox_t3_internal.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -1178,7 +1179,6 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     ggml_free(ctx);
     return wav;
 }
-#include "s3gen_pipeline.h"
 void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_synthesize_opts& opts) {
     check_cancel(opts.cancel);
     if (speech_tokens.empty()) throw std::runtime_error("S3Gen speech tokens empty");

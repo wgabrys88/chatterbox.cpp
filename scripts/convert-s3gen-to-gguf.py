@@ -6,15 +6,9 @@ from typing import Optional
 import gguf
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
-TURBO_REPO_ID = "ResembleAI/chatterbox-turbo"
-MTL_REPO_ID   = "ResembleAI/chatterbox"
-MTL_REPO_REV  = "ef85ce7bef2f3f1a74d0d837d379d2fcb68203cd"
 VARIANTS = {
     "turbo": {
-        "repo_id": TURBO_REPO_ID,
-        "allow_patterns": ["s3gen_meanflow.safetensors", "conds.pt"],
         "ckpt_filename": "s3gen_meanflow.safetensors",
         "loader": "safetensors",
         "gguf_name": "Chatterbox Turbo S3Gen",
@@ -24,9 +18,6 @@ VARIANTS = {
         "cfg_rate": 0.0,
     },
     "mtl": {
-        "repo_id": MTL_REPO_ID,
-        "revision": MTL_REPO_REV,
-        "allow_patterns": ["s3gen.pt", "conds.pt"],
         "ckpt_filename": "s3gen.pt",
         "loader": "torch",
         "gguf_name": "Chatterbox Multilingual S3Gen",
@@ -36,7 +27,7 @@ VARIANTS = {
         "cfg_rate": 0.7,
     },
 }
-QUANT_CHOICES = ("f32", "f16", "q8_0", "q5_0", "q4_0")
+QUANT_CHOICES = ("f16", "q4_0")
 from quant_policy import QUANT_TYPE as _RQ_QUANT_TYPE, should_quantize as _SHOULD_QUANTIZE
 _RAW_F32_SUBSTRINGS = (
     "flow/input_embedding",
@@ -49,21 +40,12 @@ _RAW_F32_SUBSTRINGS = (
 def _must_stay_f32(name: str) -> bool:
     return any(s in name for s in _RAW_F32_SUBSTRINGS)
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Convert Chatterbox S3Gen weights to GGUF.")
-    ap.add_argument("--variant", choices=list(VARIANTS.keys()), default="turbo",
-                    help="Which S3Gen checkpoint to convert. 'turbo' = meanflow (2-step),"
-                         " 'mtl' = standard CFM (10-step + CFG).")
-    ap.add_argument("--ckpt-dir", type=Path, help="Local checkpoint dir (downloads from HF if omitted).")
-    ap.add_argument("--out", type=Path, default=None,
-                    help="Defaults to models/chatterbox-s3gen.gguf (turbo) or "
-                         "models/chatterbox-s3gen-mtl.gguf (mtl).")
-    ap.add_argument("--hf-token", default=None, help="Optional Hugging Face token.")
-    ap.add_argument("--quant", choices=QUANT_CHOICES, default="f16", help="Quantize eligible weights.")
-    args = ap.parse_args()
-    if args.out is None:
-        args.out = Path("models/chatterbox-s3gen-mtl.gguf") if args.variant == "mtl" \
-                   else Path("models/chatterbox-s3gen.gguf")
-    return args
+    ap = argparse.ArgumentParser(description="Convert Trident S3Gen weights to GGUF.")
+    ap.add_argument("--variant", choices=list(VARIANTS), required=True)
+    ap.add_argument("--ckpt-dir", type=Path, required=True)
+    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--quant", choices=QUANT_CHOICES, required=True)
+    return ap.parse_args()
 def as_numpy(tensor: torch.Tensor, *, dtype=None) -> np.ndarray:
     if dtype is not None:
         tensor = tensor.to(dtype)
@@ -153,13 +135,7 @@ def export_conformer_block(
 def main():
     args = parse_args()
     cfg = VARIANTS[args.variant]
-    if args.ckpt_dir:
-        ckpt_dir = args.ckpt_dir
-    else:
-        ckpt_dir = Path(snapshot_download(
-            repo_id=cfg["repo_id"], revision=cfg.get("revision"), token=args.hf_token,
-            allow_patterns=cfg["allow_patterns"],
-        ))
+    ckpt_dir = args.ckpt_dir
     args.out.parent.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / cfg["ckpt_filename"]
     print(f"Loading {ckpt_path}")
@@ -181,7 +157,7 @@ def main():
     writer.add_bool("s3gen.meanflow", cfg["meanflow"])
     writer.add_uint32("s3gen.n_timesteps", cfg["n_timesteps"])
     writer.add_float32("s3gen.cfg_rate", cfg["cfg_rate"])
-    qstats: Optional[dict[str, int]] = {"n_quant": 0} if args.quant not in ("f16", "f32") else None
+    qstats: Optional[dict[str, int]] = {"n_quant": 0} if args.quant == "q4_0" else None
     writer.add_uint32("s3gen.speech_vocab_size", 6561)
     writer.add_uint32("s3gen.input_size", 512)
     writer.add_uint32("s3gen.output_size", 80)
@@ -386,7 +362,7 @@ def main():
     writer.close()
     out_size_mb = args.out.stat().st_size / (1024 * 1024)
     print(f"\nOutput: {args.out} ({out_size_mb:.0f} MB)")
-    if args.quant not in ("f16", "f32") and qstats is not None:
+    if args.quant == "q4_0" and qstats is not None:
         print(f"  --quant {args.quant}: {qstats['n_quant']} tensors block-quantized "
               f"(shared policy; embeddings, voice encoders, "
               f"norms/biases, and filterbanks kept at full precision)")
