@@ -2,6 +2,7 @@
 #include "tts-cpp/chatterbox/log.h"
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <random>
@@ -269,37 +270,55 @@ struct Engine::Impl {
 
                 int n_past = 0;
                 int32_t token = 0;
-                {
-                    std::unique_lock lock(mu);
-                    if (model.hparams.variant == CHBX_VARIANT_MTL) {
-                        std::vector<float> logits_c, logits_u;
-                        if (!eval_prompt_mtl(model, allocr, n_threads, text_tokens, opts.exaggeration, logits_c, logits_u, n_past)) throw std::runtime_error("MTL prompt failed");
-                        token = sample_next_token_mtl(logits_c, logits_u, tokens, sp, rng, model.hparams.stop_speech_token);
-                    } else {
-                        std::vector<float> logits;
-                        if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past)) throw std::runtime_error("Turbo prompt failed");
-                        token = sample_next_token_ex(logits, tokens, sp, rng);
-                    }
-                    tokens.push_back(token);
-                    cv.notify_all();
+                bool ready_emitted = false;
+                std::vector<int32_t> out;
+                out.reserve((size_t)opts.n_predict + 1);
+                if (model.hparams.variant == CHBX_VARIANT_MTL) {
+                    std::vector<float> logits_c, logits_u;
+                    if (!eval_prompt_mtl(model, allocr, n_threads, text_tokens, opts.exaggeration, logits_c, logits_u, n_past)) throw std::runtime_error("MTL prompt failed");
+                    token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
+                } else {
+                    std::vector<float> logits;
+                    if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past)) throw std::runtime_error("Turbo prompt failed");
+                    token = sample_next_token_ex(logits, out, sp, rng);
                 }
+                out.push_back(token);
+                {
+                    std::lock_guard lock(mu);
+                    tokens = out;
+                }
+                cv.notify_all();
 
                 for (int i = 0; i < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++i) {
                     check();
+                    if (!ready_emitted && (int)out.size() >= chunk_first) {
+                        const double ready_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+                        tts_emit("t3.ready", ",\"index\":" + std::to_string(index)
+                            + ",\"tokens\":" + std::to_string(out.size())
+                            + ",\"ms\":" + std::to_string((int)(ready_ms + 0.5)));
+                        ready_emitted = true;
+                    }
+                    if (model.hparams.variant == CHBX_VARIANT_MTL) {
+                        std::vector<float> logits_c, logits_u;
+                        if (!eval_step_mtl(model, allocr, n_threads, n_past++, token, logits_c, logits_u)) throw std::runtime_error("MTL step failed");
+                        token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
+                    } else {
+                        std::vector<float> logits;
+                        if (!eval_step(model, allocr, n_threads, n_past++, token, logits)) throw std::runtime_error("Turbo step failed");
+                        token = sample_next_token_ex(logits, out, sp, rng);
+                    }
+                    out.push_back(token);
                     {
-                        std::unique_lock lock(mu);
-                        if (model.hparams.variant == CHBX_VARIANT_MTL) {
-                            std::vector<float> logits_c, logits_u;
-                            if (!eval_step_mtl(model, allocr, n_threads, n_past++, token, logits_c, logits_u)) throw std::runtime_error("MTL step failed");
-                            token = sample_next_token_mtl(logits_c, logits_u, tokens, sp, rng, model.hparams.stop_speech_token);
-                        } else {
-                            std::vector<float> logits;
-                            if (!eval_step(model, allocr, n_threads, n_past++, token, logits)) throw std::runtime_error("Turbo step failed");
-                            token = sample_next_token_ex(logits, tokens, sp, rng);
-                        }
+                        std::lock_guard lock(mu);
                         tokens.push_back(token);
                     }
                     cv.notify_all();
+                }
+                if (!ready_emitted && (int)out.size() >= chunk_first) {
+                    const double ready_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+                    tts_emit("t3.ready", ",\"index\":" + std::to_string(index)
+                        + ",\"tokens\":" + std::to_string(out.size())
+                        + ",\"ms\":" + std::to_string((int)(ready_ms + 0.5)));
                 }
 
                 std::size_t token_count = 0;
@@ -367,6 +386,10 @@ struct Engine::Impl {
                 s.chunk_id = chunk_id++;
                 s.hift_cache_source = std::move(cache);
                 s.hift_source_tail = &tail;
+                tts_emit("s3gen.begin", ",\"index\":" + std::to_string(index)
+                    + ",\"chunk_id\":" + std::to_string(s.chunk_id)
+                    + ",\"tokens\":" + std::to_string(prefix.size())
+                    + ",\"final\":" + (s.final ? "true" : "false"));
                 s3gen_synthesize(prefix, s);
                 check();
                 if (cb) cb(index, pcm.data(), pcm.size(), chunk_id - 1, s.final);
@@ -390,10 +413,21 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 void Engine::synthesize_pieces(const std::vector<std::string>& texts, const PieceCallback& cb) { pimpl_->pieces(texts, cb); }
 void Engine::synthesize_pieces_streaming(const std::vector<std::string>& texts, const PieceCallback& cb) {
     pimpl_->cancelled.store(false, std::memory_order_relaxed);
-    for (size_t i = 0; i < texts.size(); ++i) {
+    if (texts.empty()) return;
+    if (texts.size() == 1) {
         pimpl_->check();
-        pimpl_->piece_streaming(texts[i], (int)i, cb);
+        pimpl_->piece_streaming(texts[0], 0, cb);
+        return;
     }
+    std::string joined;
+    for (const auto& text : texts) {
+        if (text.empty()) continue;
+        if (!joined.empty() && !std::isspace(static_cast<unsigned char>(joined.back()))) joined.push_back(' ');
+        joined += text;
+    }
+    if (joined.empty()) return;
+    pimpl_->check();
+    pimpl_->piece_streaming(joined, 0, cb);
 }
 void Engine::cancel() { pimpl_->cancelled.store(true, std::memory_order_relaxed); }
 }
