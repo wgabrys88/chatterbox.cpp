@@ -23,6 +23,8 @@
 namespace tts_cpp::chatterbox {
 using namespace detail;
 namespace {
+constexpr int k_chunk_first = 120;
+constexpr int k_chunk_next = 250;
 int threads(int n) {
     if (n > 0) return n;
     const int hw = (int)std::thread::hardware_concurrency();
@@ -234,11 +236,12 @@ struct Engine::Impl {
     }
     // True streaming T3->s3gen pipeline. T3 runs on a worker thread, emitting
     // each new speech token to a shared buffer. The main thread consumes tokens
-    // in 12 / +25 chunks and runs s3gen on the prefix, hiding T3 latency
+    // in 120 / +250 chunks and runs s3gen on the prefix, trading first-audio
+    // latency for substantially fewer prefix recomputations.
     // behind s3gen inference.
     void piece_streaming(const std::string& text, int index, const PieceCallback& cb, bool first_chunk_only = false) {
         if (text.empty()) return;
-        if (opts.n_predict <= 12) { piece(text, index, cb); return; }
+        if (opts.n_predict <= k_chunk_first) { piece(text, index, cb); return; }
 
         std::mutex mu;
         std::condition_variable cv;
@@ -246,9 +249,6 @@ struct Engine::Impl {
         bool t3_done = false;
         std::atomic<bool> t3_failed{false};
         std::string t3_error;
-        const int chunk_first = 12;
-        const int chunk_next = 25;
-
         const auto synthesis_context = tts_get_context();
         std::thread t3_thread([&, synthesis_context] {
             tts_context_scope context_scope(synthesis_context);
@@ -301,7 +301,7 @@ struct Engine::Impl {
 
                 for (int i = 0; i < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++i) {
                     check();
-                    if (!ready_emitted && (int)out.size() >= chunk_first) {
+                    if (!ready_emitted && (int)out.size() >= k_chunk_first) {
                         const double ready_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
                         tts_emit("t3.ready", ",\"index\":" + std::to_string(index)
                             + ",\"tokens\":" + std::to_string(out.size())
@@ -323,9 +323,9 @@ struct Engine::Impl {
                         tokens.push_back(token);
                     }
                     cv.notify_all();
-                    if (first_chunk_only && (int)out.size() >= chunk_first) break;
+                    if (first_chunk_only && (int)out.size() >= k_chunk_first) break;
                 }
-                if (!ready_emitted && (int)out.size() >= chunk_first) {
+                if (!ready_emitted && (int)out.size() >= k_chunk_first) {
                     const double ready_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
                     tts_emit("t3.ready", ",\"index\":" + std::to_string(index)
                         + ",\"tokens\":" + std::to_string(out.size())
@@ -377,7 +377,7 @@ struct Engine::Impl {
         int end = 0;
         try {
             while (true) {
-                const int threshold = (chunk_id == 0) ? chunk_first : (end + chunk_next);
+                const int threshold = (chunk_id == 0) ? k_chunk_first : (end + k_chunk_next);
                 std::vector<int32_t> prefix;
                 bool final = false;
                 {
@@ -385,8 +385,8 @@ struct Engine::Impl {
                     cv.wait(lock, [&] { return t3_failed.load(std::memory_order_relaxed) || (int)tokens.size() >= threshold || t3_done; });
                     if (t3_failed.load(std::memory_order_relaxed)) throw std::runtime_error(t3_error);
                     if ((int)tokens.size() < threshold && !t3_done) continue;
-                    if (first_chunk_only && (int)tokens.size() < chunk_first)
-                        throw std::runtime_error("warm-up did not produce the required 12 speech tokens");
+                    if (first_chunk_only && (int)tokens.size() < k_chunk_first)
+                        throw std::runtime_error("warm-up did not produce the required " + std::to_string(k_chunk_first) + " speech tokens");
                     if (t3_done && (int)tokens.size() <= end) break;
                     end = std::min((int)tokens.size(), threshold);
                     prefix.assign(tokens.begin(), tokens.begin() + end);
@@ -436,11 +436,11 @@ void Engine::warm_up() {
     tts_emit("warmup.start");
     pimpl_->cancelled.store(false, std::memory_order_relaxed);
     std::size_t samples = 0;
-    pimpl_->piece_streaming("The system is warming up now.", -1, [&](int, const float*, std::size_t n, int, bool) { samples += n; }, true);
+    pimpl_->piece_streaming("The system is warming up now by preparing a sufficiently long speech sample for efficient generation of future responses.", -1, [&](int, const float*, std::size_t n, int, bool) { samples += n; }, true);
     if (!samples) throw std::runtime_error("warm-up produced no PCM");
     if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
     pimpl_->cancelled.store(false, std::memory_order_relaxed);
-    tts_emit("warmup.completed", ",\"discarded_samples\":" + std::to_string(samples) + ",\"s3gen_tokens\":12");
+    tts_emit("warmup.completed", ",\"discarded_samples\":" + std::to_string(samples) + ",\"s3gen_tokens\":" + std::to_string(k_chunk_first));
 }
 void Engine::cancel() {
     pimpl_->cancelled.store(true, std::memory_order_relaxed);
