@@ -385,6 +385,8 @@ struct Engine::Impl {
                     cv.wait(lock, [&] { return t3_failed.load(std::memory_order_relaxed) || (int)tokens.size() >= threshold || t3_done; });
                     if (t3_failed.load(std::memory_order_relaxed)) throw std::runtime_error(t3_error);
                     if ((int)tokens.size() < threshold && !t3_done) continue;
+                    if (first_chunk_only && (int)tokens.size() < chunk_first)
+                        throw std::runtime_error("warm-up did not produce the required 12 speech tokens");
                     if (t3_done && (int)tokens.size() <= end) break;
                     end = std::min((int)tokens.size(), threshold);
                     prefix.assign(tokens.begin(), tokens.begin() + end);
@@ -435,6 +437,7 @@ void Engine::warm_up() {
     pimpl_->cancelled.store(false, std::memory_order_relaxed);
     std::size_t samples = 0;
     pimpl_->piece_streaming("The system is warming up now.", -1, [&](int, const float*, std::size_t n, int, bool) { samples += n; }, true);
+    if (!samples) throw std::runtime_error("warm-up produced no PCM");
     if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
     pimpl_->cancelled.store(false, std::memory_order_relaxed);
     tts_emit("warmup.completed", ",\"discarded_samples\":" + std::to_string(samples) + ",\"s3gen_tokens\":12");
