@@ -238,7 +238,6 @@ struct Engine::Impl {
     // each new speech token to a shared buffer. The main thread consumes tokens
     // in 120 / +250 chunks and runs s3gen on the prefix, trading first-audio
     // latency for substantially fewer prefix recomputations.
-    // behind s3gen inference.
     void piece_streaming(const std::string& text, int index, const PieceCallback& cb, bool first_chunk_only = false) {
         if (text.empty()) return;
         if (opts.n_predict <= k_chunk_first) { piece(text, index, cb); return; }
