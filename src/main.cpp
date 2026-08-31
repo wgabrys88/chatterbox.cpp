@@ -7,6 +7,8 @@
 #include "gguf.h"
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
+#elif defined(GGML_USE_CUDA)
+#include "ggml-cuda.h"
 #endif
 #include <algorithm>
 #include <atomic>
@@ -191,12 +193,22 @@ static ggml_tensor * require_tensor(const chatterbox_model & m, const char * nam
 }
 int g_log_verbose = 0;
 ggml_backend_t init_backend(int n_gpu_layers) {
-    if (n_gpu_layers <= 0) throw std::runtime_error("Vulkan GPU layers required");
+    if (n_gpu_layers <= 0) throw std::runtime_error("GPU layers required");
+    char desc[256] = {0};
+#ifdef GGML_USE_VULKAN
     auto * b = ggml_backend_vk_init(0);
     if (!b) throw std::runtime_error("Vulkan backend init failed");
-    char desc[256] = {0};
     ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
-    tts_emit("tts.backend", ",\"role\":\"t3\",\"backend\":\"Vulkan\",\"gpu_layers\":" + std::to_string(n_gpu_layers) + ",\"device\":" + tts_json_escape(desc));
+    const char * backend_name = "Vulkan";
+#elif defined(GGML_USE_CUDA)
+    auto * b = ggml_backend_cuda_init(0);
+    if (!b) throw std::runtime_error("CUDA backend init failed");
+    ggml_backend_cuda_get_device_description(0, desc, sizeof(desc));
+    const char * backend_name = "CUDA";
+#else
+#error "No Chatterbox GPU backend selected"
+#endif
+    tts_emit("t3.backend", ",\"backend\":" + tts_json_escape(backend_name) + ",\"gpu_layers\":" + std::to_string(n_gpu_layers) + ",\"device\":" + tts_json_escape(desc));
     return b;
 }
 bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
