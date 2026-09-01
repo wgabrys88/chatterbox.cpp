@@ -23,7 +23,7 @@
 namespace tts_cpp::chatterbox {
 using namespace detail;
 namespace {
-constexpr int k_chunk_first = 120;
+constexpr int k_chunk_first = 12;
 constexpr int k_chunk_next = 250;
 int threads(int n) {
     if (n > 0) return n;
@@ -228,7 +228,6 @@ struct Engine::Impl {
         }
     }
     void pieces(const std::vector<std::string>& texts, const PieceCallback& cb) {
-        cancelled.store(false, std::memory_order_relaxed);
         for (size_t i = 0; i < texts.size(); ++i) {
             check();
             piece(texts[i], (int)i, cb);
@@ -236,7 +235,7 @@ struct Engine::Impl {
     }
     // True streaming T3->s3gen pipeline. T3 runs on a worker thread, emitting
     // each new speech token to a shared buffer. The main thread consumes tokens
-    // in 120 / +250 chunks and runs s3gen on the prefix, trading first-audio
+    // in 12 / +250 chunks and runs s3gen on the prefix, trading first-audio
     // latency for substantially fewer prefix recomputations.
     void piece_streaming(const std::string& text, int index, const PieceCallback& cb, bool first_chunk_only = false) {
         if (text.empty()) return;
@@ -422,9 +421,9 @@ Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pim
 Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
+void Engine::begin_synthesis() { pimpl_->cancelled.store(false, std::memory_order_release); }
 void Engine::synthesize_pieces(const std::vector<std::string>& texts, const PieceCallback& cb) { pimpl_->pieces(texts, cb); }
 void Engine::synthesize_pieces_streaming(const std::vector<std::string>& texts, const PieceCallback& cb) {
-    pimpl_->cancelled.store(false, std::memory_order_relaxed);
     for (size_t i = 0; i < texts.size(); ++i) {
         if (texts[i].empty()) continue;
         pimpl_->check();
@@ -433,12 +432,12 @@ void Engine::synthesize_pieces_streaming(const std::vector<std::string>& texts, 
 }
 void Engine::warm_up() {
     tts_emit("warmup.start");
-    pimpl_->cancelled.store(false, std::memory_order_relaxed);
+    begin_synthesis();
     std::size_t samples = 0;
     pimpl_->piece_streaming("The system is warming up now by preparing a sufficiently long speech sample for efficient generation of future responses.", -1, [&](int, const float*, std::size_t n, int, bool) { samples += n; }, true);
     if (!samples) throw std::runtime_error("warm-up produced no PCM");
     if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
-    pimpl_->cancelled.store(false, std::memory_order_relaxed);
+    begin_synthesis();
     tts_emit("warmup.completed", ",\"discarded_samples\":" + std::to_string(samples) + ",\"s3gen_tokens\":" + std::to_string(k_chunk_first));
 }
 void Engine::cancel() {

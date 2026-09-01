@@ -1,5 +1,6 @@
 #pragma once
 #include <chrono>
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <ctime>
@@ -31,8 +32,10 @@ inline std::string tts_json_escape(const std::string& s) {
 inline std::mutex& tts_log_mutex() { static std::mutex m; return m; }
 inline std::string& tts_run_identity() { static std::string id; return id; }
 inline std::uint64_t& tts_log_sequence() { static std::uint64_t n = 0; return n; }
+inline std::atomic<std::uint32_t>& tts_live_epoch() { static std::atomic<std::uint32_t> epoch{0}; return epoch; }
 inline tts_synthesis_context& tts_context() { thread_local tts_synthesis_context c; return c; }
 inline void tts_set_run_identity(std::string id) { std::lock_guard<std::mutex> lock(tts_log_mutex()); tts_run_identity() = std::move(id); }
+inline void tts_set_live_epoch(std::uint32_t epoch) { tts_live_epoch().store(epoch, std::memory_order_release); }
 inline void tts_set_context(std::uint32_t epoch, std::uint32_t response, std::uint32_t piece) { tts_context() = {epoch, response, piece, true}; }
 inline void tts_clear_context() { tts_context() = {}; }
 inline tts_synthesis_context tts_get_context() { return tts_context(); }
@@ -60,7 +63,14 @@ inline void tts_emit(const char* event, const std::string& extra = {}) {
     const auto ctx = tts_get_context();
     std::lock_guard<std::mutex> lock(tts_log_mutex());
     std::string ids;
-    if (ctx.valid) ids = ",\"epoch\":" + std::to_string(ctx.epoch) + ",\"response_id\":" + std::to_string(ctx.response_id) + ",\"piece_id\":" + std::to_string(ctx.piece_id);
+    if (ctx.valid) {
+        const auto live_epoch = tts_live_epoch().load(std::memory_order_acquire);
+        ids = ",\"epoch\":" + std::to_string(ctx.epoch)
+            + ",\"response_id\":" + std::to_string(ctx.response_id)
+            + ",\"piece_id\":" + std::to_string(ctx.piece_id)
+            + ",\"live_epoch\":" + std::to_string(live_epoch)
+            + ",\"epoch_violation\":" + (ctx.epoch == live_epoch ? "false" : "true");
+    }
     std::fprintf(stderr, "{\"schema_version\":2,\"run_id\":%s,\"sequence\":%llu,\"wall_timestamp\":\"%s.%03d%s\",\"monotonic_ns\":%lld,\"component\":\"chatterbox\",\"event\":%s%s%s}\n",
         tts_json_escape(tts_run_identity()).c_str(), (unsigned long long)++tts_log_sequence(), ts, (int)ms.count(), tz,
         (long long)mono, tts_json_escape(event).c_str(), ids.c_str(), extra.c_str());
