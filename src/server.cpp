@@ -150,7 +150,7 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
         for (const auto& request : cancelled) {
             tts_context_scope context(request.epoch, request.response, request.piece);
             writer.terminal(response_kind::cancelled, request);
-            tts_emit("synthesis.cancelled", ",\"state\":\"queued\",\"terminal_kind\":\"cancelled\"");
+            tts_emit("synthesis.cancelled", ",\"state\":\"queued\",\"terminal_kind\":\"cancelled\"", false);
         }
     };
     auto finish_piece = [&](const request_t& request, response_kind kind, const std::string& message = {}) {
@@ -191,6 +191,7 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
                     chunks = std::max(chunks, static_cast<std::uint32_t>(chunk + 1));
                     if (!size) return;
                     if (first_pcm) { first_pcm = false; tts_emit("synthesis.first_result", ",\"chunk_id\":" + std::to_string(chunk) + ",\"bytes\":" + std::to_string(size * sizeof(std::int16_t)) + ",\"elapsed_ms\":" + elapsed_ms(mono_clock::now(), started)); }
+                    tts_emit("synthesis.pcm", ",\"chunk_id\":" + std::to_string(chunk) + ",\"bytes\":" + std::to_string(size * sizeof(std::int16_t)) + ",\"samples\":" + std::to_string(size));
                     writer.pcm(request, static_cast<std::uint32_t>(chunk), data, size);
                 });
                 bool completed = false;
@@ -201,7 +202,7 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
                 }
                 previous_ended = mono_clock::now(); previous = request;
                 if (completed) tts_emit("synthesis.completed", ",\"chunks\":" + std::to_string(chunks) + ",\"elapsed_ms\":" + elapsed_ms(previous_ended, started) + ",\"terminal_kind\":\"done\"");
-                else tts_emit("synthesis.cancelled", ",\"state\":\"active\",\"terminal_kind\":\"cancelled\"");
+                else tts_emit("synthesis.cancelled", ",\"state\":\"active\",\"terminal_kind\":\"cancelled\"", false);
             } catch (const std::exception& error) {
                 bool cancelled = false;
                 {
@@ -211,7 +212,7 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
                     if (!cancelled) { failed = true; stop.store(true, std::memory_order_release); shutdown(client, SD_RECEIVE); }
                 }
                 previous_ended = mono_clock::now(); previous = request;
-                if (cancelled) tts_emit("synthesis.cancelled", ",\"state\":\"active\",\"terminal_kind\":\"cancelled\"");
+                if (cancelled) tts_emit("synthesis.cancelled", ",\"state\":\"active\",\"terminal_kind\":\"cancelled\"", false);
                 else tts_emit("synthesis.failed", ",\"error\":" + tts_json_escape(error.what()) + ",\"terminal_kind\":\"error\"");
             }
             {

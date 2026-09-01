@@ -1392,8 +1392,12 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         ",\"meanflow\":" + std::string(meanflow ? "true" : "false") +
         ",\"load_ms\":" + std::to_string((int)(load_ms + 0.5)) +
         ",\"chunk_id\":" + std::to_string(opts.chunk_id) +
+        ",\"token_start\":" + std::to_string(opts.token_start) +
+        ",\"token_end\":" + std::to_string(opts.token_end) +
+        ",\"skip_mel_frames\":" + std::to_string(opts.skip_mel_frames) +
         ",\"final\":" + std::string(opts.final ? "true" : "false") +
         ",\"samples\":" + std::to_string(wav.size()) +
+        ",\"pcm_bytes\":" + std::to_string(wav.size() * sizeof(std::int16_t)) +
         ",\"encoder_ms\":" + std::to_string((int)(encoder_ms + .5)) +
         ",\"cfm_ms\":" + std::to_string((int)(cfm_ms + .5)) +
         ",\"f0_ms\":" + std::to_string((int)(f0_ms + .5)) +

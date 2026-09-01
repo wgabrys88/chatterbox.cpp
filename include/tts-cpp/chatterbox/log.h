@@ -48,7 +48,7 @@ public:
     ~tts_context_scope() { tts_context() = previous_; }
 };
 
-inline void tts_emit(const char* event, const std::string& extra = {}) {
+inline void tts_emit(const char* event, const std::string& extra = {}, bool stale_is_violation = true) {
     using namespace std::chrono;
     const auto now = system_clock::now();
     const auto mono = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
@@ -69,7 +69,7 @@ inline void tts_emit(const char* event, const std::string& extra = {}) {
             + ",\"response_id\":" + std::to_string(ctx.response_id)
             + ",\"piece_id\":" + std::to_string(ctx.piece_id)
             + ",\"live_epoch\":" + std::to_string(live_epoch)
-            + ",\"epoch_violation\":" + (ctx.epoch == live_epoch ? "false" : "true");
+            + ",\"epoch_violation\":" + (ctx.epoch != live_epoch && stale_is_violation ? "true" : "false");
     }
     std::fprintf(stderr, "{\"schema_version\":2,\"run_id\":%s,\"sequence\":%llu,\"wall_timestamp\":\"%s.%03d%s\",\"monotonic_ns\":%lld,\"component\":\"chatterbox\",\"event\":%s%s%s}\n",
         tts_json_escape(tts_run_identity()).c_str(), (unsigned long long)++tts_log_sequence(), ts, (int)ms.count(), tz,

@@ -19,6 +19,8 @@ struct s3gen_synthesize_opts {
     bool final = true;
     int skip_mel_frames = 0;
     int chunk_id = 0;
+    int token_start = 0;
+    int token_end = 0;
     std::vector<float> hift_cache_source;
     std::vector<float>* hift_source_tail = nullptr;
 };
