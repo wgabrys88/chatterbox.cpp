@@ -25,6 +25,9 @@ using namespace detail;
 namespace {
 constexpr int k_chunk_first = 48;
 constexpr int k_chunk_next = 250;
+bool third_consecutive(const std::vector<int32_t>& generated, int32_t token) {
+    return generated.size() >= 2 && generated[generated.size() - 1] == token && generated[generated.size() - 2] == token;
+}
 template<class T> std::string json_numbers(const std::vector<T>& values) {
     std::string out = "[";
     for (std::size_t i = 0; i < values.size(); ++i) {
@@ -173,6 +176,7 @@ struct Engine::Impl {
                 check();
                 if (!eval_step_mtl(model, allocr, n_threads, n_past++, token, logits_c, logits_u)) throw std::runtime_error("MTL step failed");
                 token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
+                if (third_consecutive(out, token)) token = model.hparams.stop_speech_token;
                 out.push_back(token);
             }
             if (out.empty() || out.back() != model.hparams.stop_speech_token) throw std::runtime_error("MTL stopped without EOS");
@@ -294,6 +298,8 @@ struct Engine::Impl {
 
                 int n_past = 0;
                 int32_t token = 0;
+                int32_t repeat_token = -1;
+                bool repeat_stopped = false;
                 bool ready_emitted = false;
                 std::vector<int32_t> out;
                 out.reserve((size_t)opts.n_predict + 1);
@@ -330,6 +336,9 @@ struct Engine::Impl {
                         std::vector<float> logits_c, logits_u;
                         if (!eval_step_mtl(model, allocr, n_threads, n_past++, token, logits_c, logits_u)) throw std::runtime_error("MTL step failed");
                         token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
+                        if (third_consecutive(out, token)) {
+                            repeat_token = token; repeat_stopped = true; token = model.hparams.stop_speech_token;
+                        }
                     } else {
                         std::vector<float> logits;
                         if (!eval_step(model, allocr, n_threads, n_past++, token, logits)) throw std::runtime_error("Turbo step failed");
@@ -369,13 +378,15 @@ struct Engine::Impl {
                 }
                 cv.notify_all();
                 const double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+                const std::string stop_reason = repeat_stopped ? "repeat" : (eos ? "eos" : "window");
                 tts_emit("t3", ",\"index\":" + std::to_string(index)
                     + ",\"chars\":" + std::to_string(text.size())
                     + ",\"text_tokens\":" + std::to_string(text_tokens.size())
                     + ",\"tokens\":" + std::to_string(logged_tokens.size())
                     + ",\"ms\":" + std::to_string((int)(elapsed_ms + 0.5))
                     + ",\"stream\":true"
-                    + ",\"stop_reason\":\"" + (eos ? "eos" : "window") + "\""
+                    + ",\"stop_reason\":\"" + stop_reason + "\""
+                    + (repeat_stopped ? ",\"repeat_token_id\":" + std::to_string(repeat_token) : "")
                     + ",\"text_token_ids\":" + json_numbers(text_tokens)
                     + ",\"token_ids\":" + json_numbers(logged_tokens)
                     + ",\"token_us\":" + json_numbers(logged_us));
