@@ -23,8 +23,7 @@
 namespace tts_cpp::chatterbox {
 using namespace detail;
 namespace {
-constexpr int k_chunk_first_turbo = 12;
-constexpr int k_chunk_first_mtl = 48;
+constexpr int k_chunk_first = 48;
 constexpr int k_chunk_next = 250;
 template<class T> std::string json_numbers(const std::vector<T>& values) {
     std::string out = "[";
@@ -53,7 +52,7 @@ struct Engine::Impl {
     std::vector<int32_t> prompt_token;
     std::unique_ptr<mtl_tokenizer> mtl_tok;
     std::atomic<bool> cancelled{false};
-    int first_window() const { return model.hparams.variant == CHBX_VARIANT_MTL ? k_chunk_first_mtl : k_chunk_first_turbo; }
+    int first_window() const { return k_chunk_first; }
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void init() {
         if (!std::filesystem::exists(opts.t3_gguf_path)) throw std::runtime_error("T3 GGUF missing");
@@ -250,7 +249,7 @@ struct Engine::Impl {
     }
     // True streaming T3->s3gen pipeline. T3 runs on a worker thread, emitting
     // each new speech token to a shared buffer. The main thread consumes tokens
-    // in a family-specific first window / +250 chunks and runs s3gen on the prefix, trading first-audio
+    // in a 48-token first window / +250 chunks and runs s3gen on the prefix, trading first-audio
     // latency for substantially fewer prefix recomputations.
     void piece_streaming(const std::string& text, int index, const PieceCallback& cb, bool first_chunk_only = false) {
         if (text.empty()) return;
