@@ -101,7 +101,7 @@ tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
     o.repeat_penalty = f("--repeat-penalty"); o.cfg_weight = f("--cfg-weight");
     o.exaggeration = f("--exaggeration"); o.cfm_steps = i("--cfm-steps");
     o.fastconv = i("--fastconv") != 0;
-    return {o};
+    return tts_cpp::chatterbox::Engine(o);
 }
 
 bool receive(SOCKET socket, request_t& request) {
