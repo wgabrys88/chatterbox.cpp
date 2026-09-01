@@ -1139,8 +1139,9 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
     for (size_t i = 0; i < V; ++i) {
         l[i] = logits_cond[i] + p.cfg_weight * (logits_cond[i] - logits_uncond[i]);
     }
-    if (p.repeat_penalty != 1.0f) {
-        for (int32_t t : generated) {
+    if (p.repeat_penalty != 1.0f && !generated.empty()) {
+        std::set<int32_t> seen(generated.begin(), generated.end());
+        for (int32_t t : seen) {
             if (t < 0 || (size_t) t >= V) continue;
             if (l[t] > 0.0f) l[t] /= p.repeat_penalty;
             else             l[t] *= p.repeat_penalty;
