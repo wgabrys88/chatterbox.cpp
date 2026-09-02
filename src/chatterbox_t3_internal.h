@@ -204,7 +204,6 @@ bool compute_speech_tokens_native(
     const std::string &    wav_path,
     const std::string &    s3gen_gguf,
     int                    max_cond_tokens,
-    int                    enc_cond_seconds,
     std::vector<int32_t> & prompt_token,
     std::vector<int32_t> & cond_prompt_tokens,
     int                    n_threads,
