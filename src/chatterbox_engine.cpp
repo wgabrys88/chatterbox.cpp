@@ -48,7 +48,6 @@ struct Engine::Impl {
     EngineOptions opts;
     chatterbox_model model{};
     ggml_gallocr_t allocr = nullptr;
-    std::thread preload;
     std::vector<float> prompt_feat;
     int prompt_rows = 0;
     std::vector<float> embedding;
@@ -79,12 +78,10 @@ struct Engine::Impl {
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!allocr) throw std::runtime_error("T3 allocator failed");
         tts_emit("t3.workspace.ready");
-        preload = std::thread([this] { s3gen_preload(opts.s3gen_gguf_path, opts.n_gpu_layers, opts.fastconv); });
         bake_voice();
-        join(preload);
+        s3gen_preload(opts.s3gen_gguf_path, opts.n_gpu_layers, opts.fastconv);
     }
     ~Impl() {
-        join(preload);
         tts_emit("t3.unload.begin");
         s3gen_unload();
         if (allocr) ggml_gallocr_free(allocr);
@@ -109,6 +106,8 @@ struct Engine::Impl {
     }
     void bake_voice() {
         const int n_threads = threads(opts.n_threads);
+        const int t3_seconds = model.hparams.variant == CHBX_VARIANT_MTL ? 6 : 15;
+        const auto started = std::chrono::steady_clock::now();
         voice_encoder_weights ve;
         if (!voice_encoder_load(opts.t3_gguf_path, ve)) throw std::runtime_error("VoiceEncoder weights missing");
         std::vector<float> wav, speaker;
@@ -116,12 +115,15 @@ struct Engine::Impl {
         if (!wav_load(opts.reference_audio, wav, sr)) throw std::runtime_error("reference WAV load failed");
         normalise_lufs(wav, sr, -27.0);
         if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
-        if (wav.size() > 30u * 16000u) wav.resize(30u * 16000u);
+        tts_emit("voice.conditioning.begin", ",\"reference\":" + tts_json_escape(opts.reference_audio)
+            + ",\"reference_seconds\":" + std::to_string((double)wav.size() / 16000.0)
+            + ",\"speaker_reference\":\"full\",\"t3_seconds\":" + std::to_string(t3_seconds)
+            + ",\"s3gen_seconds\":10,\"lufs_target\":-27");
         if (!voice_encoder_embed(wav, ve, model.backend, speaker)) throw std::runtime_error("VoiceEncoder failed");
         if ((int64_t)speaker.size() != ggml_nelements(model.builtin_speaker_emb)) throw std::runtime_error("speaker embedding size mismatch");
         ggml_backend_tensor_set(model.builtin_speaker_emb, speaker.data(), 0, ggml_nbytes(model.builtin_speaker_emb));
         std::vector<int32_t> cond;
-        if (!compute_speech_tokens_native(opts.reference_audio, opts.s3gen_gguf_path, model.hparams.cond_prompt_len,
+        if (!compute_speech_tokens_native(opts.reference_audio, opts.s3gen_gguf_path, model.hparams.cond_prompt_len, t3_seconds,
                 prompt_token, cond, n_threads, model.backend, false)) throw std::runtime_error("S3Tokenizer failed");
         if ((int64_t)cond.size() == ggml_nelements(model.builtin_cond_prompt_tokens)) {
             ggml_backend_tensor_set(model.builtin_cond_prompt_tokens, cond.data(), 0, ggml_nbytes(model.builtin_cond_prompt_tokens));
@@ -139,6 +141,9 @@ struct Engine::Impl {
         if (!compute_prompt_feat_native(opts.reference_audio, opts.s3gen_gguf_path, prompt_feat, prompt_rows, false)) throw std::runtime_error("prompt feature failed");
         if (!compute_embedding_native(opts.reference_audio, opts.s3gen_gguf_path, embedding, false)) throw std::runtime_error("CAMPPlus failed");
         if (prompt_token.empty() || prompt_feat.empty() || embedding.empty()) throw std::runtime_error("voice conditioning empty");
+        tts_emit("voice.conditioning.completed", ",\"elapsed_ms\":" + std::to_string((int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + .5))
+            + ",\"speaker_dims\":" + std::to_string(speaker.size()) + ",\"prompt_tokens\":" + std::to_string(prompt_token.size())
+            + ",\"t3_cond_tokens\":" + std::to_string(cond.size()) + ",\"prompt_rows\":" + std::to_string(prompt_rows));
     }
     std::vector<int32_t> t3(const std::string& text) {
         check();
@@ -312,12 +317,11 @@ struct Engine::Impl {
                         + ",\"ms\":" + std::to_string((int)(ready_ms + 0.5)));
                     ready_emitted = true;
                 };
+                std::vector<float> logits, logits_c, logits_u;
                 if (model.hparams.variant == CHBX_VARIANT_MTL) {
-                    std::vector<float> logits_c, logits_u;
                     if (!eval_prompt_mtl(model, allocr, n_threads, text_tokens, opts.exaggeration, logits_c, logits_u, n_past)) throw std::runtime_error("MTL prompt failed");
                     token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
                 } else {
-                    std::vector<float> logits;
                     if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past)) throw std::runtime_error("Turbo prompt failed");
                     token = sample_next_token_ex(logits, out, sp, rng);
                 }
@@ -333,14 +337,12 @@ struct Engine::Impl {
                 for (int i = 0; i < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++i) {
                     check();
                     if (model.hparams.variant == CHBX_VARIANT_MTL) {
-                        std::vector<float> logits_c, logits_u;
                         if (!eval_step_mtl(model, allocr, n_threads, n_past++, token, logits_c, logits_u)) throw std::runtime_error("MTL step failed");
                         token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
                         if (third_consecutive(out, token)) {
                             repeat_token = token; repeat_stopped = true; token = model.hparams.stop_speech_token;
                         }
                     } else {
-                        std::vector<float> logits;
                         if (!eval_step(model, allocr, n_threads, n_past++, token, logits)) throw std::runtime_error("Turbo step failed");
                         token = sample_next_token_ex(logits, out, sp, rng);
                     }

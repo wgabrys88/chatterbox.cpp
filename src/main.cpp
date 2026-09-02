@@ -25,7 +25,6 @@
 #include <future>
 #include <map>
 #include <random>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -154,6 +153,7 @@ bool compute_embedding_native(const std::string & wav_path,
 bool compute_speech_tokens_native(const std::string & wav_path,
                                          const std::string & s3gen_gguf_path,
                                          int max_cond_tokens,
+                                         int enc_cond_seconds,
                                          std::vector<int32_t> & out_prompt_tokens,
                                          std::vector<int32_t> & out_cond_tokens,
                                          int n_threads,
@@ -174,7 +174,7 @@ bool compute_speech_tokens_native(const std::string & wav_path,
     const int dec_cond_samples = 10 * 16000;
     std::vector<float> prompt_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), dec_cond_samples));
     if (!s3tokv2_tokenize(prompt_wav, w, -1, out_prompt_tokens, n_threads, backend)) return false;
-    const int enc_cond_samples = 15 * 16000;
+    const int enc_cond_samples = enc_cond_seconds * 16000;
     std::vector<float> cond_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), enc_cond_samples));
     if (!s3tokv2_tokenize(cond_wav, w, max_cond_tokens, out_cond_tokens, n_threads, backend)) return false;
     if (verbose) fprintf(stderr, "voice: prompt_token=(%zu,) cond_prompt_speech_tokens=(%zu,) via S3TokenizerV2\n",
@@ -548,22 +548,19 @@ int32_t sample_next_token_ex(
         for (size_t i = 0; i < sorted.size(); ++i) { probs[i] = std::exp(sorted[i].s - mx); psum += probs[i]; }
         for (float & p : probs) p /= psum;
         float cum = 0;
-        std::set<int> keep_set;
+        std::vector<unsigned char> keep((size_t)n, 0);
         for (size_t i = 0; i < sorted.size(); ++i) {
             cum += probs[i];
-            keep_set.insert(sorted[i].idx);
+            keep[(size_t)sorted[i].idx] = 1;
             if (cum >= params.top_p) break;
         }
-        if (keep_set.empty() && !sorted.empty()) keep_set.insert(sorted[0].idx);
-        for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
+        for (int i = 0; i < n; ++i) if (!keep[(size_t)i]) scores[i] = -INFINITY;
     }
     if (params.repeat_penalty != 1.0f && !generated.empty()) {
-        std::set<int32_t> seen(generated.begin(), generated.end());
-        for (int32_t t : seen) {
-            if (t < 0 || t >= n) continue;
-            if (scores[t] == -INFINITY) continue;
+        std::vector<unsigned char> seen((size_t)n, 0);
+        for (int32_t t : generated) if (t >= 0 && t < n) seen[(size_t)t] = 1;
+        for (int t = 0; t < n; ++t) if (seen[(size_t)t] && scores[t] != -INFINITY)
             scores[t] = scores[t] > 0 ? scores[t] / params.repeat_penalty : scores[t] * params.repeat_penalty;
-        }
     }
     float mx = -INFINITY;
     for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
