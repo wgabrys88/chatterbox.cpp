@@ -46,6 +46,7 @@ struct Engine::Impl {
     std::vector<int32_t> prompt_token;
     std::unique_ptr<mtl_tokenizer> mtl_tok;
     std::atomic<bool> cancelled{false};
+    int pieces_in_session = 0;
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void init() {
         if (!std::filesystem::exists(opts.t3_gguf_path)) throw std::runtime_error("T3 GGUF missing");
@@ -292,7 +293,7 @@ struct Engine::Impl {
         s.pcm_out = &pcm;
         s.final = true;
         s.chunk_id = 0;
-        s.first_piece = (index == 0);
+        s.first_piece = (index <= 0);
         s.skip_mel_frames = 0;
             s.token_start = 0;
             s.token_end = (int)prefix.size();
@@ -312,12 +313,13 @@ Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pim
 Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
-void Engine::begin_synthesis() { pimpl_->cancelled.store(false, std::memory_order_release); }
+void Engine::begin_synthesis() { pimpl_->cancelled.store(false, std::memory_order_release); pimpl_->pieces_in_session = 0; }
 void Engine::synthesize_pieces_streaming(const std::vector<std::string>& texts, const PieceCallback& cb) {
     for (size_t i = 0; i < texts.size(); ++i) {
         if (texts[i].empty()) continue;
         pimpl_->check();
-        pimpl_->piece_streaming(texts[i], (int)i, cb);
+        pimpl_->piece_streaming(texts[i], (int)pimpl_->pieces_in_session, cb);
+        ++pimpl_->pieces_in_session;
     }
 }
 void Engine::warm_up() {
@@ -328,6 +330,7 @@ void Engine::warm_up() {
     if (!samples) throw std::runtime_error("warm-up produced no PCM");
     if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
     begin_synthesis();
+    pimpl_->pieces_in_session = 0;
     tts_emit("warmup.completed", std::string(" samples=") + std::to_string(samples));
 }
 void Engine::cancel() {
