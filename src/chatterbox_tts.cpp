@@ -1270,9 +1270,11 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     check_cancel(opts.cancel);
     int T_mu = 2 * n_total;
     // Dummy pad is always appended for the encoder conv and must not be spoken.
-    // A non-final window also cannot speak its last real lookahead tokens; those
-    // are regenerated in the next chunk once future tokens exist.
-    const int dropped_lookahead_tokens = pre_lookahead_len * (opts.final ? 1 : 2);
+    // A non-final window also withholds one spoken word (~800 ms at 25 Hz) so a
+    // word that straddles the cut is rendered once, in the next chunk, with real
+    // future tokens. Three lookahead tokens is shorter than a word.
+    constexpr int k_unspoken_word_tokens = 20;
+    const int dropped_lookahead_tokens = pre_lookahead_len + (opts.final ? 0 : k_unspoken_word_tokens);
     T_mu -= 2 * dropped_lookahead_tokens;
     if (T_mu <= 0) throw std::runtime_error("S3Gen lookahead trim emptied the encoder");
     mu_T.resize((size_t)T_mu * MEL);
