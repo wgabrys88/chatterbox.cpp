@@ -308,8 +308,10 @@ struct Engine::Impl {
                     cv.wait(lock, [&] { return t3_failed.load(std::memory_order_relaxed) || (int)tokens.size() >= threshold || t3_done; });
                     if (t3_failed.load(std::memory_order_relaxed)) throw std::runtime_error(t3_error);
                     if ((int)tokens.size() < threshold && !t3_done) continue;
-                    if (first_chunk_only && (int)tokens.size() < first_window_tokens)
-                        throw std::runtime_error("warm-up did not produce the required " + std::to_string(first_window_tokens) + " speech tokens");
+                    if (first_chunk_only && t3_done && (int)tokens.size() < first_window_tokens) {
+                        if (tokens.empty()) throw std::runtime_error("warm-up produced no speech tokens");
+                        tokens.resize((size_t)first_window_tokens, tokens.back());
+                    }
                     if (t3_done && (int)tokens.size() <= offset) break;
                     token_end = t3_done ? (int)tokens.size() : std::min((int)tokens.size(), threshold);
                     const int start = offset == 0 ? 0 : offset - k_overlap;
