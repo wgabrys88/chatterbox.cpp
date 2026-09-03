@@ -28,15 +28,6 @@ constexpr int k_chunk_next = 250;
 bool third_consecutive(const std::vector<int32_t>& generated, int32_t token) {
     return generated.size() >= 2 && generated[generated.size() - 1] == token && generated[generated.size() - 2] == token;
 }
-template<class T> std::string json_numbers(const std::vector<T>& values) {
-    std::string out = "[";
-    for (std::size_t i = 0; i < values.size(); ++i) {
-        if (i) out.push_back(',');
-        out += std::to_string(values[i]);
-    }
-    out.push_back(']');
-    return out;
-}
 int threads(int n) {
     if (n > 0) return n;
     const int hw = (int)std::thread::hardware_concurrency();
@@ -386,10 +377,7 @@ struct Engine::Impl {
                     + ",\"ms\":" + std::to_string((int)(elapsed_ms + 0.5))
                     + ",\"stream\":true"
                     + ",\"stop_reason\":\"" + stop_reason + "\""
-                    + (repeat_stopped ? ",\"repeat_token_id\":" + std::to_string(repeat_token) : "")
-                    + ",\"text_token_ids\":" + json_numbers(text_tokens)
-                    + ",\"token_ids\":" + json_numbers(logged_tokens)
-                    + ",\"token_us\":" + json_numbers(logged_us));
+                    + (repeat_stopped ? ",\"repeat_token_id\":" + std::to_string(repeat_token) : ""));
             } catch (const std::exception& e) {
                 const bool was_cancelled = cancelled.load(std::memory_order_relaxed);
                 std::vector<int32_t> partial;
@@ -401,10 +389,7 @@ struct Engine::Impl {
                     + ",\"tokens\":" + std::to_string(partial.size())
                     + ",\"ms\":" + std::to_string((int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + 0.5))
                     + ",\"stream\":true,\"stop_reason\":\"" + (was_cancelled ? "cancelled" : "error")
-                    + "\",\"terminal_kind\":\"" + (was_cancelled ? "cancelled" : "error") + "\""
-                    + ",\"text_token_ids\":" + json_numbers(text_tokens)
-                    + ",\"token_ids\":" + json_numbers(partial)
-                    + ",\"token_us\":" + json_numbers(token_us));
+                    + "\",\"terminal_kind\":\"" + (was_cancelled ? "cancelled" : "error") + "\"");
                 t3_failed.store(true, std::memory_order_relaxed);
                 { std::unique_lock lock(mu); t3_error = e.what(); t3_done = true; }
                 cv.notify_all();
@@ -455,13 +440,6 @@ struct Engine::Impl {
                 s.token_end = end;
                 s.hift_cache_source = std::move(cache);
                 s.hift_source_tail = &tail;
-                tts_emit("s3gen.begin", ",\"index\":" + std::to_string(index)
-                    + ",\"chunk_id\":" + std::to_string(s.chunk_id)
-                    + ",\"tokens\":" + std::to_string(prefix.size())
-                    + ",\"token_start\":" + std::to_string(s.token_start)
-                    + ",\"token_end\":" + std::to_string(s.token_end)
-                    + ",\"skip_mel_frames\":" + std::to_string(s.skip_mel_frames)
-                    + ",\"final\":" + (s.final ? "true" : "false"));
                 s3gen_synthesize(prefix, s);
                 check();
                 if (cb) cb(index, pcm.data(), pcm.size(), chunk_id - 1, s.final);

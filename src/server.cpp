@@ -127,6 +127,21 @@ std::string counts(std::size_t queued, bool active) {
     return ",\"queued_cancel_count\":" + std::to_string(queued) + ",\"active_cancel_count\":" + std::to_string(active ? 1 : 0);
 }
 
+std::string identity_json(const request_t& request) {
+    return "{\"epoch\":" + std::to_string(request.epoch)
+        + ",\"response_id\":" + std::to_string(request.response)
+        + ",\"piece_id\":" + std::to_string(request.piece) + "}";
+}
+
+std::string identity_array(const std::vector<request_t>& items) {
+    std::string out = "[";
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (i) out += ",";
+        out += identity_json(items[i]);
+    }
+    return out + "]";
+}
+
 void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
     wire_writer writer{client};
     std::mutex mutex;
@@ -159,7 +174,6 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
     };
 
     std::thread synth([&] {
-        tts_emit("synthesis.worker.start");
         std::optional<request_t> previous;
         mono_clock::time_point previous_ended{};
         try {
@@ -191,7 +205,6 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
                     chunks = std::max(chunks, static_cast<std::uint32_t>(chunk + 1));
                     if (!size) return;
                     if (first_pcm) { first_pcm = false; tts_emit("synthesis.first_result", ",\"chunk_id\":" + std::to_string(chunk) + ",\"bytes\":" + std::to_string(size * sizeof(std::int16_t)) + ",\"elapsed_ms\":" + elapsed_ms(mono_clock::now(), started)); }
-                    tts_emit("synthesis.pcm", ",\"chunk_id\":" + std::to_string(chunk) + ",\"bytes\":" + std::to_string(size * sizeof(std::int16_t)) + ",\"samples\":" + std::to_string(size));
                     writer.pcm(request, static_cast<std::uint32_t>(chunk), data, size);
                 });
                 bool completed = false;
@@ -229,7 +242,6 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
             tts.cancel(); shutdown(client, SD_BOTH); changed.notify_all();
             tts_emit("synthesis.worker.failed", ",\"error\":" + tts_json_escape(error.what()));
         }
-        tts_emit("synthesis.worker.stopped");
     });
 
     bool close_requested = false;
@@ -256,17 +268,21 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
                 if (request.epoch <= old_epoch) throw std::runtime_error("epoch must advance monotonically");
                 bool cancel_active = false;
                 std::vector<request_t> queued_cancelled;
+                std::optional<request_t> in_flight;
                 {
                     std::lock_guard lock(mutex);
                     live_epoch.store(request.epoch, std::memory_order_release);
                     tts_set_live_epoch(request.epoch);
                     cancel_active = active.has_value() && active->epoch != request.epoch;
+                    if (cancel_active) in_flight = active;
                     queued_cancelled = cancel_queued(request.epoch);
                 }
                 acknowledge_cancelled(queued_cancelled);
                 if (cancel_active) tts.cancel();
                 tts_emit("epoch.advanced", ",\"from\":" + std::to_string(old_epoch)
-                    + ",\"to\":" + std::to_string(request.epoch) + counts(queued_cancelled.size(), cancel_active));
+                    + ",\"to\":" + std::to_string(request.epoch) + counts(queued_cancelled.size(), cancel_active)
+                    + ",\"cancelled\":" + identity_array(queued_cancelled)
+                    + (in_flight ? ",\"active\":" + identity_json(*in_flight) : ""));
                 changed.notify_all();
                 continue;
             }
