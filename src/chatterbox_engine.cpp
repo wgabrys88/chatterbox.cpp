@@ -25,8 +25,6 @@
 namespace tts_cpp::chatterbox {
 using namespace detail;
 namespace {
-constexpr int k_hop = 250;
-constexpr int k_overlap = 20;
 bool third_consecutive(const std::vector<int32_t>& generated, int32_t token) {
     return generated.size() >= 2 && generated[generated.size() - 1] == token && generated[generated.size() - 2] == token;
 }
@@ -48,7 +46,6 @@ struct Engine::Impl {
     std::vector<int32_t> prompt_token;
     std::unique_ptr<mtl_tokenizer> mtl_tok;
     std::atomic<bool> cancelled{false};
-    int first_window() const { return k_hop; }
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void init() {
         if (!std::filesystem::exists(opts.t3_gguf_path)) throw std::runtime_error("T3 GGUF missing");
@@ -133,9 +130,8 @@ struct Engine::Impl {
         if (!compute_embedding_native(opts.reference_audio, opts.s3gen_gguf_path, embedding, false)) throw std::runtime_error("CAMPPlus failed");
         if (prompt_token.empty() || prompt_feat.empty() || embedding.empty()) throw std::runtime_error("voice conditioning empty");
     }
-    void piece_streaming(const std::string& text, int index, const PieceCallback& cb, bool first_chunk_only = false) {
+    void piece_streaming(const std::string& text, int index, const PieceCallback& cb) {
         if (text.empty()) return;
-        const int first_window_tokens = first_window();
         std::mutex mu;
         std::condition_variable cv;
         std::vector<int32_t> tokens;
@@ -181,7 +177,7 @@ struct Engine::Impl {
                 out.reserve((size_t)opts.n_predict + 1);
                 token_us.reserve((size_t)opts.n_predict + 1);
                 auto emit_ready = [&] {
-                    if (ready_emitted || (int)out.size() < first_window_tokens) return;
+                    if (ready_emitted || out.empty()) return;
                     const double ready_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
                     tts_emit("t3.ready", ",\"index\":" + std::to_string(index)
                         + ",\"tokens\":" + std::to_string(out.size())
@@ -228,11 +224,10 @@ struct Engine::Impl {
                     }
                     emit_ready();
                     cv.notify_all();
-                    if (first_chunk_only && (int)out.size() >= first_window_tokens) break;
                 }
 
                 const bool eos = token == model.hparams.stop_speech_token;
-                if (!first_chunk_only && !eos) throw std::runtime_error("streaming T3 stopped without EOS");
+                if (!eos) throw std::runtime_error("streaming T3 stopped without EOS");
                 std::vector<int32_t> logged_tokens;
                 std::vector<long long> logged_us;
                 {
@@ -297,27 +292,26 @@ struct Engine::Impl {
         std::vector<float> cache;
         int offset = 0;
         int chunk_id = 0;
+        const int min_speech = std::max(1, (prompt_rows + 3) / 2 - (int)prompt_token.size());
         try {
             while (true) {
-                const int threshold = offset + k_hop;
                 std::vector<int32_t> prefix;
                 bool final = false;
                 int token_end = offset;
                 {
                     std::unique_lock lock(mu);
-                    cv.wait(lock, [&] { return t3_failed.load(std::memory_order_relaxed) || (int)tokens.size() >= threshold || t3_done; });
+                    cv.wait(lock, [&] {
+                        return t3_failed.load(std::memory_order_relaxed)
+                            || t3_done
+                            || (int)tokens.size() >= offset + min_speech;
+                    });
                     if (t3_failed.load(std::memory_order_relaxed)) throw std::runtime_error(t3_error);
-                    if ((int)tokens.size() < threshold && !t3_done) continue;
-                    if (first_chunk_only && t3_done && (int)tokens.size() < first_window_tokens) {
-                        if (tokens.empty()) throw std::runtime_error("warm-up produced no speech tokens");
-                        tokens.resize((size_t)first_window_tokens, tokens.back());
-                    }
                     if (t3_done && (int)tokens.size() <= offset) break;
-                    token_end = t3_done ? (int)tokens.size() : std::min((int)tokens.size(), threshold);
-                    const int start = offset == 0 ? 0 : offset - k_overlap;
-                    prefix.assign(tokens.begin() + start, tokens.begin() + token_end);
-                    final = !first_chunk_only && t3_done && token_end == (int)tokens.size();
-                    s.skip_mel_frames = (offset == 0) ? 0 : 2 * k_overlap;
+                    if (!t3_done && (int)tokens.size() < offset + min_speech) continue;
+                    token_end = (int)tokens.size();
+                    prefix.assign(tokens.begin() + offset, tokens.begin() + token_end);
+                    final = t3_done && token_end == (int)tokens.size();
+                    s.skip_mel_frames = 0;
                     s.token_start = offset;
                     s.token_end = token_end;
                 }
@@ -332,7 +326,7 @@ struct Engine::Impl {
                 if (cb) cb(index, pcm.data(), pcm.size(), chunk_id - 1, s.final);
                 offset = token_end;
                 cache = std::move(tail);
-                if (first_chunk_only || s.final) break;
+                if (s.final) break;
             }
         } catch (...) {
             cancelled.store(true, std::memory_order_relaxed);
@@ -356,15 +350,14 @@ void Engine::synthesize_pieces_streaming(const std::vector<std::string>& texts, 
     }
 }
 void Engine::warm_up() {
-    const int tokens = pimpl_->first_window();
-    tts_emit("warmup.start", ",\"s3gen_tokens\":" + std::to_string(tokens));
+    tts_emit("warmup.start", "");
     begin_synthesis();
     std::size_t samples = 0;
-    pimpl_->piece_streaming("The system is warming up now by preparing a sufficiently long speech sample for efficient generation of future responses.", -1, [&](int, const float*, std::size_t n, int, bool) { samples += n; }, true);
+    pimpl_->piece_streaming("Warm up.", -1, [&](int, const float*, std::size_t n, int, bool) { samples += n; });
     if (!samples) throw std::runtime_error("warm-up produced no PCM");
     if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
     begin_synthesis();
-    tts_emit("warmup.completed", ",\"discarded_samples\":" + std::to_string(samples) + ",\"s3gen_tokens\":" + std::to_string(tokens));
+    tts_emit("warmup.completed", ",\"discarded_samples\":" + std::to_string(samples));
 }
 void Engine::cancel() {
     pimpl_->cancelled.store(true, std::memory_order_relaxed);
