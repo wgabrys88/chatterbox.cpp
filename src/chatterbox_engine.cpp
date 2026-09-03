@@ -4,7 +4,9 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -131,126 +133,9 @@ struct Engine::Impl {
         if (!compute_embedding_native(opts.reference_audio, opts.s3gen_gguf_path, embedding, false)) throw std::runtime_error("CAMPPlus failed");
         if (prompt_token.empty() || prompt_feat.empty() || embedding.empty()) throw std::runtime_error("voice conditioning empty");
     }
-    std::vector<int32_t> t3(const std::string& text) {
-        check();
-        const int n_threads = threads(opts.n_threads);
-        std::mt19937 rng(opts.seed);
-        chatterbox_sampling_params sp;
-        sp.top_k = opts.top_k;
-        sp.top_p = opts.top_p;
-        sp.min_p = opts.min_p;
-        sp.temp = opts.temperature;
-        sp.repeat_penalty = opts.repeat_penalty;
-        sp.cfg_weight = opts.cfg_weight;
-        std::vector<int32_t> text_tokens;
-        if (model.hparams.variant == CHBX_VARIANT_MTL) {
-            if (!mtl_tok) throw std::runtime_error("MTL tokenizer missing");
-            text_tokens = mtl_tok->encode(text, opts.language);
-            text_tokens.insert(text_tokens.begin(), model.hparams.start_text_token);
-            text_tokens.push_back(model.hparams.stop_text_token);
-        } else {
-            if (model.tok_tokens.empty()) throw std::runtime_error("Turbo tokenizer missing");
-            gpt2_bpe bpe;
-            bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
-            text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
-        }
-        if (text_tokens.empty()) throw std::runtime_error("empty T3 text tokens");
-        std::vector<int32_t> out;
-        out.reserve((size_t)opts.n_predict + 1);
-        int n_past = 0;
-        if (model.hparams.variant == CHBX_VARIANT_MTL) {
-            std::vector<float> logits_c, logits_u;
-            if (!eval_prompt_mtl(model, allocr, n_threads, text_tokens, opts.exaggeration, logits_c, logits_u, n_past)) throw std::runtime_error("MTL prompt failed");
-            int32_t token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
-            out.push_back(token);
-            for (int i = 0; i < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++i) {
-                check();
-                if (!eval_step_mtl(model, allocr, n_threads, n_past++, token, logits_c, logits_u)) throw std::runtime_error("MTL step failed");
-                token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
-                if (third_consecutive(out, token)) token = model.hparams.stop_speech_token;
-                out.push_back(token);
-            }
-            if (out.empty() || out.back() != model.hparams.stop_speech_token) throw std::runtime_error("MTL stopped without EOS");
-            out.pop_back();
-            if (out.size() > 1) out.pop_back();
-            return out;
-        }
-        std::vector<float> logits;
-        if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past)) throw std::runtime_error("Turbo prompt failed");
-        int32_t token = sample_next_token_ex(logits, out, sp, rng);
-        out.push_back(token);
-        for (int i = 0; i < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++i) {
-            check();
-            if (!eval_step(model, allocr, n_threads, n_past++, token, logits)) throw std::runtime_error("Turbo step failed");
-            token = sample_next_token_ex(logits, out, sp, rng);
-            out.push_back(token);
-        }
-        if (out.empty() || out.back() != model.hparams.stop_speech_token) throw std::runtime_error("Turbo stopped without EOS");
-        out.pop_back();
-        const int32_t vocab = model.hparams.start_speech_token;
-        out.erase(std::remove_if(out.begin(), out.end(), [vocab](int32_t v) { return v < 0 || v >= vocab; }), out.end());
-        return out;
-    }
-    void piece(const std::string& text, int index, const PieceCallback& cb) {
-        if (text.empty()) return;
-        const auto t0 = std::chrono::steady_clock::now();
-        auto tokens = t3(text);
-        const double t3_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        tts_emit("t3", ",\"index\":" + std::to_string(index)
-            + ",\"chars\":" + std::to_string(text.size())
-            + ",\"tokens\":" + std::to_string(tokens.size())
-            + ",\"ms\":" + std::to_string((int)(t3_ms + 0.5)));
-        check();
-        s3gen_synthesize_opts s;
-        s.s3gen_gguf_path = opts.s3gen_gguf_path;
-        s.seed = opts.seed;
-        s.n_threads = threads(opts.n_threads);
-        s.n_gpu_layers = opts.n_gpu_layers;
-        s.fastconv = opts.fastconv;
-        s.cfm_steps = opts.cfm_steps;
-        s.prompt_feat = prompt_feat;
-        s.prompt_rows = prompt_rows;
-        s.embedding = embedding;
-        s.prompt_token = prompt_token;
-        s.cancel = &cancelled;
-        std::vector<float> cache;
-        int emitted = 0;
-        const int first = first_window();
-        for (int end = 0, chunk = 0; end < (int)tokens.size(); ++chunk) {
-            const int token_start = end;
-            end = std::min((int)tokens.size(), end + (chunk ? 25 : first));
-            std::vector<int32_t> prefix(tokens.begin(), tokens.begin() + end);
-            std::vector<float> pcm, tail;
-            s.pcm_out = &pcm;
-            s.final = end == (int)tokens.size();
-            s.skip_mel_frames = emitted;
-            s.chunk_id = chunk;
-            s.token_start = token_start;
-            s.token_end = end;
-            s.hift_cache_source = std::move(cache);
-            s.hift_source_tail = &tail;
-            s3gen_synthesize(prefix, s);
-            check();
-            if (cb) cb(index, pcm.data(), pcm.size(), chunk, s.final);
-            emitted += (int)pcm.size() / 480;
-            cache = std::move(tail);
-        }
-    }
-    void pieces(const std::vector<std::string>& texts, const PieceCallback& cb) {
-        for (size_t i = 0; i < texts.size(); ++i) {
-            check();
-            piece(texts[i], (int)i, cb);
-        }
-    }
-    // True streaming T3->s3gen pipeline. T3 runs on a worker thread, emitting
-    // each new speech token to a shared buffer. The main thread consumes tokens
-    // in a 48-token first window / +250 chunks and runs s3gen on the prefix, trading first-audio
-    // latency for substantially fewer prefix recomputations.
     void piece_streaming(const std::string& text, int index, const PieceCallback& cb, bool first_chunk_only = false) {
         if (text.empty()) return;
         const int first_window_tokens = first_window();
-        if (opts.n_predict <= first_window_tokens) { piece(text, index, cb); return; }
-
         std::mutex mu;
         std::condition_variable cv;
         std::vector<int32_t> tokens;
@@ -418,7 +303,7 @@ struct Engine::Impl {
                 const int threshold = (chunk_id == 0) ? first_window_tokens : (end + k_chunk_next);
                 std::vector<int32_t> prefix;
                 bool final = false;
-                const int token_start = end;
+                const int token_start = emitted / 2;
                 {
                     std::unique_lock lock(mu);
                     cv.wait(lock, [&] { return t3_failed.load(std::memory_order_relaxed) || (int)tokens.size() >= threshold || t3_done; });
@@ -461,7 +346,6 @@ Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 void Engine::begin_synthesis() { pimpl_->cancelled.store(false, std::memory_order_release); }
-void Engine::synthesize_pieces(const std::vector<std::string>& texts, const PieceCallback& cb) { pimpl_->pieces(texts, cb); }
 void Engine::synthesize_pieces_streaming(const std::vector<std::string>& texts, const PieceCallback& cb) {
     for (size_t i = 0; i < texts.size(); ++i) {
         if (texts[i].empty()) continue;

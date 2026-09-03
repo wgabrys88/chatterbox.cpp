@@ -1269,10 +1269,13 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
       std::vector<float> tmp = run_encoder(m, input_embed, n_total, D, opts.chunk_id == 0); encoder_ms = now_ms() - t0; mu_T.swap(tmp); }
     check_cancel(opts.cancel);
     int T_mu = 2 * n_total;
-    if (!opts.final) {
-        T_mu -= 2 * pre_lookahead_len;
-        mu_T.resize((size_t)T_mu * MEL);
-    }
+    // Dummy pad is always appended for the encoder conv and must not be spoken.
+    // A non-final window also cannot speak its last real lookahead tokens; those
+    // are regenerated in the next chunk once future tokens exist.
+    const int dropped_lookahead_tokens = pre_lookahead_len * (opts.final ? 1 : 2);
+    T_mu -= 2 * dropped_lookahead_tokens;
+    if (T_mu <= 0) throw std::runtime_error("S3Gen lookahead trim emptied the encoder");
+    mu_T.resize((size_t)T_mu * MEL);
     std::vector<float> mu(T_mu * MEL);
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mu; ++t)
@@ -1371,7 +1374,8 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     check_cancel(opts.cancel);
     const int n_trim = sr / 50;
     const int fade_len = 2 * n_trim;
-    if ((int)wav.size() >= fade_len) {
+    const int fade_in_samples = (opts.skip_mel_frames == 0 && (int)wav.size() >= fade_len) ? n_trim : 0;
+    if (fade_in_samples) {
         for (int i = 0; i < n_trim; ++i) wav[i] = 0.0f;
         for (int i = 0; i < n_trim; ++i) {
             float theta = (float)M_PI * (1.0f - (float)i / (float)n_trim);
@@ -1391,6 +1395,9 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         ",\"chunk_id\":" + std::to_string(opts.chunk_id) +
         ",\"token_start\":" + std::to_string(opts.token_start) +
         ",\"token_end\":" + std::to_string(opts.token_end) +
+        ",\"skip_mel_frames\":" + std::to_string(opts.skip_mel_frames) +
+        ",\"dropped_lookahead_tokens\":" + std::to_string(dropped_lookahead_tokens) +
+        ",\"fade_in_samples\":" + std::to_string(fade_in_samples) +
         ",\"final\":" + std::string(opts.final ? "true" : "false") +
         ",\"samples\":" + std::to_string(wav.size()) +
         ",\"pcm_bytes\":" + std::to_string(wav.size() * sizeof(std::int16_t)));

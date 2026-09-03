@@ -35,7 +35,6 @@ public:
     Engine(Engine&&) noexcept;
     Engine& operator=(Engine&&) noexcept;
     void begin_synthesis();
-    void synthesize_pieces(const std::vector<std::string>&, const PieceCallback&);
     void synthesize_pieces_streaming(const std::vector<std::string>&, const PieceCallback&);
     void warm_up();
     void cancel();
