@@ -46,6 +46,7 @@ struct Engine::Impl {
     std::vector<int32_t> prompt_token;
     std::unique_ptr<mtl_tokenizer> mtl_tok;
     std::atomic<bool> cancelled{false};
+    std::uint32_t last_epoch = 0;
     int pieces_in_session = 0;
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void init() {
@@ -133,6 +134,9 @@ struct Engine::Impl {
     }
     void piece_streaming(const std::string& text, int index, const PieceCallback& cb) {
         if (text.empty()) return;
+        const auto ctx = tts_get_context();
+        const std::uint32_t epoch = ctx.valid ? ctx.epoch : 0;
+        if (epoch != last_epoch) { pieces_in_session = 0; last_epoch = epoch; }
         std::mutex mu;
         std::condition_variable cv;
         std::vector<int32_t> tokens;
@@ -313,7 +317,7 @@ Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pim
 Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
-void Engine::begin_synthesis() { pimpl_->cancelled.store(false, std::memory_order_release); pimpl_->pieces_in_session = 0; }
+void Engine::begin_synthesis() { pimpl_->cancelled.store(false, std::memory_order_release); }
 void Engine::synthesize_pieces_streaming(const std::vector<std::string>& texts, const PieceCallback& cb) {
     for (size_t i = 0; i < texts.size(); ++i) {
         if (texts[i].empty()) continue;
@@ -329,8 +333,8 @@ void Engine::warm_up() {
     pimpl_->piece_streaming("Warm up.", -1, [&](int, const float*, std::size_t n, int, bool) { samples += n; });
     if (!samples) throw std::runtime_error("warm-up produced no PCM");
     if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
-    begin_synthesis();
     pimpl_->pieces_in_session = 0;
+    begin_synthesis();
     tts_emit("warmup.completed", std::string(" samples=") + std::to_string(samples));
 }
 void Engine::cancel() {
