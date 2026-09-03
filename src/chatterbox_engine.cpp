@@ -289,52 +289,33 @@ struct Engine::Impl {
         s.prompt_token = prompt_token;
         s.cancel = &cancelled;
 
-        std::vector<float> cache;
-        int offset = 0;
-        int chunk_id = 0;
-        const int min_speech = std::max(1, (prompt_rows + 3) / 2 - (int)prompt_token.size());
         try {
-            while (true) {
-                std::vector<int32_t> prefix;
-                bool final = false;
-                int token_end = offset;
-                {
-                    std::unique_lock lock(mu);
-                    cv.wait(lock, [&] {
-                        return t3_failed.load(std::memory_order_relaxed)
-                            || t3_done
-                            || (int)tokens.size() >= offset + min_speech;
-                    });
-                    if (t3_failed.load(std::memory_order_relaxed)) throw std::runtime_error(t3_error);
-                    if (t3_done && (int)tokens.size() <= offset) break;
-                    if (!t3_done && (int)tokens.size() < offset + min_speech) continue;
-                    token_end = (int)tokens.size();
-                    prefix.assign(tokens.begin() + offset, tokens.begin() + token_end);
-                    final = t3_done && token_end == (int)tokens.size();
-                    s.skip_mel_frames = 0;
-                    s.token_start = offset;
-                    s.token_end = token_end;
-                }
-                std::vector<float> pcm, tail;
-                s.pcm_out = &pcm;
-                s.final = final;
-                s.chunk_id = chunk_id++;
-                s.hift_cache_source = std::move(cache);
-                s.hift_source_tail = &tail;
-                s3gen_synthesize(prefix, s);
-                check();
-                if (cb) cb(index, pcm.data(), pcm.size(), chunk_id - 1, s.final);
-                offset = token_end;
-                cache = std::move(tail);
-                if (s.final) break;
+            std::vector<int32_t> prefix;
+            {
+                std::unique_lock lock(mu);
+                cv.wait(lock, [&] { return t3_failed.load(std::memory_order_relaxed) || t3_done; });
+                if (t3_failed.load(std::memory_order_relaxed)) throw std::runtime_error(t3_error);
+                prefix = tokens;
             }
+            join(t3_thread);
+            if (prefix.empty()) return;
+            std::vector<float> pcm;
+            s.pcm_out = &pcm;
+            s.final = true;
+            s.chunk_id = 0;
+            s.skip_mel_frames = 0;
+            s.token_start = 0;
+            s.token_end = (int)prefix.size();
+            s3gen_synthesize(prefix, s);
+            check();
+            if (cb) cb(index, pcm.data(), pcm.size(), 0, true);
+            return;
         } catch (...) {
             cancelled.store(true, std::memory_order_relaxed);
             cv.notify_all();
             join(t3_thread);
             throw;
         }
-        join(t3_thread);
     }
 };
 Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(); }
