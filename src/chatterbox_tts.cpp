@@ -1269,12 +1269,8 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
       std::vector<float> tmp = run_encoder(m, input_embed, n_total, D, opts.chunk_id == 0); encoder_ms = now_ms() - t0; mu_T.swap(tmp); }
     check_cancel(opts.cancel);
     int T_mu = 2 * n_total;
-    // Dummy pad is always appended for the encoder conv and must not be spoken.
-    // A non-final window also withholds one spoken word (~800 ms at 25 Hz) so a
-    // word that straddles the cut is rendered once, in the next chunk, with real
-    // future tokens. Three lookahead tokens is shorter than a word.
-    constexpr int k_unspoken_word_tokens = 20;
-    const int dropped_lookahead_tokens = pre_lookahead_len + (opts.final ? 0 : k_unspoken_word_tokens);
+    // Dummy pad is encoder lookahead, not audio. Each hop speaks its own tokens once.
+    const int dropped_lookahead_tokens = pre_lookahead_len;
     T_mu -= 2 * dropped_lookahead_tokens;
     if (T_mu <= 0) throw std::runtime_error("S3Gen lookahead trim emptied the encoder");
     mu_T.resize((size_t)T_mu * MEL);
@@ -1376,7 +1372,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     check_cancel(opts.cancel);
     const int n_trim = sr / 50;
     const int fade_len = 2 * n_trim;
-    const int fade_in_samples = (opts.skip_mel_frames == 0 && (int)wav.size() >= fade_len) ? n_trim : 0;
+    const int fade_in_samples = (opts.chunk_id == 0 && (int)wav.size() >= fade_len) ? n_trim : 0;
     if (fade_in_samples) {
         for (int i = 0; i < n_trim; ++i) wav[i] = 0.0f;
         for (int i = 0; i < n_trim; ++i) {

@@ -25,8 +25,8 @@
 namespace tts_cpp::chatterbox {
 using namespace detail;
 namespace {
-constexpr int k_chunk_first = 48;
-constexpr int k_chunk_next = 250;
+constexpr int k_hop = 250;
+constexpr int k_overlap = 20;
 bool third_consecutive(const std::vector<int32_t>& generated, int32_t token) {
     return generated.size() >= 2 && generated[generated.size() - 1] == token && generated[generated.size() - 2] == token;
 }
@@ -48,7 +48,7 @@ struct Engine::Impl {
     std::vector<int32_t> prompt_token;
     std::unique_ptr<mtl_tokenizer> mtl_tok;
     std::atomic<bool> cancelled{false};
-    int first_window() const { return k_chunk_first; }
+    int first_window() const { return k_hop; }
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void init() {
         if (!std::filesystem::exists(opts.t3_gguf_path)) throw std::runtime_error("T3 GGUF missing");
@@ -295,15 +295,14 @@ struct Engine::Impl {
         s.cancel = &cancelled;
 
         std::vector<float> cache;
-        int emitted = 0;
+        int offset = 0;
         int chunk_id = 0;
-        int end = 0;
         try {
             while (true) {
-                const int threshold = (chunk_id == 0) ? first_window_tokens : (end + k_chunk_next);
+                const int threshold = offset + k_hop;
                 std::vector<int32_t> prefix;
                 bool final = false;
-                const int token_start = emitted / 2;
+                int token_end = offset;
                 {
                     std::unique_lock lock(mu);
                     cv.wait(lock, [&] { return t3_failed.load(std::memory_order_relaxed) || (int)tokens.size() >= threshold || t3_done; });
@@ -311,24 +310,25 @@ struct Engine::Impl {
                     if ((int)tokens.size() < threshold && !t3_done) continue;
                     if (first_chunk_only && (int)tokens.size() < first_window_tokens)
                         throw std::runtime_error("warm-up did not produce the required " + std::to_string(first_window_tokens) + " speech tokens");
-                    if (t3_done && (int)tokens.size() <= end) break;
-                    end = std::min((int)tokens.size(), threshold);
-                    prefix.assign(tokens.begin(), tokens.begin() + end);
-                    final = !first_chunk_only && t3_done && end == (int)tokens.size();
+                    if (t3_done && (int)tokens.size() <= offset) break;
+                    token_end = t3_done ? (int)tokens.size() : std::min((int)tokens.size(), threshold);
+                    const int start = offset == 0 ? 0 : offset - k_overlap;
+                    prefix.assign(tokens.begin() + start, tokens.begin() + token_end);
+                    final = !first_chunk_only && t3_done && token_end == (int)tokens.size();
+                    s.skip_mel_frames = (offset == 0) ? 0 : 2 * k_overlap;
+                    s.token_start = offset;
+                    s.token_end = token_end;
                 }
                 std::vector<float> pcm, tail;
                 s.pcm_out = &pcm;
                 s.final = final;
-                s.skip_mel_frames = emitted;
                 s.chunk_id = chunk_id++;
-                s.token_start = token_start;
-                s.token_end = end;
                 s.hift_cache_source = std::move(cache);
                 s.hift_source_tail = &tail;
                 s3gen_synthesize(prefix, s);
                 check();
                 if (cb) cb(index, pcm.data(), pcm.size(), chunk_id - 1, s.final);
-                emitted += (int)pcm.size() / 480;
+                offset = token_end;
                 cache = std::move(tail);
                 if (first_chunk_only || s.final) break;
             }
