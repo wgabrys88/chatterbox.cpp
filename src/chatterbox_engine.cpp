@@ -54,12 +54,12 @@ struct Engine::Impl {
         ggml_time_init();
         g_log_verbose = 0;
         ggml_log_set(chatterbox_log_cb, nullptr);
-        tts_emit("t3.model.load.begin", ",\"path\":" + tts_json_escape(opts.t3_gguf_path));
+        tts_emit("t3.model.load.begin", " path=" + opts.t3_gguf_path);
         const auto t3_load_started = std::chrono::steady_clock::now();
         if (!load_model_gguf(opts.t3_gguf_path, model, opts.n_ctx, opts.n_gpu_layers)) throw std::runtime_error("T3 load failed");
-        tts_emit("t3.model.load.completed", ",\"elapsed_ms\":" + std::to_string((int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t3_load_started).count() + .5))
-            + ",\"weights_bytes\":" + std::to_string(model.buffer_w ? ggml_backend_buffer_get_size(model.buffer_w) : 0)
-            + ",\"kv_bytes\":" + std::to_string(model.buffer_kv ? ggml_backend_buffer_get_size(model.buffer_kv) : 0));
+        tts_emit("t3.model.load.completed", std::string(" ms=") + std::to_string((int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t3_load_started).count() + .5))
+            + " weights_bytes=" + std::to_string(model.buffer_w ? ggml_backend_buffer_get_size(model.buffer_w) : 0)
+            + " kv_bytes=" + std::to_string(model.buffer_kv ? ggml_backend_buffer_get_size(model.buffer_kv) : 0));
         if (model.hparams.variant != CHBX_VARIANT_TURBO && model.hparams.variant != CHBX_VARIANT_MTL) throw std::runtime_error("unsupported T3 variant");
         if (model.hparams.variant == CHBX_VARIANT_MTL) {
             mtl_tok = std::make_unique<mtl_tokenizer>();
@@ -68,18 +68,18 @@ struct Engine::Impl {
         }
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!allocr) throw std::runtime_error("T3 allocator failed");
-        tts_emit("t3.workspace.ready");
+        tts_emit("t3.workspace.ready", " ok");
         preload = std::thread([this] { s3gen_preload(opts.s3gen_gguf_path, opts.n_gpu_layers, opts.fastconv); });
         bake_voice();
         join(preload);
     }
     ~Impl() {
         join(preload);
-        tts_emit("t3.unload.begin");
+        tts_emit("t3.unload.begin", " start");
         s3gen_unload();
         if (allocr) ggml_gallocr_free(allocr);
         free_model();
-        tts_emit("t3.unload.completed");
+        tts_emit("t3.unload.completed", " done");
     }
     void free_model() {
         if (model.buffer_stack || model.ctx_stack) t3_stack_unregister(model.buffer_stack, model.ctx_stack);
@@ -176,12 +176,10 @@ struct Engine::Impl {
                 std::vector<int32_t> out;
                 out.reserve((size_t)opts.n_predict + 1);
                 token_us.reserve((size_t)opts.n_predict + 1);
-                auto emit_ready = [&] {
+                auto                 emit_ready = [&] {
                     if (ready_emitted || out.empty()) return;
                     const double ready_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-                    tts_emit("t3.ready", ",\"index\":" + std::to_string(index)
-                        + ",\"tokens\":" + std::to_string(out.size())
-                        + ",\"ms\":" + std::to_string((int)(ready_ms + 0.5)));
+                    tts_emit("t3.ready", std::string(" tokens=") + std::to_string(out.size()) + " ms=" + std::to_string((int)(ready_ms + 0.5)));
                     ready_emitted = true;
                 };
                 if (model.hparams.variant == CHBX_VARIANT_MTL) {
@@ -250,26 +248,17 @@ struct Engine::Impl {
                 cv.notify_all();
                 const double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
                 const std::string stop_reason = repeat_stopped ? "repeat" : (eos ? "eos" : "window");
-                tts_emit("t3", ",\"index\":" + std::to_string(index)
-                    + ",\"chars\":" + std::to_string(text.size())
-                    + ",\"text_tokens\":" + std::to_string(text_tokens.size())
-                    + ",\"tokens\":" + std::to_string(logged_tokens.size())
-                    + ",\"ms\":" + std::to_string((int)(elapsed_ms + 0.5))
-                    + ",\"stream\":true"
-                    + ",\"stop_reason\":\"" + stop_reason + "\""
-                    + (repeat_stopped ? ",\"repeat_token_id\":" + std::to_string(repeat_token) : ""));
+                tts_emit("t3", std::string(" tokens=") + std::to_string(logged_tokens.size())
+                    + " ms=" + std::to_string((int)(elapsed_ms + 0.5))
+                    + " stop=" + stop_reason);
             } catch (const std::exception& e) {
                 const bool was_cancelled = cancelled.load(std::memory_order_relaxed);
                 std::vector<int32_t> partial;
                 { std::unique_lock lock(mu); partial = tokens; }
                 if (token_us.size() > partial.size()) token_us.resize(partial.size());
-                tts_emit("t3", ",\"index\":" + std::to_string(index)
-                    + ",\"chars\":" + std::to_string(text.size())
-                    + ",\"text_tokens\":" + std::to_string(text_tokens.size())
-                    + ",\"tokens\":" + std::to_string(partial.size())
-                    + ",\"ms\":" + std::to_string((int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + 0.5))
-                    + ",\"stream\":true,\"stop_reason\":\"" + (was_cancelled ? "cancelled" : "error")
-                    + "\",\"terminal_kind\":\"" + (was_cancelled ? "cancelled" : "error") + "\"");
+                tts_emit("t3", std::string(" tokens=") + std::to_string(partial.size())
+                    + " ms=" + std::to_string((int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + 0.5))
+                    + " stop=" + (was_cancelled ? "cancelled" : "error"));
                 t3_failed.store(true, std::memory_order_relaxed);
                 { std::unique_lock lock(mu); t3_error = e.what(); t3_done = true; }
                 cv.notify_all();
@@ -300,10 +289,11 @@ struct Engine::Impl {
             join(t3_thread);
             if (prefix.empty()) return;
             std::vector<float> pcm;
-            s.pcm_out = &pcm;
-            s.final = true;
-            s.chunk_id = 0;
-            s.skip_mel_frames = 0;
+        s.pcm_out = &pcm;
+        s.final = true;
+        s.chunk_id = 0;
+        s.first_piece = (index == 0);
+        s.skip_mel_frames = 0;
             s.token_start = 0;
             s.token_end = (int)prefix.size();
             s3gen_synthesize(prefix, s);
@@ -331,17 +321,17 @@ void Engine::synthesize_pieces_streaming(const std::vector<std::string>& texts, 
     }
 }
 void Engine::warm_up() {
-    tts_emit("warmup.start", "");
+    tts_emit("warmup.start", " begin");
     begin_synthesis();
     std::size_t samples = 0;
     pimpl_->piece_streaming("Warm up.", -1, [&](int, const float*, std::size_t n, int, bool) { samples += n; });
     if (!samples) throw std::runtime_error("warm-up produced no PCM");
     if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
     begin_synthesis();
-    tts_emit("warmup.completed", ",\"discarded_samples\":" + std::to_string(samples));
+    tts_emit("warmup.completed", std::string(" samples=") + std::to_string(samples));
 }
 void Engine::cancel() {
     pimpl_->cancelled.store(true, std::memory_order_relaxed);
-    tts_emit("synthesis.cancel.requested");
+    tts_emit("synthesis.cancel.requested", " ok");
 }
 }

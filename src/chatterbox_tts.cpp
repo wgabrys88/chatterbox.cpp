@@ -113,7 +113,7 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
 #else
 #error "No Chatterbox GPU backend selected"
 #endif
-    tts_emit("s3gen.backend", ",\"backend\":" + tts_json_escape(backend_name) + ",\"gpu_layers\":" + std::to_string(n_gpu_layers) + ",\"device\":" + tts_json_escape(desc));
+    tts_emit("s3gen.backend", std::string(" backend=") + backend_name + " device=" + desc);
     return b;
 }
 static model_ctx load_s3gen_gguf(const std::string&, int, bool);
@@ -126,7 +126,7 @@ static double                                g_s3gen_cache_last_load_ms = 0.0;
 static void s3gen_model_cache_release() {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
     if (!g_s3gen_cache_entry) return;
-    tts_emit("s3gen.unload.begin");
+    tts_emit("s3gen.unload.begin", " start");
     model_ctx * m = g_s3gen_cache_entry->m.get();
     if (m) {
         m->first_cfm.reset(); m->time_mixed.reset(); m->time_mlp.reset(); m->first_encoder.reset();
@@ -136,7 +136,7 @@ static void s3gen_model_cache_release() {
         m->tensors.clear();
     }
     g_s3gen_cache_entry.reset();
-    tts_emit("s3gen.unload.completed");
+    tts_emit("s3gen.unload.completed", " done");
 }
 static model_ctx * s3gen_model_cache_get(const std::string& path, int n_gpu_layers, bool fastconv) {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
@@ -161,7 +161,7 @@ static model_ctx * s3gen_model_cache_get(const std::string& path, int n_gpu_laye
 }
 static double s3gen_model_cache_last_load_ms() { return g_s3gen_cache_last_load_ms; }
 static model_ctx load_s3gen_gguf(const std::string& path, int n_gpu_layers, bool fastconv) {
-    tts_emit("s3gen.model.load.begin", ",\"path\":" + tts_json_escape(path));
+    tts_emit("s3gen.model.load.begin", " path=" + path);
     const double load_started = now_ms();
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
@@ -218,10 +218,10 @@ static model_ctx load_s3gen_gguf(const std::string& path, int n_gpu_layers, bool
         for (float& value : values) value = 1.0f / (value + 1e-9f);
         inverse_bytes += values.size() * sizeof(float); m.inv_alpha.emplace(name, std::move(values));
     }
-    tts_emit("s3gen.model.load.completed", ",\"elapsed_ms\":" + std::to_string((int)(now_ms() - load_started + .5))
-        + ",\"weights_bytes\":" + std::to_string(m.buffer_w ? ggml_backend_buffer_get_size(m.buffer_w) : 0)
-        + ",\"immutable_host_bytes\":" + std::to_string((m.input_embedding.size()+m.spk_affine_w.size()+m.spk_affine_b.size()+m.hift_linear_w.size()+1)*sizeof(float) + inverse_bytes)
-        + ",\"fastconv_baked_tensors\":" + std::to_string(baked) + ",\"fastconv_baked_bytes\":" + std::to_string(baked_bytes));
+    tts_emit("s3gen.model.load.completed", std::string(" ms=") + std::to_string((int)(now_ms() - load_started + .5))
+        + " weights_bytes=" + std::to_string(m.buffer_w ? ggml_backend_buffer_get_size(m.buffer_w) : 0)
+        + " baked_tensors=" + std::to_string(baked)
+        + " baked_bytes=" + std::to_string(baked_bytes));
     gguf_free(g);
     ggml_free(tmp_ctx);
     return m;
@@ -1320,8 +1320,8 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     }
     const std::vector<float> zeros_tm(T_mu * MEL, 0.0f), zeros_m(MEL, 0.0f);
     cfm_estimator_cache later_cfm;
-    if (opts.chunk_id == 0 && !m.first_cfm) m.first_cfm = std::make_unique<cfm_estimator_cache>();
-    cfm_estimator_cache & cfm_cache = opts.chunk_id == 0 ? *m.first_cfm : later_cfm;
+    if (opts.first_piece && !m.first_cfm) m.first_cfm = std::make_unique<cfm_estimator_cache>();
+    cfm_estimator_cache & cfm_cache = opts.first_piece ? *m.first_cfm : later_cfm;
     const double cfm_started = now_ms();
     for (size_t step = 0; step + 1 < t_span.size(); ++step) {
         check_cancel(opts.cancel);
@@ -1372,7 +1372,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     check_cancel(opts.cancel);
     const int n_trim = sr / 50;
     const int fade_len = 2 * n_trim;
-    const int fade_in_samples = (opts.chunk_id == 0 && (int)wav.size() >= fade_len) ? n_trim : 0;
+    const int fade_in_samples = (opts.first_piece && (int)wav.size() >= fade_len) ? n_trim : 0;
     if (fade_in_samples) {
         for (int i = 0; i < n_trim; ++i) wav[i] = 0.0f;
         for (int i = 0; i < n_trim; ++i) {
@@ -1386,19 +1386,13 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     char rtf[32];
     std::snprintf(rtf, sizeof(rtf), "%.3f", audio_ms > 0.0 ? pipeline_total / audio_ms : 0.0);
     tts_emit("s3gen",
-        ",\"infer_ms\":" + std::to_string((int)(pipeline_total + 0.5)) +
-        ",\"audio_ms\":" + std::to_string((int)(audio_ms + 0.5)) +
-        ",\"rtf\":" + rtf +
-        ",\"tokens\":" + std::to_string(speech_tokens.size()) +
-        ",\"chunk_id\":" + std::to_string(opts.chunk_id) +
-        ",\"token_start\":" + std::to_string(opts.token_start) +
-        ",\"token_end\":" + std::to_string(opts.token_end) +
-        ",\"skip_mel_frames\":" + std::to_string(opts.skip_mel_frames) +
-        ",\"dropped_lookahead_tokens\":" + std::to_string(dropped_lookahead_tokens) +
-        ",\"fade_in_samples\":" + std::to_string(fade_in_samples) +
-        ",\"final\":" + std::string(opts.final ? "true" : "false") +
-        ",\"samples\":" + std::to_string(wav.size()) +
-        ",\"pcm_bytes\":" + std::to_string(wav.size() * sizeof(std::int16_t)));
+        " tokens=" + std::to_string(speech_tokens.size()) +
+        " ms=" + std::to_string((int)(pipeline_total + 0.5)) +
+        " audio_ms=" + std::to_string((int)(audio_ms + 0.5)) +
+        " rtf=" + rtf +
+        " dropped_lookahead=" + std::to_string(dropped_lookahead_tokens) +
+        " fade_in_samples=" + std::to_string(fade_in_samples) +
+        " samples=" + std::to_string(wav.size()));
     *opts.pcm_out = std::move(wav);
 }
 void s3gen_preload(const std::string& path, int n_gpu_layers, bool fastconv) {

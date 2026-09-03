@@ -208,7 +208,7 @@ ggml_backend_t init_backend(int n_gpu_layers) {
 #else
 #error "No Chatterbox GPU backend selected"
 #endif
-    tts_emit("t3.backend", ",\"backend\":" + tts_json_escape(backend_name) + ",\"gpu_layers\":" + std::to_string(n_gpu_layers) + ",\"device\":" + tts_json_escape(desc));
+    tts_emit("t3.backend", std::string(" backend=") + backend_name + " device=" + desc);
     return b;
 }
 bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
