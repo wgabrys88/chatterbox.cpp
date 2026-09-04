@@ -220,7 +220,12 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
     bool close_requested = false;
     try {
         request_t request;
-        while (!close_requested && receive(client, request)) {
+        while (!close_requested) {
+            tts_emit("serve.recv-wait", " entering");
+            if (!receive(client, request)) {
+                tts_emit("serve.recv-false", " reason=client_closed");
+                break;
+            }
             if (request.kind == request_kind::synthesize) {
                 if (request.epoch != live_epoch.load(std::memory_order_acquire)) {
                     writer.terminal(response_kind::error, request, "sentence epoch is not live"); continue;
@@ -276,6 +281,7 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
             }
         }
     } catch (...) {
+        tts_emit("serve.catch-all", " entering");
         {
             std::lock_guard lock(mutex);
             stop.store(true, std::memory_order_release);
@@ -284,7 +290,8 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
         }
         tts.cancel(); changed.notify_all();
         if (synth.joinable()) synth.join();
-        throw;
+        tts_emit("serve.catch-all", " done");
+        return;
     }
 
     const bool unexpected_disconnect = !close_requested;
@@ -335,14 +342,27 @@ int main(int argc, char** argv) {
         tts_emit("server.ready", std::string(" port=") + std::to_string(ntohs(address.sin_port))
             + " family=" + args.at("--family") + " language=" + args.at("--language"));
 
+        static int iter = 0;
         for (;;) {
+            tts_emit("accept-loop.iteration", std::string(" iter=") + std::to_string(++iter));
             client = accept(listener, nullptr, nullptr);
-            if (client == INVALID_SOCKET) break;
+            tts_emit("accept-loop.accepted", std::string(" client=") + std::to_string(client));
+            if (client == INVALID_SOCKET) {
+                tts_emit("accept-loop.broken", std::string(" error=") + std::to_string(WSAGetLastError()));
+                break;
+            }
             tts_emit("client.accepted", " ok");
-            try { serve(client, tts); }
-            catch (const std::exception&) { closesocket(client); client = INVALID_SOCKET; }
+            try {
+                tts_emit("serve.begin", " ok");
+                serve(client, tts);
+                tts_emit("serve.end", " ok");
+            }
+            catch (const std::exception& e) {
+                tts_emit("serve.catch", std::string(" error=") + e.what());
+                closesocket(client); client = INVALID_SOCKET;
+            }
             closesocket(client); client = INVALID_SOCKET;
-            tts_emit("client.done", " ok");
+            tts_emit("client.done", std::string(" iter=") + std::to_string(iter));
         }
         closesocket(listener); listener = INVALID_SOCKET;
         WSACleanup(); wsa_started = false;
