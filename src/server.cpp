@@ -326,9 +326,6 @@ int main(int argc, char** argv) {
         int exclusive = 1;
         if (setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)))
             throw std::runtime_error("SO_EXCLUSIVEADDRUSE failed");
-        int reuse = 1;
-        if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse)))
-            throw std::runtime_error("SO_REUSEADDR failed");
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_port = htons(static_cast<unsigned short>(std::stoi(args.at("--port"))));
