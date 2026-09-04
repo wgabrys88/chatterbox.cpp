@@ -326,6 +326,9 @@ int main(int argc, char** argv) {
         int exclusive = 1;
         if (setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)))
             throw std::runtime_error("SO_EXCLUSIVEADDRUSE failed");
+        int reuse = 1;
+        if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse)))
+            throw std::runtime_error("SO_REUSEADDR failed");
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_port = htons(static_cast<unsigned short>(std::stoi(args.at("--port"))));
@@ -335,11 +338,15 @@ int main(int argc, char** argv) {
         tts_emit("server.ready", std::string(" port=") + std::to_string(ntohs(address.sin_port))
             + " family=" + args.at("--family") + " language=" + args.at("--language"));
 
-        client = accept(listener, nullptr, nullptr);
-        if (client == INVALID_SOCKET) throw std::runtime_error("accept failed");
-        tts_emit("client.accepted", " ok");
-        serve(client, tts);
-        closesocket(client); client = INVALID_SOCKET;
+        for (;;) {
+            client = accept(listener, nullptr, nullptr);
+            if (client == INVALID_SOCKET) break;
+            tts_emit("client.accepted", " ok");
+            try { serve(client, tts); }
+            catch (const std::exception&) { closesocket(client); client = INVALID_SOCKET; throw; }
+            closesocket(client); client = INVALID_SOCKET;
+            tts_emit("client.done", " ok");
+        }
         closesocket(listener); listener = INVALID_SOCKET;
         WSACleanup(); wsa_started = false;
         tts_emit("server.stopped", " clean=true");
