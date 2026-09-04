@@ -297,8 +297,8 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
         changed.notify_all();
     }
     if (synth.joinable()) synth.join();
-    if (failed) throw std::runtime_error("native synthesis worker failed");
-    if (unexpected_disconnect) throw std::runtime_error("client disconnected without close handshake");
+    if (failed) { tts_emit("serve.failed", " ok"); }
+    if (unexpected_disconnect) { tts_emit("client.disconnected", " ok"); }
     if (close_requested) {
         request_t close_frame{request_kind::close, live_epoch.load(), 0, 0, {}};
         writer.terminal(response_kind::closed, close_frame);
@@ -340,7 +340,7 @@ int main(int argc, char** argv) {
             if (client == INVALID_SOCKET) break;
             tts_emit("client.accepted", " ok");
             try { serve(client, tts); }
-            catch (const std::exception&) { closesocket(client); client = INVALID_SOCKET; throw; }
+            catch (const std::exception&) { closesocket(client); client = INVALID_SOCKET; }
             closesocket(client); client = INVALID_SOCKET;
             tts_emit("client.done", " ok");
         }
