@@ -5,6 +5,7 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <filesystem>
 #include <mutex>
 #include <random>
@@ -144,6 +145,8 @@ struct Engine::Impl {
         std::atomic<bool> t3_failed{false};
         std::string t3_error;
         const auto synthesis_context = tts_get_context();
+        std::atomic<long long> t3_end_us{0};
+        if (index >= 0) tts_session_begin_if_needed();
         std::thread t3_thread([&, synthesis_context] {
             tts_context_scope context_scope(synthesis_context);
             const auto started = std::chrono::steady_clock::now();
@@ -176,7 +179,6 @@ struct Engine::Impl {
                 int32_t token = 0;
                 int32_t repeat_token = -1;
                 bool repeat_stopped = false;
-                bool ready_emitted = false;
                 std::vector<int32_t> out;
                 out.reserve((size_t)opts.n_predict + 1);
                 int32_t pending_mtl = -1;
@@ -188,14 +190,7 @@ struct Engine::Impl {
                         if (pending_mtl >= 0) tokens.push_back(pending_mtl);
                         pending_mtl = value;
                     } else tokens.push_back(value);
-                    tts_emit("t3.progress", " tokens=" + std::to_string(tokens.size()));
                     cv.notify_all();
-                };
-                auto                 emit_ready = [&] {
-                    if (ready_emitted || out.empty()) return;
-                    const double ready_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
-                    tts_emit("t3.ready", std::string(" tokens=") + std::to_string(out.size()) + " ms=" + std::to_string((int)(ready_ms + 0.5)));
-                    ready_emitted = true;
                 };
                 if (model.hparams.variant == CHBX_VARIANT_MTL) {
                     std::vector<float> logits_c, logits_u;
@@ -208,7 +203,6 @@ struct Engine::Impl {
                 }
                 out.push_back(token);
                 publish(token);
-                emit_ready();
                 cv.notify_all();
 
                 for (int i = 0; i < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++i) {
@@ -227,7 +221,6 @@ struct Engine::Impl {
                     }
                     out.push_back(token);
                     publish(token);
-                    emit_ready();
                     cv.notify_all();
                 }
 
@@ -238,20 +231,21 @@ struct Engine::Impl {
                     std::unique_lock lock(mu);
                     if (tokens.empty() && pending_mtl >= 0) tokens.push_back(pending_mtl);
                     logged_tokens = tokens;
-                    tts_emit("t3.eos", " tokens=" + std::to_string(tokens.size()));
                     t3_done = true;
                 }
                 cv.notify_all();
+                t3_end_us.store(tts_mono_us(), std::memory_order_relaxed);
                 const double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
                 const std::string stop_reason = repeat_stopped ? "repeat" : (eos ? "eos" : "window");
-                tts_emit("t3", std::string(" tokens=") + std::to_string(logged_tokens.size())
+                tts_emit_piece("t3", std::string(" tokens=") + std::to_string(logged_tokens.size())
                     + " ms=" + std::to_string((int)(elapsed_ms + 0.5))
                     + " stop=" + stop_reason);
             } catch (const std::exception& e) {
                 const bool was_cancelled = cancelled.load(std::memory_order_relaxed);
                 std::vector<int32_t> partial;
                 { std::unique_lock lock(mu); partial = tokens; }
-                tts_emit("t3", std::string(" tokens=") + std::to_string(partial.size())
+                t3_end_us.store(tts_mono_us(), std::memory_order_relaxed);
+                tts_emit_piece("t3", std::string(" tokens=") + std::to_string(partial.size())
                     + " ms=" + std::to_string((int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + 0.5))
                     + " stop=" + (was_cancelled ? "cancelled" : "error"));
                 { std::unique_lock lock(mu); t3_error = e.what(); t3_failed.store(true); t3_done = true; }
@@ -277,6 +271,7 @@ struct Engine::Impl {
             s3gen_piece_state state;
             s.state = &state;
             s.first_piece = (index <= 0);
+            long long s3_first_us = 0;
             for (;;) {
                 std::vector<int32_t> window;
                 {
@@ -294,13 +289,36 @@ struct Engine::Impl {
                 }
                 std::vector<float> pcm;
                 s.pcm_out = &pcm;
+                if (!s3_first_us) s3_first_us = tts_mono_us();
                 s3gen_synthesize(window, s);
                 check();
+                if (!pcm.empty()) tts_session_note_first_audio();
                 if (cb) cb(index, pcm.data(), pcm.size(), s.chunk_id, s.final);
                 ++s.chunk_id;
                 if (s.final) break;
             }
             join(t3_thread);
+            if (s3_first_us) {
+                const long long t3e = t3_end_us.load(std::memory_order_relaxed);
+                if (t3e > s3_first_us) tts_session_add_overlap((double)(t3e - s3_first_us) / 1000.0);
+            }
+            if (state.samples > 0) {
+                const double audio_ms = 1000.0 * state.samples / 24000.0;
+                char rtf[32];
+                std::snprintf(rtf, sizeof(rtf), "%.3f", audio_ms > 0.0 ? state.pipeline_ms / audio_ms : 0.0);
+                tts_emit_piece("s3",
+                    std::string(" encoder_ms=") + std::to_string((int)(state.encoder_ms + 0.5))
+                    + " cfm_ms=" + std::to_string((int)(state.cfm_ms + 0.5))
+                    + " f0_ms=" + std::to_string((int)(state.f0_ms + 0.5))
+                    + " stft_ms=" + std::to_string((int)(state.stft_ms + 0.5))
+                    + " hift_ms=" + std::to_string((int)(state.hift_ms + 0.5))
+                    + " audio_ms=" + std::to_string((int)(audio_ms + 0.5))
+                    + " rtf=" + rtf
+                    + " samples=" + std::to_string(state.samples)
+                    + " prompt_tokens=" + std::to_string(state.prompt_tokens)
+                    + " speech_tokens=" + std::to_string(state.speech_tokens));
+            }
+            if (index >= 0) tts_session_touch_end();
             return;
         } catch (...) {
             const bool producer_failed = t3_failed.load();

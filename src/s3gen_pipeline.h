@@ -8,6 +8,8 @@ struct s3gen_piece_state {
     // Channel-major mel and sample-major excitation for the preceding 25 tokens.
     std::vector<float> mel, source, pending_pcm;
     std::vector<double> phase;
+    double encoder_ms = 0, cfm_ms = 0, f0_ms = 0, stft_ms = 0, hift_ms = 0, pipeline_ms = 0;
+    int samples = 0, prompt_tokens = 0, speech_tokens = 0;
 };
 struct s3gen_synthesize_opts {
     std::string s3gen_gguf_path;

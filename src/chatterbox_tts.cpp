@@ -57,9 +57,7 @@ static void check_cancel(const std::atomic<bool>* cancel) {
     if (cancel && cancel->load(std::memory_order_relaxed)) throw std::runtime_error("synthesis cancelled");
 }
 static void compute(ggml_backend_t backend, ggml_cgraph * gf) {
-    tts_emit("s3.graph.begin");
     const auto status = ggml_backend_graph_compute(backend, gf);
-    tts_emit("s3.graph.complete");
     if (status != GGML_STATUS_SUCCESS) throw std::runtime_error("S3Gen graph failed");
 }
 
@@ -1255,9 +1253,6 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     if (history_tokens < 0 || history_tokens > 25 || output_tokens <= history_tokens ||
         (int)speech_tokens.size() != output_tokens + (opts.final ? 0 : 3))
         throw std::runtime_error("S3Gen token range invalid");
-    tts_emit("s3.enter", " start=" + std::to_string(opts.token_start) +
-        " emit_start=" + std::to_string(state.token_end) + " end=" + std::to_string(opts.token_end) +
-        " final=" + std::to_string(opts.final));
     if (opts.prompt_token.empty() || opts.embedding.empty() || opts.prompt_feat.empty() || opts.prompt_rows <= 0)
         throw std::runtime_error("S3Gen voice conditioning missing");
     g_n_threads = opts.n_threads;
@@ -1426,21 +1421,17 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     state.pending_pcm.assign(wav.begin() + end, wav.end());
     std::vector<float> emitted(wav.begin() + begin, wav.begin() + end);
     wav.swap(emitted);
-    tts_emit("s3.emit", " start_sample=" + std::to_string((int64_t)state.token_end * 960 - pending) +
-        " end_sample=" + std::to_string((int64_t)opts.token_end * 960 - state.pending_pcm.size()));
     state.token_end = opts.token_end;
     const double pipeline_total = now_ms() - pipeline_t0;
-    const double audio_ms = 1000.0 * wav.size() / sr;
-    char rtf[32];
-    std::snprintf(rtf, sizeof(rtf), "%.3f", audio_ms > 0.0 ? pipeline_total / audio_ms : 0.0);
-    tts_emit("s3gen",
-        " tokens=" + std::to_string(speech_tokens.size()) +
-        " ms=" + std::to_string((int)(pipeline_total + 0.5)) +
-        " audio_ms=" + std::to_string((int)(audio_ms + 0.5)) +
-        " rtf=" + rtf +
-        " dropped_lookahead=" + std::to_string(dropped_lookahead_tokens) +
-        " fade_in_samples=" + std::to_string(fade_in_samples) +
-        " samples=" + std::to_string(wav.size()));
+    state.encoder_ms += encoder_ms;
+    state.cfm_ms += cfm_ms;
+    state.f0_ms += f0_ms;
+    state.stft_ms += stft_ms;
+    state.hift_ms += hift_ms;
+    state.pipeline_ms += pipeline_total;
+    state.samples += (int)wav.size();
+    state.prompt_tokens = n_prompt;
+    state.speech_tokens = opts.token_end;
     *opts.pcm_out = std::move(wav);
 }
 void s3gen_preload(const std::string& path, int n_gpu_layers, bool fastconv) {

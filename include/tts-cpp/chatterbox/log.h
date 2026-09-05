@@ -6,7 +6,6 @@
 #include <ctime>
 #include <mutex>
 #include <string>
-#include <thread>
 
 struct tts_synthesis_context {
     std::uint32_t epoch = 0;
@@ -32,7 +31,12 @@ public:
     ~tts_context_scope() { tts_context() = previous_; }
 };
 
-inline void tts_emit(const char* event, const char* extra = nullptr) {
+inline long long tts_mono_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+inline void tts_emit(const char* event, const char* extra, bool with_mono) {
     const auto now = std::time(nullptr);
     std::tm tm;
 #if defined(_WIN32)
@@ -49,14 +53,81 @@ inline void tts_emit(const char* event, const char* extra = nullptr) {
         ctx_str = " epoch=" + std::to_string(ctx.epoch) + " piece=" + std::to_string(ctx.piece_id);
     }
 
-    const auto mono_us = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    std::fprintf(stderr, "[%s] %s%s mono_us=%lld thread=%zu | %s%s%s\n",
-        ts, event, ctx_str.c_str(), (long long)mono_us, std::hash<std::thread::id>{}(std::this_thread::get_id()), tts_run_identity().c_str(),
-        extra ? " " : "", extra ? extra : "");
-    std::fflush(stderr);
+    if (with_mono) {
+        std::fprintf(stderr, "[%s] %s%s mono_us=%lld | %s%s%s\n",
+            ts, event, ctx_str.c_str(), tts_mono_us(), tts_run_identity().c_str(),
+            extra ? " " : "", extra ? extra : "");
+        std::fflush(stderr);
+    } else {
+        std::fprintf(stderr, "[%s] %s%s | %s%s%s\n",
+            ts, event, ctx_str.c_str(), tts_run_identity().c_str(),
+            extra ? " " : "", extra ? extra : "");
+    }
+}
+
+inline void tts_emit(const char* event, const char* extra = nullptr) {
+    tts_emit(event, extra, false);
 }
 
 inline void tts_emit(const char* event, const std::string& extra) {
-    tts_emit(event, extra.c_str());
+    tts_emit(event, extra.c_str(), false);
+}
+
+inline void tts_emit_piece(const char* event, const std::string& extra) {
+    tts_emit(event, extra.c_str(), true);
+}
+
+struct tts_session_acc {
+    std::chrono::steady_clock::time_point t0{};
+    std::chrono::steady_clock::time_point t1{};
+    double first_audio_ms = -1;
+    double overlap_ms = 0;
+    bool open = false;
+};
+
+inline tts_session_acc& tts_session() { static tts_session_acc s; return s; }
+inline std::mutex& tts_session_mu() { static std::mutex m; return m; }
+
+inline void tts_session_begin_if_needed() {
+    std::lock_guard<std::mutex> lock(tts_session_mu());
+    auto& s = tts_session();
+    if (s.open) return;
+    s.t0 = s.t1 = std::chrono::steady_clock::now();
+    s.first_audio_ms = -1;
+    s.overlap_ms = 0;
+    s.open = true;
+}
+
+inline void tts_session_note_first_audio() {
+    std::lock_guard<std::mutex> lock(tts_session_mu());
+    auto& s = tts_session();
+    if (!s.open || s.first_audio_ms >= 0) return;
+    s.first_audio_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - s.t0).count();
+}
+
+inline void tts_session_add_overlap(double ms) {
+    std::lock_guard<std::mutex> lock(tts_session_mu());
+    if (tts_session().open) tts_session().overlap_ms += ms;
+}
+
+inline void tts_session_touch_end() {
+    std::lock_guard<std::mutex> lock(tts_session_mu());
+    if (tts_session().open) tts_session().t1 = std::chrono::steady_clock::now();
+}
+
+inline void tts_session_emit() {
+    int wall = 0, fa = -1, ov = 0;
+    {
+        std::lock_guard<std::mutex> lock(tts_session_mu());
+        auto& s = tts_session();
+        if (!s.open) return;
+        wall = (int)(std::chrono::duration<double, std::milli>(s.t1 - s.t0).count() + 0.5);
+        fa = s.first_audio_ms < 0 ? -1 : (int)(s.first_audio_ms + 0.5);
+        ov = (int)(s.overlap_ms + 0.5);
+        s.open = false;
+    }
+    tts_emit_piece("session", std::string(" tts_synth=") + std::to_string(wall)
+        + " first_audio_ms=" + std::to_string(fa)
+        + " overlap_ms=" + std::to_string(ov));
 }

@@ -290,6 +290,7 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
         }
         tts.cancel(); changed.notify_all();
         if (synth.joinable()) synth.join();
+        tts_session_emit();
         tts_emit("serve.catch-all", " done");
         return;
     }
@@ -304,6 +305,7 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
         changed.notify_all();
     }
     if (synth.joinable()) synth.join();
+    tts_session_emit();
     if (failed) { tts_emit("serve.failed", " ok"); }
     if (unexpected_disconnect) { tts_emit("client.disconnected", " ok"); }
     if (close_requested) {

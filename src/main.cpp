@@ -493,9 +493,7 @@ bool eval_prompt(
             ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
         }
     }
-    tts_emit("t3.graph.begin");
     const auto status = ggml_backend_graph_compute(model.backend, gf);
-    tts_emit("t3.graph.complete");
     if (status != GGML_STATUS_SUCCESS) return false;
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);
@@ -513,9 +511,7 @@ bool eval_step(
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
     int32_t position = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), &position, 0, sizeof(position));
-    tts_emit("t3.graph.begin");
     const auto status = ggml_backend_graph_compute(model.backend, gf);
-    tts_emit("t3.graph.complete");
     if (status != GGML_STATUS_SUCCESS) return false;
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);
