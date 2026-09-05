@@ -1422,7 +1422,8 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         const float weight = 0.5f - 0.5f * std::cos((float)M_PI * (i + 1) / pending);
         wav[begin + i] = state.pending_pcm[i] * (1.0f - weight) + wav[begin + i] * weight;
     }
-    const size_t end = wav.size() - (opts.final ? 0 : n_trim);
+    const size_t hold = (!opts.last_piece && (int)wav.size() > n_trim) ? (size_t)n_trim : 0;
+    const size_t end = wav.size() - hold;
     state.pending_pcm.assign(wav.begin() + end, wav.end());
     std::vector<float> emitted(wav.begin() + begin, wav.begin() + end);
     wav.swap(emitted);

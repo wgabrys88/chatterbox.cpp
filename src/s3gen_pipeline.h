@@ -28,6 +28,7 @@ struct s3gen_synthesize_opts {
     bool fastconv = true;
     const std::atomic<bool>* cancel = nullptr;
     bool final = true;
+    bool last_piece = true;
     bool first_piece = true;
     int chunk_id = 0;
     int token_start = 0;

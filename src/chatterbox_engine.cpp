@@ -318,7 +318,7 @@ struct Engine::Impl {
             + " speech_tokens=" + std::to_string(acoustic.speech_tokens)
             + s3_overlap_fields());
     }
-    void run_s3(const std::vector<int32_t>& tokens, int index, const PieceCallback& cb) {
+    void run_s3(const std::vector<int32_t>& tokens, int index, bool last_piece, const PieceCallback& cb) {
         auto synthesis_context = tts_get_context();
         if (index >= 0) { synthesis_context.valid = true; synthesis_context.piece_id = (std::uint32_t)index; }
         tts_context_scope context_scope(synthesis_context);
@@ -347,6 +347,7 @@ struct Engine::Impl {
         s.token_start = 0;
         s.token_end = (int)window.size();
         s.final = true;
+        s.last_piece = last_piece;
         s.first_piece = (index <= 0);
         s.chunk_id = 0;
         std::vector<float> pcm;
@@ -376,13 +377,9 @@ struct Engine::Impl {
             std::vector<int32_t> tokens;
             { std::lock_guard lock(job->mu); tokens = std::move(job->tokens); }
             std::unique_ptr<T3Job> next;
-            if (i + 1 < work.size()) {
-                next = std::make_unique<T3Job>();
-                launch_t3(*next, work[i + 1].text, work[i + 1].session_index);
-            }
-            const long long s3_t0 = tts_mono_us();
             try {
-                run_s3(tokens, work[i].session_index, [&](int, const float* pcm, std::size_t n, int chunk, bool final) {
+                run_s3(tokens, work[i].session_index, i + 1 == work.size(),
+                    [&](int, const float* pcm, std::size_t n, int chunk, bool final) {
                     if (cb) cb(work[i].cb_index, pcm, n, chunk, final);
                 });
             } catch (...) {
@@ -394,14 +391,9 @@ struct Engine::Impl {
                 }
                 throw;
             }
-            const long long s3_t1 = tts_mono_us();
-            if (next) {
-                const long long t3s = next->start_us.load(std::memory_order_relaxed);
-                long long t3e = next->end_us.load(std::memory_order_relaxed);
-                if (!t3e) t3e = s3_t1;
-                const long long lo = std::max(s3_t0, t3s);
-                const long long hi = std::min(s3_t1, t3e);
-                if (hi > lo) tts_session_add_overlap((double)(hi - lo) / 1000.0);
+            if (i + 1 < work.size()) {
+                next = std::make_unique<T3Job>();
+                launch_t3(*next, work[i + 1].text, work[i + 1].session_index);
                 job = std::move(next);
             }
         }
