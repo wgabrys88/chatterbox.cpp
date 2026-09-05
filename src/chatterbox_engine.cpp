@@ -24,6 +24,13 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#ifdef GGML_USE_VULKAN
+#ifdef _WIN32
+extern "C" __declspec(dllimport) void ggml_vk_overlap_counters(ggml_backend_t, unsigned long long *, unsigned long long *, unsigned long long *, int);
+#else
+extern "C" void ggml_vk_overlap_counters(ggml_backend_t, unsigned long long *, unsigned long long *, unsigned long long *, int);
+#endif
+#endif
 namespace tts_cpp::chatterbox {
 using namespace detail;
 namespace {
@@ -36,6 +43,31 @@ int threads(int n) {
     return hw > 0 ? std::min(hw, 4) : 4;
 }
 void join(std::thread& t) { if (t.joinable()) t.join(); }
+#ifdef GGML_USE_VULKAN
+void vk_overlap_reset(ggml_backend_t b) {
+    if (b) ggml_vk_overlap_counters(b, nullptr, nullptr, nullptr, 1);
+}
+std::string vk_overlap_fields(ggml_backend_t b) {
+    unsigned long long wait_us = 0, submit_n = 0, barrier_n = 0;
+    if (b) ggml_vk_overlap_counters(b, &wait_us, &submit_n, &barrier_n, 0);
+    return std::string(" wait_us=") + std::to_string(wait_us)
+        + " submit_n=" + std::to_string(submit_n)
+        + " barrier_n=" + std::to_string(barrier_n);
+}
+#else
+void vk_overlap_reset(ggml_backend_t) {}
+std::string vk_overlap_fields(ggml_backend_t) { return {}; }
+#endif
+std::string s3_overlap_fields() {
+    unsigned long long wait_us = 0, submit_n = 0, barrier_n = 0;
+    s3gen_vk_overlap_counters(&wait_us, &submit_n, &barrier_n, 0);
+    return std::string(" wait_us=") + std::to_string(wait_us)
+        + " submit_n=" + std::to_string(submit_n)
+        + " barrier_n=" + std::to_string(barrier_n);
+}
+void s3_overlap_reset() {
+    s3gen_vk_overlap_counters(nullptr, nullptr, nullptr, 1);
+}
 }
 struct Engine::Impl {
     EngineOptions opts;
@@ -157,6 +189,7 @@ struct Engine::Impl {
             tts_context_scope context_scope(synthesis_context);
             job.start_us.store(tts_mono_us(), std::memory_order_relaxed);
             const auto started = std::chrono::steady_clock::now();
+            vk_overlap_reset(model.backend);
             std::vector<int32_t> text_tokens;
             try {
                 const int n_threads = threads(opts.n_threads);
@@ -246,7 +279,8 @@ struct Engine::Impl {
                 const std::string stop_reason = repeat_stopped ? "repeat" : (eos ? "eos" : "window");
                 tts_emit_piece("t3", std::string(" tokens=") + std::to_string(logged_tokens.size())
                     + " ms=" + std::to_string((int)(elapsed_ms + 0.5))
-                    + " stop=" + stop_reason);
+                    + " stop=" + stop_reason
+                    + vk_overlap_fields(model.backend));
             } catch (const std::exception& e) {
                 const bool was_cancelled = cancelled.load(std::memory_order_relaxed);
                 std::vector<int32_t> partial;
@@ -254,7 +288,8 @@ struct Engine::Impl {
                 job.end_us.store(tts_mono_us(), std::memory_order_relaxed);
                 tts_emit_piece("t3", std::string(" tokens=") + std::to_string(partial.size())
                     + " ms=" + std::to_string((int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + 0.5))
-                    + " stop=" + (was_cancelled ? "cancelled" : "error"));
+                    + " stop=" + (was_cancelled ? "cancelled" : "error")
+                    + vk_overlap_fields(model.backend));
                 { std::unique_lock lock(job.mu); job.error = e.what(); job.failed.store(true); job.done = true; }
                 cancelled.store(true, std::memory_order_relaxed);
                 job.cv.notify_all();
@@ -280,7 +315,8 @@ struct Engine::Impl {
             + " rtf=" + rtf
             + " samples=" + std::to_string(acoustic.samples)
             + " prompt_tokens=" + std::to_string(acoustic.prompt_tokens)
-            + " speech_tokens=" + std::to_string(acoustic.speech_tokens));
+            + " speech_tokens=" + std::to_string(acoustic.speech_tokens)
+            + s3_overlap_fields());
     }
     void run_s3(const std::vector<int32_t>& tokens, int index, const PieceCallback& cb) {
         auto synthesis_context = tts_get_context();
@@ -289,6 +325,7 @@ struct Engine::Impl {
         if (tokens.empty()) throw std::runtime_error("S3Gen speech tokens empty");
         acoustic.encoder_ms = acoustic.cfm_ms = acoustic.f0_ms = acoustic.stft_ms = acoustic.hift_ms = acoustic.pipeline_ms = 0;
         acoustic.samples = acoustic.prompt_tokens = acoustic.speech_tokens = 0;
+        s3_overlap_reset();
         acoustic.token_end = (int)speech_history.size();
         std::vector<int32_t> window;
         window.reserve(speech_history.size() + tokens.size());

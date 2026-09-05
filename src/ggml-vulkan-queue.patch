@@ -1,0 +1,394 @@
+diff --git a/src/ggml-vulkan/ggml-vulkan.cpp b/src/ggml-vulkan/ggml-vulkan.cpp
+index 19e7fbd..07b8cde 100644
+--- a/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -39,6 +39,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
+ #include <mutex>
+ #include <future>
+ #include <thread>
++#include <chrono>
+ 
+ #if defined(_MSC_VER)
+ # define NOMINMAX 1
+@@ -1637,6 +1638,7 @@ struct vk_staging_memset {
+ struct vk_context_struct {
+     vk_submission * s;
+     std::vector<vk_sequence> seqs;
++    ggml_backend_vk_context * backend_ctx {};
+ 
+     int exit_tensor_idx;
+ 
+@@ -1885,6 +1887,10 @@ struct ggml_backend_vk_context {
+     vk::Fence fence, almost_ready_fence;
+     bool submit_pending {};
+     bool almost_ready_fence_pending {};
++    bool fence_in_flight {};
++    uint64_t wait_us {};
++    uint64_t submit_n {};
++    uint64_t barrier_n {};
+     // Set before op_add and unset after op_rms_norm to indicate that the add should
+     // write partial sums to accumulate the square of the vector components
+     bool do_add_rms_partials_offset_calculation;
+@@ -2082,8 +2088,9 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
+     return range;
+ }
+ 
+-// Wait for ctx->fence to be signaled.
++// Wait for this context's in-flight fence (not the shared compute queue).
+ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
++    const auto t0 = std::chrono::steady_clock::now();
+     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
+     // during this wait.
+     if (ctx->almost_ready_fence_pending) {
+@@ -2092,27 +2099,32 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+         ctx->almost_ready_fence_pending = false;
+     }
+ 
+-    // Spin (w/pause) waiting for the graph to finish executing.
+-    vk::Result result;
+-    while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
+-        if (result != vk::Result::eNotReady) {
+-            fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
+-            exit(1);
+-        }
+-        for (uint32_t i = 0; i < 100; ++i) {
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
+-            YIELD();
++    if (ctx->fence_in_flight) {
++        // Spin (w/pause) waiting for this context's graph to finish executing.
++        vk::Result result;
++        while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
++            if (result != vk::Result::eNotReady) {
++                fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
++                exit(1);
++            }
++            for (uint32_t i = 0; i < 100; ++i) {
++                YIELD();
++                YIELD();
++                YIELD();
++                YIELD();
++                YIELD();
++                YIELD();
++                YIELD();
++                YIELD();
++                YIELD();
++                YIELD();
++            }
+         }
++        ctx->device->device.resetFences({ ctx->fence });
++        ctx->fence_in_flight = false;
+     }
+-    ctx->device->device.resetFences({ ctx->fence });
++    ctx->wait_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::steady_clock::now() - t0).count();
+ }
+ 
+ // variables to track number of compiles in progress
+@@ -2344,6 +2356,9 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
+         if (fence) {
+             std::lock_guard<std::mutex> guard(queue_mutex);
+             ctx->p->q->queue.submit({}, fence);
++            if (ctx->backend_ctx) {
++                ctx->backend_ctx->submit_n++;
++            }
+         }
+         return;
+     }
+@@ -2414,10 +2429,22 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
+ 
+     std::lock_guard<std::mutex> guard(queue_mutex);
+     ctx->p->q->queue.submit(submit_infos, fence);
++    if (ctx->backend_ctx) {
++        ctx->backend_ctx->submit_n++;
++    }
+ 
+     ctx->seqs.clear();
+ }
+ 
++static void ggml_vk_submit_own_fence(ggml_backend_vk_context * ctx, vk_context& subctx) {
++    if (ctx->fence_in_flight) {
++        ggml_vk_wait_for_fence(ctx);
++    }
++    ggml_vk_submit(subctx, ctx->fence);
++    ctx->fence_in_flight = true;
++    ctx->submit_pending = true;
++}
++
+ static uint32_t ggml_vk_find_queue_family_index(std::vector<vk::QueueFamilyProperties>& queue_family_props, const vk::QueueFlags& required, const vk::QueueFlags& avoid, int32_t compute_index, uint32_t min_num_queues) {
+     VK_LOG_DEBUG("ggml_vk_find_queue_family_index()");
+     const uint32_t qfsize = queue_family_props.size();
+@@ -2483,6 +2510,7 @@ static vk_context ggml_vk_create_context(ggml_backend_vk_context * ctx, vk_comma
+     VK_LOG_DEBUG("ggml_vk_create_context(" << result << ")");
+     ctx->gc.contexts.emplace_back(result);
+     result->p = &p;
++    result->backend_ctx = ctx;
+     return result;
+ }
+ 
+@@ -2786,22 +2814,77 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
+     VK_LOG_DEBUG("ggml_vk_sync_buffers()");
+ 
+     const bool transfer_queue = subctx->p->q->transfer_only;
++    const vk::AccessFlags access = !transfer_queue
++        ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite)
++        : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
++
++    ggml_backend_vk_context * counters = ctx ? ctx : subctx->backend_ctx;
++    if (counters) {
++        counters->barrier_n++;
++    }
+ 
+     if (ctx) {
+         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+     }
+ 
+-    subctx->s->buffer->buf.pipelineBarrier(
+-        subctx->p->q->stage_flags,
+-        subctx->p->q->stage_flags,
+-        {},
+-        { {
+-          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) },
+-          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) }
+-        } },
+-        {},
+-        {}
+-    );
++    std::vector<vk::BufferMemoryBarrier> buf_barriers;
++    auto add_buf = [&](const vk_buffer& buf) {
++        if (!buf || buf->buffer == VK_NULL_HANDLE) {
++            return;
++        }
++        for (const auto& b : buf_barriers) {
++            if (b.buffer == buf->buffer) {
++                return;
++            }
++        }
++        buf_barriers.push_back({
++            access, access,
++            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
++            buf->buffer, 0, VK_WHOLE_SIZE
++        });
++    };
++    auto add_tensor = [&](const ggml_tensor * node) {
++        if (!node || !node->buffer) {
++            return;
++        }
++        ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
++        if (buf_ctx) {
++            add_buf(buf_ctx->dev_buffer);
++        }
++    };
++
++    if (ctx) {
++        for (auto * n : ctx->unsynced_nodes_written) {
++            add_tensor(n);
++        }
++        for (auto * n : ctx->unsynced_nodes_read) {
++            add_tensor(n);
++        }
++        add_buf(ctx->prealloc_x);
++        add_buf(ctx->prealloc_y);
++        add_buf(ctx->prealloc_split_k);
++        add_buf(ctx->prealloc_add_rms_partials);
++    }
++
++    if (!buf_barriers.empty()) {
++        subctx->s->buffer->buf.pipelineBarrier(
++            subctx->p->q->stage_flags,
++            subctx->p->q->stage_flags,
++            {},
++            {},
++            buf_barriers,
++            {}
++        );
++    } else {
++        subctx->s->buffer->buf.pipelineBarrier(
++            subctx->p->q->stage_flags,
++            subctx->p->q->stage_flags,
++            {},
++            { { { access }, { access } } },
++            {},
++            {}
++        );
++    }
+ }
+ 
+ static void ggml_vk_reset_event(vk_context& ctx, vk::Event& event) {
+@@ -12723,8 +12806,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
+     if (subctx) {
+         // Submit and wait for any pending work before reallocating the buffers
+         ggml_vk_ctx_end(subctx);
+-        ggml_vk_submit(subctx, {});
+-        ctx->submit_pending = true;
++        ggml_vk_submit_own_fence(ctx, subctx);
+         ggml_vk_synchronize(ctx);
+         GGML_ASSERT(ctx->compute_ctx.expired());
+         ggml_vk_ctx_begin(ctx->device, subctx);
+@@ -12867,9 +12949,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+             if (vk_enable_sync_logger) {
+                 std::cerr <<  "sync" << std::endl;
+             }
++            ggml_vk_sync_buffers(ctx, compute_ctx);
+             ctx->unsynced_nodes_written.clear();
+             ctx->unsynced_nodes_read.clear();
+-            ggml_vk_sync_buffers(ctx, compute_ctx);
+ 
+             if (vk_perf_logger_enabled && vk_perf_logger_concurrent) {
+                 ctx->query_node_idx[ctx->query_idx] = node_idx;
+@@ -13292,13 +13374,16 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
+             memset(mset.dst, mset.val, mset.n);
+         }
+ 
+-        if (almost_ready && !ctx->almost_ready_fence_pending) {
++        if (subctx->exit_tensor_idx >= 0) {
++            ggml_vk_submit_own_fence(ctx, subctx);
++        } else if (almost_ready && !ctx->almost_ready_fence_pending) {
+             ggml_vk_submit(subctx, ctx->almost_ready_fence);
+             ctx->almost_ready_fence_pending = true;
++            ctx->submit_pending = true;
+         } else {
+             ggml_vk_submit(subctx, {});
++            ctx->submit_pending = true;
+         }
+-        ctx->submit_pending = true;
+ 
+ #ifdef GGML_VULKAN_CHECK_RESULTS
+         ggml_vk_synchronize(ctx);
+@@ -13822,7 +13907,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
+ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+     VK_LOG_DEBUG("ggml_vk_synchronize()");
+ 
+-    bool do_transfer = !ctx->compute_ctx.expired();
++    const bool had_compute = !ctx->compute_ctx.expired();
+ 
+     if (ggml_vk_submit_transfer_ctx(ctx)) {
+         ctx->submit_pending = true;
+@@ -13830,7 +13915,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+ 
+     vk_context compute_ctx;
+     vk_command_buffer* cmd_buf = nullptr;
+-    if (do_transfer) {
++    if (had_compute) {
+         compute_ctx = ctx->compute_ctx.lock();
+         if (compute_ctx->s) {
+             cmd_buf = compute_ctx->s->buffer;
+@@ -13842,39 +13927,36 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+             memcpy(cpy.dst, cpy.src, cpy.n);
+         }
+ 
+-        ggml_vk_submit(compute_ctx, {});
+-        ctx->submit_pending = true;
++        if (!compute_ctx->seqs.empty()) {
++            ggml_vk_submit_own_fence(ctx, compute_ctx);
++        }
+     }
+ 
+-    if (ctx->submit_pending) {
+-        if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+-            vk::TimelineSemaphoreSubmitInfo tl_info{
+-                1, &ctx->transfer_semaphore.value,
+-                0, nullptr,
+-            };
+-            vk::PipelineStageFlags stage = ctx->device->transfer_queue.stage_flags;
+-            vk::SubmitInfo si{
+-                1, &ctx->transfer_semaphore.s, &stage,
+-                0, nullptr,
+-                0, nullptr,
+-            };
+-            si.setPNext(&tl_info);
+-            std::lock_guard<std::mutex> guard(queue_mutex);
+-            ctx->device->compute_queue.queue.submit({ si }, ctx->fence);
+-            ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+-        } else {
+-            std::lock_guard<std::mutex> guard(queue_mutex);
+-            ctx->device->compute_queue.queue.submit({}, ctx->fence);
+-        }
++    // Wait this backend's transfer timeline on the host. Do not empty-submit a
++    // fence on the shared compute queue (that wait is queue-wide).
++    if (ctx->device->async_use_transfer_queue &&
++        ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
++        const auto t0 = std::chrono::steady_clock::now();
++        vk::SemaphoreWaitInfo wi{};
++        wi.semaphoreCount = 1;
++        wi.pSemaphores = &ctx->transfer_semaphore.s;
++        wi.pValues = &ctx->transfer_semaphore.value;
++        VK_CHECK(ctx->device->device.waitSemaphores(wi, UINT64_MAX), "transfer_semaphore");
++        ctx->wait_us += (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
++            std::chrono::steady_clock::now() - t0).count();
++        ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
++    }
++
++    if (ctx->fence_in_flight || ctx->almost_ready_fence_pending) {
+         ggml_vk_wait_for_fence(ctx);
+-        ctx->submit_pending = false;
+-        if (cmd_buf) {
+-            cmd_buf->in_use = false;
+-            cmd_buf->buf.reset();
+-        }
++    }
++    ctx->submit_pending = false;
++    if (cmd_buf) {
++        cmd_buf->in_use = false;
++        cmd_buf->buf.reset();
+     }
+ 
+-    if (do_transfer) {
++    if (had_compute) {
+         for (auto& cpy : compute_ctx->out_memcpys) {
+             memcpy(cpy.dst, cpy.src, cpy.n);
+         }
+@@ -14953,8 +15035,7 @@ static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_ev
+     compute_ctx->s->signal_semaphores.push_back(vkev->tl_semaphore);
+     ggml_vk_ctx_end(compute_ctx);
+ 
+-    ggml_vk_submit(compute_ctx, {});
+-    ctx->submit_pending = true;
++    ggml_vk_submit_own_fence(ctx, compute_ctx);
+     vkev->cmd_buffer = cmd_buf;
+     vkev->cmd_buffer_use_counter = cmd_buf->use_counter;
+     ctx->compute_ctx.reset();
+@@ -15020,6 +15101,36 @@ bool ggml_backend_is_vk(ggml_backend_t backend) {
+     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
+ }
+ 
++#if defined(_WIN32)
++#define GGML_VK_OVERLAP_EXPORT __declspec(dllexport)
++#else
++#define GGML_VK_OVERLAP_EXPORT
++#endif
++extern "C" GGML_VK_OVERLAP_EXPORT void ggml_vk_overlap_counters(ggml_backend_t b, unsigned long long * wait_us,
++                                                          unsigned long long * submit_n, unsigned long long * barrier_n, int reset) {
++    unsigned long long w = 0, s = 0, br = 0;
++    if (b && ggml_backend_is_vk(b)) {
++        ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)b->context;
++        w = ctx->wait_us;
++        s = ctx->submit_n;
++        br = ctx->barrier_n;
++        if (reset) {
++            ctx->wait_us = 0;
++            ctx->submit_n = 0;
++            ctx->barrier_n = 0;
++        }
++    }
++    if (wait_us) {
++        *wait_us = w;
++    }
++    if (submit_n) {
++        *submit_n = s;
++    }
++    if (barrier_n) {
++        *barrier_n = br;
++    }
++}
++
+ int ggml_backend_vk_get_device_count() {
+     return ggml_vk_get_device_count();
+ }

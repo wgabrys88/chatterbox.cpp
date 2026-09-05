@@ -6,6 +6,11 @@
 #include "gguf.h"
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
+#ifdef _WIN32
+extern "C" __declspec(dllimport) void ggml_vk_overlap_counters(ggml_backend_t, unsigned long long *, unsigned long long *, unsigned long long *, int);
+#else
+extern "C" void ggml_vk_overlap_counters(ggml_backend_t, unsigned long long *, unsigned long long *, unsigned long long *, int);
+#endif
 #elif defined(GGML_USE_CUDA)
 #include "ggml-cuda.h"
 #endif
@@ -1439,4 +1444,20 @@ void s3gen_preload(const std::string& path, int n_gpu_layers, bool fastconv) {
 }
 void s3gen_unload() {
     s3gen_model_cache_release();
+}
+void s3gen_vk_overlap_counters(unsigned long long * wait_us, unsigned long long * submit_n,
+                               unsigned long long * barrier_n, int reset) {
+#ifdef GGML_USE_VULKAN
+    ggml_backend_t b = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
+        if (g_s3gen_cache_entry && g_s3gen_cache_entry->m) b = g_s3gen_cache_entry->m->backend;
+    }
+    ggml_vk_overlap_counters(b, wait_us, submit_n, barrier_n, reset);
+#else
+    if (wait_us) *wait_us = 0;
+    if (submit_n) *submit_n = 0;
+    if (barrier_n) *barrier_n = 0;
+    (void)reset;
+#endif
 }

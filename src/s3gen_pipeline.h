@@ -37,3 +37,5 @@ struct s3gen_synthesize_opts {
 void s3gen_synthesize(const std::vector<int32_t>&, const s3gen_synthesize_opts&);
 void s3gen_preload(const std::string&, int, bool);
 void s3gen_unload();
+void s3gen_vk_overlap_counters(unsigned long long * wait_us, unsigned long long * submit_n,
+                               unsigned long long * barrier_n, int reset);
