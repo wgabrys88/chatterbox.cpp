@@ -3,6 +3,12 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+struct s3gen_piece_state {
+    int token_end = 0;
+    // Channel-major mel and sample-major excitation for the preceding 25 tokens.
+    std::vector<float> mel, source, pending_pcm;
+    std::vector<double> phase;
+};
 struct s3gen_synthesize_opts {
     std::string s3gen_gguf_path;
     std::vector<float>* pcm_out = nullptr;
@@ -18,12 +24,10 @@ struct s3gen_synthesize_opts {
     const std::atomic<bool>* cancel = nullptr;
     bool final = true;
     bool first_piece = true;
-    int skip_mel_frames = 0;
     int chunk_id = 0;
     int token_start = 0;
     int token_end = 0;
-    std::vector<float> hift_cache_source;
-    std::vector<float>* hift_source_tail = nullptr;
+    s3gen_piece_state* state = nullptr;
 };
 void s3gen_synthesize(const std::vector<int32_t>&, const s3gen_synthesize_opts&);
 void s3gen_preload(const std::string&, int, bool);

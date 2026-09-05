@@ -1,10 +1,12 @@
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <ctime>
 #include <mutex>
 #include <string>
+#include <thread>
 
 struct tts_synthesis_context {
     std::uint32_t epoch = 0;
@@ -47,8 +49,10 @@ inline void tts_emit(const char* event, const char* extra = nullptr) {
         ctx_str = " epoch=" + std::to_string(ctx.epoch) + " piece=" + std::to_string(ctx.piece_id);
     }
 
-    std::fprintf(stderr, "[%s] %s%s | %s%s%s\n",
-        ts, event, ctx_str.c_str(), tts_run_identity().c_str(),
+    const auto mono_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::fprintf(stderr, "[%s] %s%s mono_us=%lld thread=%zu | %s%s%s\n",
+        ts, event, ctx_str.c_str(), (long long)mono_us, std::hash<std::thread::id>{}(std::this_thread::get_id()), tts_run_identity().c_str(),
         extra ? " " : "", extra ? extra : "");
     std::fflush(stderr);
 }

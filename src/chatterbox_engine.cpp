@@ -148,7 +148,6 @@ struct Engine::Impl {
             tts_context_scope context_scope(synthesis_context);
             const auto started = std::chrono::steady_clock::now();
             std::vector<int32_t> text_tokens;
-            std::vector<long long> token_us;
             try {
                 const int n_threads = threads(opts.n_threads);
                 std::mt19937 rng(opts.seed);
@@ -180,7 +179,18 @@ struct Engine::Impl {
                 bool ready_emitted = false;
                 std::vector<int32_t> out;
                 out.reserve((size_t)opts.n_predict + 1);
-                token_us.reserve((size_t)opts.n_predict + 1);
+                int32_t pending_mtl = -1;
+                auto publish = [&](int32_t value) {
+                    if (value < 0 || value >= model.hparams.start_speech_token ||
+                        value == model.hparams.stop_speech_token) return;
+                    std::lock_guard lock(mu);
+                    if (model.hparams.variant == CHBX_VARIANT_MTL) {
+                        if (pending_mtl >= 0) tokens.push_back(pending_mtl);
+                        pending_mtl = value;
+                    } else tokens.push_back(value);
+                    tts_emit("t3.progress", " tokens=" + std::to_string(tokens.size()));
+                    cv.notify_all();
+                };
                 auto                 emit_ready = [&] {
                     if (ready_emitted || out.empty()) return;
                     const double ready_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -197,11 +207,7 @@ struct Engine::Impl {
                     token = sample_next_token_ex(logits, out, sp, rng);
                 }
                 out.push_back(token);
-                token_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
-                {
-                    std::lock_guard lock(mu);
-                    tokens = out;
-                }
+                publish(token);
                 emit_ready();
                 cv.notify_all();
 
@@ -220,11 +226,7 @@ struct Engine::Impl {
                         token = sample_next_token_ex(logits, out, sp, rng);
                     }
                     out.push_back(token);
-                    token_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
-                    {
-                        std::lock_guard lock(mu);
-                        tokens.push_back(token);
-                    }
+                    publish(token);
                     emit_ready();
                     cv.notify_all();
                 }
@@ -232,22 +234,11 @@ struct Engine::Impl {
                 const bool eos = token == model.hparams.stop_speech_token;
                 if (!eos) throw std::runtime_error("streaming T3 stopped without EOS");
                 std::vector<int32_t> logged_tokens;
-                std::vector<long long> logged_us;
                 {
                     std::unique_lock lock(mu);
-                    if (eos && !tokens.empty()) {
-                        tokens.pop_back(); token_us.pop_back();
-                        if (model.hparams.variant == CHBX_VARIANT_MTL && tokens.size() > 1) { tokens.pop_back(); token_us.pop_back(); }
-                    }
-                    if (model.hparams.variant != CHBX_VARIANT_MTL) {
-                        const int32_t vocab = model.hparams.start_speech_token;
-                        std::size_t write = 0;
-                        for (std::size_t read = 0; read < tokens.size(); ++read) if (tokens[read] >= 0 && tokens[read] < vocab) {
-                            tokens[write] = tokens[read]; token_us[write] = token_us[read]; ++write;
-                        }
-                        tokens.resize(write); token_us.resize(write);
-                    }
-                    logged_tokens = tokens; logged_us = token_us;
+                    if (tokens.empty() && pending_mtl >= 0) tokens.push_back(pending_mtl);
+                    logged_tokens = tokens;
+                    tts_emit("t3.eos", " tokens=" + std::to_string(tokens.size()));
                     t3_done = true;
                 }
                 cv.notify_all();
@@ -260,12 +251,11 @@ struct Engine::Impl {
                 const bool was_cancelled = cancelled.load(std::memory_order_relaxed);
                 std::vector<int32_t> partial;
                 { std::unique_lock lock(mu); partial = tokens; }
-                if (token_us.size() > partial.size()) token_us.resize(partial.size());
                 tts_emit("t3", std::string(" tokens=") + std::to_string(partial.size())
                     + " ms=" + std::to_string((int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + 0.5))
                     + " stop=" + (was_cancelled ? "cancelled" : "error"));
-                t3_failed.store(true, std::memory_order_relaxed);
-                { std::unique_lock lock(mu); t3_error = e.what(); t3_done = true; }
+                { std::unique_lock lock(mu); t3_error = e.what(); t3_failed.store(true); t3_done = true; }
+                cancelled.store(true, std::memory_order_relaxed);
                 cv.notify_all();
             }
         });
@@ -284,31 +274,40 @@ struct Engine::Impl {
         s.cancel = &cancelled;
 
         try {
-            std::vector<int32_t> prefix;
-            {
-                std::unique_lock lock(mu);
-                cv.wait(lock, [&] { return t3_failed.load(std::memory_order_relaxed) || t3_done; });
-                if (t3_failed.load(std::memory_order_relaxed)) throw std::runtime_error(t3_error);
-                prefix = tokens;
+            s3gen_piece_state state;
+            s.state = &state;
+            s.first_piece = (index <= 0);
+            for (;;) {
+                std::vector<int32_t> window;
+                {
+                    std::unique_lock lock(mu);
+                    cv.wait(lock, [&] { return t3_done || tokens.size() >= (size_t)state.token_end + 28; });
+                    if (t3_failed.load()) throw std::runtime_error(t3_error);
+                    check();
+                    if ((int)tokens.size() == state.token_end) break;
+                    s.token_start = std::max(0, state.token_end - 25);
+                    s.token_end = t3_done && (int)tokens.size() - state.token_end <= 28
+                        ? (int)tokens.size() : state.token_end + 25;
+                    s.final = t3_done && s.token_end == (int)tokens.size();
+                    const int window_end = s.final ? s.token_end : s.token_end + 3;
+                    window.assign(tokens.begin() + s.token_start, tokens.begin() + window_end);
+                }
+                std::vector<float> pcm;
+                s.pcm_out = &pcm;
+                s3gen_synthesize(window, s);
+                check();
+                if (cb) cb(index, pcm.data(), pcm.size(), s.chunk_id, s.final);
+                ++s.chunk_id;
+                if (s.final) break;
             }
             join(t3_thread);
-            if (prefix.empty()) return;
-            std::vector<float> pcm;
-        s.pcm_out = &pcm;
-        s.final = true;
-        s.chunk_id = 0;
-        s.first_piece = (index <= 0);
-        s.skip_mel_frames = 0;
-            s.token_start = 0;
-            s.token_end = (int)prefix.size();
-            s3gen_synthesize(prefix, s);
-            check();
-            if (cb) cb(index, pcm.data(), pcm.size(), 0, true);
             return;
         } catch (...) {
+            const bool producer_failed = t3_failed.load();
             cancelled.store(true, std::memory_order_relaxed);
             cv.notify_all();
             join(t3_thread);
+            if (producer_failed) throw std::runtime_error(t3_error);
             throw;
         }
     }
