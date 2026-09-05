@@ -3,9 +3,12 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+constexpr int kSpeechHistoryTokens = 25;
+constexpr int kSpeechLookaheadTokens = 3;
+constexpr int kSamplesPerToken = 960;
 struct s3gen_piece_state {
     int token_end = 0;
-    // Channel-major mel and sample-major excitation for the preceding 25 tokens.
+    // Channel-major mel and sample-major excitation for the preceding history tokens.
     std::vector<float> mel, source, pending_pcm;
     std::vector<double> phase;
     double encoder_ms = 0, cfm_ms = 0, f0_ms = 0, stft_ms = 0, hift_ms = 0, pipeline_ms = 0;

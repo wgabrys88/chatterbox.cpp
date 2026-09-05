@@ -61,6 +61,14 @@ std::string elapsed_ms(mono_clock::time_point a, mono_clock::time_point b) {
     return std::to_string((int)std::chrono::duration<double, std::milli>(a - b).count());
 }
 
+bool socket_has_data(SOCKET socket) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(socket, &fds);
+    timeval tv{0, 0};
+    return select(0, &fds, nullptr, nullptr, &tv) > 0;
+}
+
 struct wire_writer {
     SOCKET socket;
     std::mutex mutex;
@@ -147,63 +155,83 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
             tts_emit("synthesis.cancelled", " state=queued");
         }
     };
-    auto finish_piece = [&](const request_t& request, response_kind kind, const std::string& message = {}) {
-        writer.terminal(kind, request, message);
-        active.reset();
-    };
-
     std::thread synth([&] {
         std::optional<request_t> previous;
         mono_clock::time_point previous_ended{};
         try {
         for (;;) {
-            request_t request;
+            std::vector<request_t> batch;
             {
                 std::unique_lock lock(mutex);
                 changed.wait(lock, [&] { return stop.load(std::memory_order_acquire) || !pending.empty(); });
                 if (stop.load(std::memory_order_acquire) && pending.empty()) break;
-                request = std::move(pending.front()); pending.pop_front(); active = request;
+                const auto epoch = pending.front().epoch;
+                while (!pending.empty() && pending.front().epoch == epoch) {
+                    batch.push_back(std::move(pending.front()));
+                    pending.pop_front();
+                }
+                active = batch.front();
                 tts.begin_synthesis();
             }
-            tts_context_scope context(request.epoch, request.response, request.piece);
             const auto started = mono_clock::now();
-            tts_emit("synthesis.start", std::string(" chars=") + std::to_string(request.text.size()));
+            for (const auto& request : batch) {
+                tts_context_scope context(request.epoch, request.response, request.piece);
+                tts_emit("synthesis.start", std::string(" chars=") + std::to_string(request.text.size()));
+            }
+            tts_context_scope context(batch.front().epoch, batch.front().response, batch.front().piece);
+            std::vector<char> finished(batch.size(), 0);
+            auto terminal_remaining = [&](response_kind kind, const std::string& message = {}) {
+                std::lock_guard lock(mutex);
+                for (size_t i = 0; i < batch.size(); ++i) {
+                    if (finished[i]) continue;
+                    finished[i] = 1;
+                    writer.terminal(kind, batch[i], message);
+                }
+                active.reset();
+            };
             try {
-                std::uint32_t chunks = 0; bool first_pcm = true;
-                tts.synthesize_pieces_streaming({request.text}, [&](int, const float* data, std::size_t size, int chunk, bool) {
+                bool first_pcm = true;
+                std::vector<std::string> texts;
+                texts.reserve(batch.size());
+                for (const auto& request : batch) texts.push_back(request.text);
+                tts.synthesize_pieces_streaming(texts, [&](int index, const float* data, std::size_t size, int chunk, bool final) {
+                    if (index < 0 || (size_t)index >= batch.size()) return;
+                    const auto& request = batch[(size_t)index];
                     if (live_epoch.load(std::memory_order_acquire) != request.epoch) {
                         if (size) tts_emit("synthesis.cancelled", std::string(" state=pcm-after-advance bytes=") + std::to_string(size * sizeof(std::int16_t)));
                         return;
                     }
-                    chunks = std::max(chunks, static_cast<std::uint32_t>(chunk + 1));
-                    if (!size) return;
-                    if (first_pcm) { first_pcm = false; tts_emit("synthesis.first_result", std::string(" bytes=") + std::to_string(size * sizeof(std::int16_t)) + " ms=" + elapsed_ms(mono_clock::now(), started)); }
-                    writer.pcm(request, static_cast<std::uint32_t>(chunk), data, size);
+                    if (size) {
+                        if (first_pcm) { first_pcm = false; tts_emit("synthesis.first_result", std::string(" bytes=") + std::to_string(size * sizeof(std::int16_t)) + " ms=" + elapsed_ms(mono_clock::now(), started)); }
+                        writer.pcm(request, static_cast<std::uint32_t>(chunk), data, size);
+                    }
+                    if (final) {
+                        std::lock_guard lock(mutex);
+                        const bool completed = live_epoch.load(std::memory_order_acquire) == request.epoch;
+                        finished[(size_t)index] = 1;
+                        writer.terminal(completed ? response_kind::done : response_kind::cancelled, request);
+                        previous_ended = mono_clock::now(); previous = request;
+                        tts_context_scope piece_context(request.epoch, request.response, request.piece);
+                        if (completed) tts_emit("synthesis.completed", std::string(" ms=") + elapsed_ms(previous_ended, started) + " terminal=done");
+                        else tts_emit("synthesis.cancelled", " state=active");
+                    }
                 });
-                bool completed = false;
-                {
-                    std::lock_guard lock(mutex);
-                    completed = live_epoch.load(std::memory_order_acquire) == request.epoch;
-                    finish_piece(request, completed ? response_kind::done : response_kind::cancelled);
-                }
-                previous_ended = mono_clock::now(); previous = request;
-                if (completed) tts_emit("synthesis.completed", std::string(" ms=") + elapsed_ms(previous_ended, started) + " terminal=done");
-                else tts_emit("synthesis.cancelled", " state=active");
+                terminal_remaining(response_kind::cancelled);
             } catch (const std::exception& error) {
                 bool cancelled = false;
                 {
                     std::lock_guard lock(mutex);
-                    cancelled = live_epoch.load(std::memory_order_acquire) != request.epoch || stop.load(std::memory_order_acquire);
-                    finish_piece(request, cancelled ? response_kind::cancelled : response_kind::error, cancelled ? std::string{} : error.what());
+                    cancelled = live_epoch.load(std::memory_order_acquire) != batch.front().epoch || stop.load(std::memory_order_acquire);
                     if (!cancelled) { failed = true; stop.store(true, std::memory_order_release); shutdown(client, SD_RECEIVE); }
                 }
-                previous_ended = mono_clock::now(); previous = request;
+                previous_ended = mono_clock::now(); previous = batch.front();
                 if (cancelled) tts_emit("synthesis.cancelled", " state=active");
                 else tts_emit("synthesis.failed", " error=" + std::string(error.what()));
+                terminal_remaining(cancelled ? response_kind::cancelled : response_kind::error, cancelled ? std::string{} : error.what());
             }
             {
                 std::lock_guard lock(mutex);
-                if (active && active->epoch == request.epoch && active->response == request.response && active->piece == request.piece) active.reset();
+                if (active && active->epoch == batch.front().epoch) active.reset();
             }
             changed.notify_all();
         }
@@ -221,6 +249,12 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
     try {
         request_t request;
         while (!close_requested) {
+            bool notify_synth = false;
+            {
+                std::lock_guard lock(mutex);
+                notify_synth = !pending.empty() && !socket_has_data(client);
+            }
+            if (notify_synth) changed.notify_one();
             tts_emit("serve.recv-wait", " entering");
             if (!receive(client, request)) {
                 tts_emit("serve.recv-false", " reason=client_closed");
@@ -237,7 +271,6 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
                     pending.push_back(request);
                 }
                 { tts_context_scope context(request.epoch, request.response, request.piece); tts_emit("synthesis.queued"); }
-                changed.notify_one();
                 continue;
             }
 

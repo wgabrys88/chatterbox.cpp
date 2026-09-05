@@ -1250,14 +1250,14 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     auto& state = *opts.state;
     const int history_tokens = state.token_end - opts.token_start;
     const int output_tokens = opts.token_end - opts.token_start;
-    if (history_tokens < 0 || history_tokens > 25 || output_tokens <= history_tokens ||
-        (int)speech_tokens.size() != output_tokens + (opts.final ? 0 : 3))
+    if (history_tokens < 0 || history_tokens > kSpeechHistoryTokens || output_tokens <= history_tokens ||
+        (int)speech_tokens.size() != output_tokens + (opts.final ? 0 : kSpeechLookaheadTokens))
         throw std::runtime_error("S3Gen token range invalid");
     if (opts.prompt_token.empty() || opts.embedding.empty() || opts.prompt_feat.empty() || opts.prompt_rows <= 0)
         throw std::runtime_error("S3Gen voice conditioning missing");
     g_n_threads = opts.n_threads;
     constexpr int sr = 24000;
-    constexpr int pre_lookahead_len = 3;
+    constexpr int pre_lookahead_len = kSpeechLookaheadTokens;
     const int seed = opts.seed;
     std::vector<float> emb_data = opts.embedding;
     std::vector<int32_t> pt_data = opts.prompt_token;
@@ -1385,7 +1385,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     for (int i = 0; i < T_mel; ++i)
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, m_hift.hift_linear_w, m_hift.hift_linear_b,
-        (uint32_t)(seed + 1), state, history_frames * upsample, (int64_t)opts.token_start * 960);
+        (uint32_t)(seed + 1), state, history_frames * upsample, (int64_t)opts.token_start * kSamplesPerToken);
     const double stft_started = now_ms();
     auto s_stft = run_stft(m_hift, src); stft_ms = now_ms() - stft_started;
     check_cancel(opts.cancel);
@@ -1404,15 +1404,15 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
             wav[n_trim + i] *= w;
         }
     }
-    if ((int)wav.size() != output_tokens * 960) throw std::runtime_error("S3Gen waveform range mismatch");
-    const int retained_frames = std::min(50, T_mel);
+    if ((int)wav.size() != output_tokens * kSamplesPerToken) throw std::runtime_error("S3Gen waveform range mismatch");
+    const int retained_frames = std::min(2 * kSpeechHistoryTokens, T_mel);
     state.mel.resize(MEL * retained_frames);
     for (int m2 = 0; m2 < MEL; ++m2)
         std::copy_n(mel.data() + m2 * T_mel + T_mel - retained_frames, retained_frames,
             state.mel.data() + m2 * retained_frames);
     state.source.assign(src.end() - retained_frames * upsample, src.end());
     const size_t pending = state.pending_pcm.size();
-    const size_t begin = history_tokens * 960 - pending;
+    const size_t begin = history_tokens * kSamplesPerToken - pending;
     for (size_t i = 0; i < pending; ++i) {
         const float weight = 0.5f - 0.5f * std::cos((float)M_PI * (i + 1) / pending);
         wav[begin + i] = state.pending_pcm[i] * (1.0f - weight) + wav[begin + i] * weight;
@@ -1431,7 +1431,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     state.pipeline_ms += pipeline_total;
     state.samples += (int)wav.size();
     state.prompt_tokens = n_prompt;
-    state.speech_tokens = opts.token_end;
+    state.speech_tokens = output_tokens - history_tokens;
     *opts.pcm_out = std::move(wav);
 }
 void s3gen_preload(const std::string& path, int n_gpu_layers, bool fastconv) {

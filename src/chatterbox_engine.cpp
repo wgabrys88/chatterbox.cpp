@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -49,7 +50,10 @@ struct Engine::Impl {
     std::atomic<bool> cancelled{false};
     std::uint32_t last_epoch = 0;
     int pieces_in_session = 0;
+    s3gen_piece_state acoustic;
+    std::vector<int32_t> speech_history;
     explicit Impl(const EngineOptions& o) : opts(o) {}
+    void reset_acoustics() { acoustic = {}; speech_history.clear(); }
     void init() {
         if (!std::filesystem::exists(opts.t3_gguf_path)) throw std::runtime_error("T3 GGUF missing");
         if (!std::filesystem::exists(opts.s3gen_gguf_path)) throw std::runtime_error("S3Gen GGUF missing");
@@ -133,22 +137,25 @@ struct Engine::Impl {
         if (!compute_embedding_native(opts.reference_audio, opts.s3gen_gguf_path, embedding, false)) throw std::runtime_error("CAMPPlus failed");
         if (prompt_token.empty() || prompt_feat.empty() || embedding.empty()) throw std::runtime_error("voice conditioning empty");
     }
-    void piece_streaming(const std::string& text, int index, const PieceCallback& cb) {
-        if (text.empty()) return;
-        const auto ctx = tts_get_context();
-        const std::uint32_t epoch = ctx.valid ? ctx.epoch : 0;
-        if (epoch != last_epoch) { pieces_in_session = 0; last_epoch = epoch; }
+    struct T3Job {
         std::mutex mu;
         std::condition_variable cv;
         std::vector<int32_t> tokens;
-        bool t3_done = false;
-        std::atomic<bool> t3_failed{false};
-        std::string t3_error;
-        const auto synthesis_context = tts_get_context();
-        std::atomic<long long> t3_end_us{0};
+        bool done = false;
+        std::atomic<bool> failed{false};
+        std::string error;
+        std::thread thread;
+        std::atomic<long long> start_us{0};
+        std::atomic<long long> end_us{0};
+        void join_thread() { join(thread); }
+    };
+    void launch_t3(T3Job& job, const std::string& text, int index) {
+        auto synthesis_context = tts_get_context();
+        if (index >= 0) { synthesis_context.valid = true; synthesis_context.piece_id = (std::uint32_t)index; }
         if (index >= 0) tts_session_begin_if_needed();
-        std::thread t3_thread([&, synthesis_context] {
+        job.thread = std::thread([this, &job, text, synthesis_context] {
             tts_context_scope context_scope(synthesis_context);
+            job.start_us.store(tts_mono_us(), std::memory_order_relaxed);
             const auto started = std::chrono::steady_clock::now();
             std::vector<int32_t> text_tokens;
             try {
@@ -185,12 +192,12 @@ struct Engine::Impl {
                 auto publish = [&](int32_t value) {
                     if (value < 0 || value >= model.hparams.start_speech_token ||
                         value == model.hparams.stop_speech_token) return;
-                    std::lock_guard lock(mu);
+                    std::lock_guard lock(job.mu);
                     if (model.hparams.variant == CHBX_VARIANT_MTL) {
-                        if (pending_mtl >= 0) tokens.push_back(pending_mtl);
+                        if (pending_mtl >= 0) job.tokens.push_back(pending_mtl);
                         pending_mtl = value;
-                    } else tokens.push_back(value);
-                    cv.notify_all();
+                    } else job.tokens.push_back(value);
+                    job.cv.notify_all();
                 };
                 if (model.hparams.variant == CHBX_VARIANT_MTL) {
                     std::vector<float> logits_c, logits_u;
@@ -203,7 +210,7 @@ struct Engine::Impl {
                 }
                 out.push_back(token);
                 publish(token);
-                cv.notify_all();
+                job.cv.notify_all();
 
                 for (int i = 0; i < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++i) {
                     check();
@@ -221,20 +228,20 @@ struct Engine::Impl {
                     }
                     out.push_back(token);
                     publish(token);
-                    cv.notify_all();
+                    job.cv.notify_all();
                 }
 
                 const bool eos = token == model.hparams.stop_speech_token;
                 if (!eos) throw std::runtime_error("streaming T3 stopped without EOS");
                 std::vector<int32_t> logged_tokens;
                 {
-                    std::unique_lock lock(mu);
-                    if (tokens.empty() && pending_mtl >= 0) tokens.push_back(pending_mtl);
-                    logged_tokens = tokens;
-                    t3_done = true;
+                    std::unique_lock lock(job.mu);
+                    if (job.tokens.empty() && pending_mtl >= 0) job.tokens.push_back(pending_mtl);
+                    logged_tokens = job.tokens;
+                    job.done = true;
                 }
-                cv.notify_all();
-                t3_end_us.store(tts_mono_us(), std::memory_order_relaxed);
+                job.cv.notify_all();
+                job.end_us.store(tts_mono_us(), std::memory_order_relaxed);
                 const double elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
                 const std::string stop_reason = repeat_stopped ? "repeat" : (eos ? "eos" : "window");
                 tts_emit_piece("t3", std::string(" tokens=") + std::to_string(logged_tokens.size())
@@ -243,17 +250,50 @@ struct Engine::Impl {
             } catch (const std::exception& e) {
                 const bool was_cancelled = cancelled.load(std::memory_order_relaxed);
                 std::vector<int32_t> partial;
-                { std::unique_lock lock(mu); partial = tokens; }
-                t3_end_us.store(tts_mono_us(), std::memory_order_relaxed);
+                { std::unique_lock lock(job.mu); partial = job.tokens; }
+                job.end_us.store(tts_mono_us(), std::memory_order_relaxed);
                 tts_emit_piece("t3", std::string(" tokens=") + std::to_string(partial.size())
                     + " ms=" + std::to_string((int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + 0.5))
                     + " stop=" + (was_cancelled ? "cancelled" : "error"));
-                { std::unique_lock lock(mu); t3_error = e.what(); t3_failed.store(true); t3_done = true; }
+                { std::unique_lock lock(job.mu); job.error = e.what(); job.failed.store(true); job.done = true; }
                 cancelled.store(true, std::memory_order_relaxed);
-                cv.notify_all();
+                job.cv.notify_all();
             }
         });
-
+    }
+    void finish_t3(T3Job& job) {
+        job.join_thread();
+        if (job.failed.load()) throw std::runtime_error(job.error);
+    }
+    void emit_s3_line() {
+        if (acoustic.samples <= 0) return;
+        const double audio_ms = 1000.0 * acoustic.samples / 24000.0;
+        char rtf[32];
+        std::snprintf(rtf, sizeof(rtf), "%.3f", audio_ms > 0.0 ? acoustic.pipeline_ms / audio_ms : 0.0);
+        tts_emit_piece("s3",
+            std::string(" encoder_ms=") + std::to_string((int)(acoustic.encoder_ms + 0.5))
+            + " cfm_ms=" + std::to_string((int)(acoustic.cfm_ms + 0.5))
+            + " f0_ms=" + std::to_string((int)(acoustic.f0_ms + 0.5))
+            + " stft_ms=" + std::to_string((int)(acoustic.stft_ms + 0.5))
+            + " hift_ms=" + std::to_string((int)(acoustic.hift_ms + 0.5))
+            + " audio_ms=" + std::to_string((int)(audio_ms + 0.5))
+            + " rtf=" + rtf
+            + " samples=" + std::to_string(acoustic.samples)
+            + " prompt_tokens=" + std::to_string(acoustic.prompt_tokens)
+            + " speech_tokens=" + std::to_string(acoustic.speech_tokens));
+    }
+    void run_s3(const std::vector<int32_t>& tokens, int index, const PieceCallback& cb) {
+        auto synthesis_context = tts_get_context();
+        if (index >= 0) { synthesis_context.valid = true; synthesis_context.piece_id = (std::uint32_t)index; }
+        tts_context_scope context_scope(synthesis_context);
+        if (tokens.empty()) throw std::runtime_error("S3Gen speech tokens empty");
+        acoustic.encoder_ms = acoustic.cfm_ms = acoustic.f0_ms = acoustic.stft_ms = acoustic.hift_ms = acoustic.pipeline_ms = 0;
+        acoustic.samples = acoustic.prompt_tokens = acoustic.speech_tokens = 0;
+        acoustic.token_end = (int)speech_history.size();
+        std::vector<int32_t> window;
+        window.reserve(speech_history.size() + tokens.size());
+        window.insert(window.end(), speech_history.begin(), speech_history.end());
+        window.insert(window.end(), tokens.begin(), tokens.end());
         s3gen_synthesize_opts s;
         s.s3gen_gguf_path = opts.s3gen_gguf_path;
         s.seed = opts.seed;
@@ -266,91 +306,111 @@ struct Engine::Impl {
         s.embedding = embedding;
         s.prompt_token = prompt_token;
         s.cancel = &cancelled;
-
-        try {
-            s3gen_piece_state state;
-            s.state = &state;
-            s.first_piece = (index <= 0);
-            long long s3_first_us = 0;
-            for (;;) {
-                std::vector<int32_t> window;
-                {
-                    std::unique_lock lock(mu);
-                    cv.wait(lock, [&] { return t3_done || tokens.size() >= (size_t)state.token_end + 28; });
-                    if (t3_failed.load()) throw std::runtime_error(t3_error);
-                    check();
-                    if ((int)tokens.size() == state.token_end) break;
-                    s.token_start = std::max(0, state.token_end - 25);
-                    s.token_end = t3_done && (int)tokens.size() - state.token_end <= 28
-                        ? (int)tokens.size() : state.token_end + 25;
-                    s.final = t3_done && s.token_end == (int)tokens.size();
-                    const int window_end = s.final ? s.token_end : s.token_end + 3;
-                    window.assign(tokens.begin() + s.token_start, tokens.begin() + window_end);
+        s.state = &acoustic;
+        s.token_start = 0;
+        s.token_end = (int)window.size();
+        s.final = true;
+        s.first_piece = (index <= 0);
+        s.chunk_id = 0;
+        std::vector<float> pcm;
+        s.pcm_out = &pcm;
+        s3gen_synthesize(window, s);
+        check();
+        if (!pcm.empty()) tts_session_note_first_audio();
+        if (cb) cb(index, pcm.data(), pcm.size(), 0, true);
+        if ((int)window.size() > kSpeechHistoryTokens)
+            speech_history.assign(window.end() - kSpeechHistoryTokens, window.end());
+        else
+            speech_history = window;
+        emit_s3_line();
+        if (index >= 0) tts_session_touch_end();
+    }
+    struct PieceWork {
+        int session_index = 0;
+        int cb_index = 0;
+        std::string text;
+    };
+    void pipeline_pieces(const std::vector<PieceWork>& work, const PieceCallback& cb) {
+        if (work.empty()) return;
+        auto job = std::make_unique<T3Job>();
+        launch_t3(*job, work[0].text, work[0].session_index);
+        for (size_t i = 0; i < work.size(); ++i) {
+            finish_t3(*job);
+            std::vector<int32_t> tokens;
+            { std::lock_guard lock(job->mu); tokens = std::move(job->tokens); }
+            std::unique_ptr<T3Job> next;
+            if (i + 1 < work.size()) {
+                next = std::make_unique<T3Job>();
+                launch_t3(*next, work[i + 1].text, work[i + 1].session_index);
+            }
+            const long long s3_t0 = tts_mono_us();
+            try {
+                run_s3(tokens, work[i].session_index, [&](int, const float* pcm, std::size_t n, int chunk, bool final) {
+                    if (cb) cb(work[i].cb_index, pcm, n, chunk, final);
+                });
+            } catch (...) {
+                cancelled.store(true, std::memory_order_relaxed);
+                if (next) {
+                    next->cv.notify_all();
+                    next->join_thread();
+                    if (next->failed.load()) throw std::runtime_error(next->error);
                 }
-                std::vector<float> pcm;
-                s.pcm_out = &pcm;
-                if (!s3_first_us) s3_first_us = tts_mono_us();
-                s3gen_synthesize(window, s);
-                check();
-                if (!pcm.empty()) tts_session_note_first_audio();
-                if (cb) cb(index, pcm.data(), pcm.size(), s.chunk_id, s.final);
-                ++s.chunk_id;
-                if (s.final) break;
+                throw;
             }
-            join(t3_thread);
-            if (s3_first_us) {
-                const long long t3e = t3_end_us.load(std::memory_order_relaxed);
-                if (t3e > s3_first_us) tts_session_add_overlap((double)(t3e - s3_first_us) / 1000.0);
+            const long long s3_t1 = tts_mono_us();
+            if (next) {
+                const long long t3s = next->start_us.load(std::memory_order_relaxed);
+                long long t3e = next->end_us.load(std::memory_order_relaxed);
+                if (!t3e) t3e = s3_t1;
+                const long long lo = std::max(s3_t0, t3s);
+                const long long hi = std::min(s3_t1, t3e);
+                if (hi > lo) tts_session_add_overlap((double)(hi - lo) / 1000.0);
+                job = std::move(next);
             }
-            if (state.samples > 0) {
-                const double audio_ms = 1000.0 * state.samples / 24000.0;
-                char rtf[32];
-                std::snprintf(rtf, sizeof(rtf), "%.3f", audio_ms > 0.0 ? state.pipeline_ms / audio_ms : 0.0);
-                tts_emit_piece("s3",
-                    std::string(" encoder_ms=") + std::to_string((int)(state.encoder_ms + 0.5))
-                    + " cfm_ms=" + std::to_string((int)(state.cfm_ms + 0.5))
-                    + " f0_ms=" + std::to_string((int)(state.f0_ms + 0.5))
-                    + " stft_ms=" + std::to_string((int)(state.stft_ms + 0.5))
-                    + " hift_ms=" + std::to_string((int)(state.hift_ms + 0.5))
-                    + " audio_ms=" + std::to_string((int)(audio_ms + 0.5))
-                    + " rtf=" + rtf
-                    + " samples=" + std::to_string(state.samples)
-                    + " prompt_tokens=" + std::to_string(state.prompt_tokens)
-                    + " speech_tokens=" + std::to_string(state.speech_tokens));
-            }
-            if (index >= 0) tts_session_touch_end();
-            return;
-        } catch (...) {
-            const bool producer_failed = t3_failed.load();
-            cancelled.store(true, std::memory_order_relaxed);
-            cv.notify_all();
-            join(t3_thread);
-            if (producer_failed) throw std::runtime_error(t3_error);
-            throw;
         }
+    }
+    void piece_streaming(const std::string& text, int index, const PieceCallback& cb) {
+        if (text.empty()) return;
+        pipeline_pieces({{index, 0, text}}, cb);
     }
 };
 Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(); }
 Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
-void Engine::begin_synthesis() { pimpl_->cancelled.store(false, std::memory_order_release); }
+void Engine::begin_synthesis() {
+    pimpl_->cancelled.store(false, std::memory_order_release);
+    pimpl_->pieces_in_session = 0;
+    pimpl_->reset_acoustics();
+}
 void Engine::synthesize_pieces_streaming(const std::vector<std::string>& texts, const PieceCallback& cb) {
-    for (size_t i = 0; i < texts.size(); ++i) {
-        if (texts[i].empty()) continue;
+    const auto ctx = tts_get_context();
+    const std::uint32_t epoch = ctx.valid ? ctx.epoch : 0;
+    if (epoch != pimpl_->last_epoch) {
+        pimpl_->pieces_in_session = 0;
+        pimpl_->last_epoch = epoch;
+        pimpl_->reset_acoustics();
+    }
+    std::vector<Impl::PieceWork> work;
+    int cb_index = 0;
+    for (const auto& text : texts) {
+        if (text.empty()) continue;
         pimpl_->check();
-        pimpl_->piece_streaming(texts[i], (int)pimpl_->pieces_in_session, cb);
+        work.push_back({pimpl_->pieces_in_session, cb_index++, text});
         ++pimpl_->pieces_in_session;
     }
+    pimpl_->pipeline_pieces(work, cb);
 }
 void Engine::warm_up() {
     tts_emit("warmup.start", " begin");
     begin_synthesis();
+    pimpl_->reset_acoustics();
     std::size_t samples = 0;
     pimpl_->piece_streaming("Warm up.", -1, [&](int, const float*, std::size_t n, int, bool) { samples += n; });
     if (!samples) throw std::runtime_error("warm-up produced no PCM");
     if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
     pimpl_->pieces_in_session = 0;
+    pimpl_->reset_acoustics();
     begin_synthesis();
     tts_emit("warmup.completed", std::string(" samples=") + std::to_string(samples));
 }
