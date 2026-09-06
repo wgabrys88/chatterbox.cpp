@@ -34,8 +34,12 @@ extern "C" void ggml_vk_overlap_counters(ggml_backend_t, unsigned long long *, u
 namespace tts_cpp::chatterbox {
 using namespace detail;
 namespace {
-bool third_consecutive(const std::vector<int32_t>& generated, int32_t token) {
-    return generated.size() >= 2 && generated[generated.size() - 1] == token && generated[generated.size() - 2] == token;
+bool fifth_consecutive(const std::vector<int32_t>& generated, int32_t token) {
+    if (generated.size() < 4) return false;
+    return generated[generated.size() - 1] == token &&
+           generated[generated.size() - 2] == token &&
+           generated[generated.size() - 3] == token &&
+           generated[generated.size() - 4] == token;
 }
 int threads(int n) {
     if (n > 0) return n;
@@ -85,7 +89,7 @@ struct Engine::Impl {
     s3gen_piece_state acoustic;
     std::vector<int32_t> speech_history;
     explicit Impl(const EngineOptions& o) : opts(o) {}
-    void reset_acoustics() { acoustic = {}; speech_history.clear(); }
+    void reset_acoustics() { acoustic = {}; speech_history.clear(); fprintf(stderr, "s3.history_cleared\n"); }
     void init() {
         if (!std::filesystem::exists(opts.t3_gguf_path)) throw std::runtime_error("T3 GGUF missing");
         if (!std::filesystem::exists(opts.s3gen_gguf_path)) throw std::runtime_error("S3Gen GGUF missing");
@@ -251,7 +255,7 @@ struct Engine::Impl {
                         std::vector<float> logits_c, logits_u;
                         if (!eval_step_mtl(model, allocr, n_threads, n_past++, token, logits_c, logits_u)) throw std::runtime_error("MTL step failed");
                         token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
-                        if (third_consecutive(out, token)) {
+                        if (fifth_consecutive(out, token)) {
                             repeat_token = token; repeat_stopped = true;
                             fprintf(stderr, "t3.repeat_detected: token=%d position=%zu repeat_penalty=%.2f cfg_weight=%.2f\n",
                                     token, out.size(), sp.repeat_penalty, sp.cfg_weight);
@@ -361,13 +365,8 @@ struct Engine::Impl {
         check();
         if (!pcm.empty()) tts_session_note_first_audio();
         if (cb) cb(index, pcm.data(), pcm.size(), 0, true);
-        if ((int)window.size() > kSpeechHistoryTokens) {
-            speech_history.assign(window.end() - kSpeechHistoryTokens, window.end());
-            fprintf(stderr, "s3.history_trim: kept=%d window_size=%d\n", kSpeechHistoryTokens, (int)window.size());
-        } else {
-            speech_history = window;
-            fprintf(stderr, "s3.history_full: size=%d\n", (int)window.size());
-        }
+        speech_history.clear();
+        fprintf(stderr, "s3.history_cleared_after_chunk\n");
         emit_s3_line();
         if (index >= 0) tts_session_touch_end();
     }
