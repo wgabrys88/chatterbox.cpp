@@ -205,6 +205,9 @@ struct Engine::Impl {
                 sp.temp = opts.temperature;
                 sp.repeat_penalty = opts.repeat_penalty;
                 sp.cfg_weight = opts.cfg_weight;
+                
+                fprintf(stderr, "t3.start: text_len=%d text='%.80s...' n_predict=%d repeat_penalty=%.2f cfg_weight=%.2f temp=%.2f top_k=%d top_p=%.2f\n",
+                        (int)text.size(), text.c_str(), opts.n_predict, sp.repeat_penalty, sp.cfg_weight, sp.temp, sp.top_k, sp.top_p);
 
                 if (model.hparams.variant == CHBX_VARIANT_MTL) {
                     if (!mtl_tok) throw std::runtime_error("MTL tokenizer missing");
@@ -218,6 +221,19 @@ struct Engine::Impl {
                     text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
                 }
                 if (text_tokens.empty()) throw std::runtime_error("empty T3 text tokens");
+                
+                fprintf(stderr, "t3.tokenized: text_tokens_count=%d first_5=[%d,%d,%d,%d,%d] last_5=[%d,%d,%d,%d,%d]\n",
+                        (int)text_tokens.size(),
+                        text_tokens.size() > 0 ? text_tokens[0] : -1,
+                        text_tokens.size() > 1 ? text_tokens[1] : -1,
+                        text_tokens.size() > 2 ? text_tokens[2] : -1,
+                        text_tokens.size() > 3 ? text_tokens[3] : -1,
+                        text_tokens.size() > 4 ? text_tokens[4] : -1,
+                        text_tokens.size() > 0 ? text_tokens[text_tokens.size()-1] : -1,
+                        text_tokens.size() > 1 ? text_tokens[text_tokens.size()-2] : -1,
+                        text_tokens.size() > 2 ? text_tokens[text_tokens.size()-3] : -1,
+                        text_tokens.size() > 3 ? text_tokens[text_tokens.size()-4] : -1,
+                        text_tokens.size() > 4 ? text_tokens[text_tokens.size()-5] : -1);
 
                 int n_past = 0;
                 int32_t token = 0;
@@ -265,6 +281,23 @@ struct Engine::Impl {
                         std::vector<float> logits;
                         if (!eval_step(model, allocr, n_threads, n_past++, token, logits)) throw std::runtime_error("Turbo step failed");
                         token = sample_next_token_ex(logits, out, sp, rng);
+                        
+                        if (fifth_consecutive(out, token)) {
+                            repeat_token = token; repeat_stopped = true;
+                            fprintf(stderr, "t3.repeat_detected: token=%d position=%zu repeat_penalty=%.2f\n",
+                                    token, out.size(), sp.repeat_penalty);
+                            token = model.hparams.stop_speech_token;
+                        }
+                        
+                        if (out.size() >= 2 && out[out.size()-1] == out[out.size()-2]) {
+                            fprintf(stderr, "t3.adjacent_repeat: position=%zu token=%d\n", out.size(), token);
+                        }
+                        
+                        if (out.size() % 10 == 0) {
+                            float max_logit = logits.empty() ? 0.0f : *std::max_element(logits.begin(), logits.end());
+                            fprintf(stderr, "t3.token_progress: position=%zu token=%d logits_max=%.4f\n",
+                                    out.size(), token, max_logit);
+                        }
                     }
                     out.push_back(token);
                     publish(token);

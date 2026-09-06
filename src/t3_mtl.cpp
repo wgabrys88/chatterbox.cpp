@@ -1140,8 +1140,23 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
     for (size_t i = 0; i < V; ++i) {
         l[i] = logits_cond[i] + p.cfg_weight * (logits_cond[i] - logits_uncond[i]);
     }
-    fprintf(stderr, "sample_next_token_mtl: cfg_weight=%.2f repeat_penalty=%.2f logits_size=%zu generated_size=%zu\n",
-            p.cfg_weight, p.repeat_penalty, V, generated.size());
+    
+    if (generated.size() <= 5) {
+        std::vector<std::pair<int, float>> top5;
+        for (size_t i = 0; i < V; i++) {
+            top5.emplace_back((int)i, l[i]);
+        }
+        std::partial_sort(top5.begin(), top5.begin() + 5, top5.end(),
+                         [](auto& a, auto& b){ return a.second > b.second; });
+        fprintf(stderr, "t3.mtl_top5: pos=%zu [(%d,%.3f),(%d,%.3f),(%d,%.3f),(%d,%.3f),(%d,%.3f)]\n",
+                generated.size(),
+                top5[0].first, top5[0].second,
+                top5[1].first, top5[1].second,
+                top5[2].first, top5[2].second,
+                top5[3].first, top5[3].second,
+                top5[4].first, top5[4].second);
+    }
+    
     if (p.repeat_penalty != 1.0f && !generated.empty()) {
         std::set<int32_t> seen(generated.begin(), generated.end());
         for (int32_t t : seen) {
@@ -1206,8 +1221,12 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
     double cum = 0.0;
     for (size_t i = 0; i < V; ++i) {
         cum += probs[i];
-        if (cum >= r) return (int32_t) i;
+        if (cum >= r) {
+            fprintf(stderr, "t3.mtl_selected: pos=%zu token=%d\n", generated.size(), (int32_t)i);
+            return (int32_t) i;
+        }
     }
+    fprintf(stderr, "t3.mtl_selected: pos=%zu token=%d (fallback)\n", generated.size(), (int32_t)(V - 1));
     return (int32_t)(V - 1);
 }
 }
