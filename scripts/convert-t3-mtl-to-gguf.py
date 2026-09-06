@@ -30,8 +30,8 @@ START_SPEECH_TOKEN = 6561
 STOP_SPEECH_TOKEN = 6562
 START_TEXT_TOKEN = 255
 STOP_TEXT_TOKEN = 0
-MAX_TEXT_TOKENS = 2048
-MAX_SPEECH_TOKENS = 4096
+MAX_TEXT_TOKENS = 1024
+MAX_SPEECH_TOKENS = 2048
 SPEECH_COND_PROMPT_LEN = 150
 SPEAKER_EMBED_SIZE = 256
 PERCEIVER_QUERY_TOKENS = 32
@@ -45,7 +45,7 @@ ROPE_HIGH_FREQ_FACTOR = 4.0
 ROPE_ORIGINAL_MAX_POS = 8192
 N_CTX = MAX_TEXT_TOKENS + MAX_SPEECH_TOKENS + 4
 LAYER_RE = re.compile(r"^tfmr\.layers\.(\d+)\.(.+)$")
-QUANT_CHOICES = ["f16", "q8_0", "q5_0", "q4_0"]
+QUANT_CHOICES = ["f16", "q8_0", "q5_0", "q4_0", "iq4_nl"]
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Convert Chatterbox multilingual T3 weights to GGUF.")
     p.add_argument("--ckpt-dir", type=Path, help="Local checkpoint dir (downloads from HF if omitted).")

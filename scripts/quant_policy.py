@@ -10,6 +10,7 @@ QUANT_TYPE = {
     "q8_0": gguf.GGMLQuantizationType.Q8_0,
     "q5_0": gguf.GGMLQuantizationType.Q5_0,
     "q4_0": gguf.GGMLQuantizationType.Q4_0,
+    "iq4_nl": gguf.GGMLQuantizationType.IQ4_NL,
     "f16": gguf.GGMLQuantizationType.F16,
 }
 def should_quantize(name, shape, qtype):
