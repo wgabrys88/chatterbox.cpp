@@ -365,8 +365,11 @@ struct Engine::Impl {
         check();
         if (!pcm.empty()) tts_session_note_first_audio();
         if (cb) cb(index, pcm.data(), pcm.size(), 0, true);
-        speech_history.clear();
-        fprintf(stderr, "s3.history_cleared_after_chunk\n");
+        if ((int)window.size() > kSpeechHistoryTokens) {
+            speech_history.assign(window.end() - kSpeechHistoryTokens, window.end());
+        } else {
+            speech_history = window;
+        }
         emit_s3_line();
         if (index >= 0) tts_session_touch_end();
     }
