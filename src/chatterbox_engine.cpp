@@ -252,7 +252,10 @@ struct Engine::Impl {
                         if (!eval_step_mtl(model, allocr, n_threads, n_past++, token, logits_c, logits_u)) throw std::runtime_error("MTL step failed");
                         token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
                         if (third_consecutive(out, token)) {
-                            repeat_token = token; repeat_stopped = true; token = model.hparams.stop_speech_token;
+                            repeat_token = token; repeat_stopped = true;
+                            fprintf(stderr, "t3.repeat_detected: token=%d position=%zu repeat_penalty=%.2f cfg_weight=%.2f\n",
+                                    token, out.size(), sp.repeat_penalty, sp.cfg_weight);
+                            token = model.hparams.stop_speech_token;
                         }
                     } else {
                         std::vector<float> logits;
@@ -280,6 +283,8 @@ struct Engine::Impl {
                 tts_emit_piece("t3", std::string(" tokens=") + std::to_string(logged_tokens.size())
                     + " ms=" + std::to_string((int)(elapsed_ms + 0.5))
                     + " stop=" + stop_reason
+                    + " cfg_weight=" + std::to_string(opts.cfg_weight)
+                    + " repeat_penalty=" + std::to_string(opts.repeat_penalty)
                     + vk_overlap_fields(model.backend));
             } catch (const std::exception& e) {
                 const bool was_cancelled = cancelled.load(std::memory_order_relaxed);
@@ -356,10 +361,13 @@ struct Engine::Impl {
         check();
         if (!pcm.empty()) tts_session_note_first_audio();
         if (cb) cb(index, pcm.data(), pcm.size(), 0, true);
-        if ((int)window.size() > kSpeechHistoryTokens)
+        if ((int)window.size() > kSpeechHistoryTokens) {
             speech_history.assign(window.end() - kSpeechHistoryTokens, window.end());
-        else
+            fprintf(stderr, "s3.history_trim: kept=%d window_size=%d\n", kSpeechHistoryTokens, (int)window.size());
+        } else {
             speech_history = window;
+            fprintf(stderr, "s3.history_full: size=%d\n", (int)window.size());
+        }
         emit_s3_line();
         if (index >= 0) tts_session_touch_end();
     }

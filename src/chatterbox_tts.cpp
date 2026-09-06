@@ -1256,8 +1256,11 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     const int history_tokens = state.token_end - opts.token_start;
     const int output_tokens = opts.token_end - opts.token_start;
     if (history_tokens < 0 || history_tokens > kSpeechHistoryTokens || output_tokens <= history_tokens ||
-        (int)speech_tokens.size() != output_tokens + (opts.final ? 0 : kSpeechLookaheadTokens))
+        (int)speech_tokens.size() != output_tokens + (opts.final ? 0 : kSpeechLookaheadTokens)) {
+        fprintf(stderr, "s3gen.history_check: history_tokens=%d kSpeechHistoryTokens=%d output_tokens=%d speech_tokens_size=%zu\n",
+                history_tokens, kSpeechHistoryTokens, output_tokens, speech_tokens.size());
         throw std::runtime_error("S3Gen token range invalid");
+    }
     if (opts.prompt_token.empty() || opts.embedding.empty() || opts.prompt_feat.empty() || opts.prompt_rows <= 0)
         throw std::runtime_error("S3Gen voice conditioning missing");
     g_n_threads = opts.n_threads;

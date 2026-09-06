@@ -1140,6 +1140,8 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
     for (size_t i = 0; i < V; ++i) {
         l[i] = logits_cond[i] + p.cfg_weight * (logits_cond[i] - logits_uncond[i]);
     }
+    fprintf(stderr, "sample_next_token_mtl: cfg_weight=%.2f repeat_penalty=%.2f logits_size=%zu generated_size=%zu\n",
+            p.cfg_weight, p.repeat_penalty, V, generated.size());
     if (p.repeat_penalty != 1.0f && !generated.empty()) {
         std::set<int32_t> seen(generated.begin(), generated.end());
         for (int32_t t : seen) {
