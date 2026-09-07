@@ -12,7 +12,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1144,14 +1143,7 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
         l[i] = logits_cond[i] + p.cfg_weight * (logits_cond[i] - logits_uncond[i]);
     }
     
-    if (p.repeat_penalty != 1.0f && !generated.empty()) {
-        std::set<int32_t> seen(generated.begin(), generated.end());
-        for (int32_t t : seen) {
-            if (t < 0 || (size_t) t >= V) continue;
-            if (l[t] > 0.0f) l[t] /= p.repeat_penalty;
-            else             l[t] *= p.repeat_penalty;
-        }
-    }
+    apply_speech_repeat_penalty(l.data(), (int)V, generated, p.repeat_penalty);
     if (p.temp > 0.0f && p.temp != 1.0f) {
         for (float & x : l) x /= p.temp;
     }

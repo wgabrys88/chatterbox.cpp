@@ -560,14 +560,7 @@ int32_t sample_next_token_ex(
         if (keep_set.empty() && !sorted.empty()) keep_set.insert(sorted[0].idx);
         for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
-    if (params.repeat_penalty != 1.0f && !generated.empty()) {
-        std::set<int32_t> seen(generated.begin(), generated.end());
-        for (int32_t t : seen) {
-            if (t < 0 || t >= n) continue;
-            if (scores[t] == -INFINITY) continue;
-            scores[t] = scores[t] > 0 ? scores[t] / params.repeat_penalty : scores[t] * params.repeat_penalty;
-        }
-    }
+    apply_speech_repeat_penalty(scores.data(), n, generated, params.repeat_penalty);
     float mx = -INFINITY;
     for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
     std::vector<float> probs(n);

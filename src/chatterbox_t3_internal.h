@@ -1,7 +1,9 @@
 #pragma once
+#include <cmath>
 #include <cstdint>
 #include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 #include "ggml-alloc.h"
@@ -9,6 +11,27 @@
 #include "ggml.h"
 namespace tts_cpp::chatterbox::detail {
 constexpr int CHBX_MAX_NODES = 8192;
+// Speech tokens are a small reused codebook. HuggingFace-style penalty over
+// the full unique history poisons later words that share units with earlier
+// ones; Nano then loops a pause token and a 5-in-a-row stop treats that as EOS.
+constexpr int REPEAT_PENALTY_LAST_N = 16;
+constexpr int REPEAT_STOP_CONSECUTIVE = 16;
+
+inline void apply_speech_repeat_penalty(float * scores, int vocab,
+                                        const std::vector<int32_t> & generated,
+                                        float penalty) {
+    if (penalty == 1.0f || generated.empty() || vocab <= 0) return;
+    const size_t start = generated.size() > (size_t)REPEAT_PENALTY_LAST_N
+        ? generated.size() - (size_t)REPEAT_PENALTY_LAST_N : 0;
+    std::set<int32_t> seen;
+    for (size_t i = start; i < generated.size(); ++i) seen.insert(generated[i]);
+    for (int32_t t : seen) {
+        if (t < 0 || t >= vocab) continue;
+        float & s = scores[t];
+        if (s == -INFINITY) continue;
+        s = s > 0.0f ? s / penalty : s * penalty;
+    }
+}
 constexpr const char * KEY_VARIANT           = "chatterbox.variant";
 constexpr const char * KEY_TEXT_VOCAB_SIZE   = "chatterbox.text_vocab_size";
 constexpr const char * KEY_SPEECH_VOCAB_SIZE = "chatterbox.speech_vocab_size";

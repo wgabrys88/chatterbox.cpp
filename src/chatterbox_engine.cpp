@@ -80,12 +80,12 @@ std::size_t token_edit_distance(const std::vector<int32_t>& a, const std::vector
     }
     return row.back();
 }
-bool fifth_consecutive(const std::vector<int32_t>& generated, int32_t token) {
-    if (generated.size() < 4) return false;
-    return generated[generated.size() - 1] == token &&
-           generated[generated.size() - 2] == token &&
-           generated[generated.size() - 3] == token &&
-           generated[generated.size() - 4] == token;
+bool consecutive_repeat(const std::vector<int32_t>& generated, int32_t token, int count) {
+    if (count < 2 || (int)generated.size() < count - 1) return false;
+    for (int i = 1; i < count; ++i) {
+        if (generated[generated.size() - (size_t)i] != token) return false;
+    }
+    return true;
 }
 int threads(int n) {
     if (n > 0) return n;
@@ -246,6 +246,8 @@ struct Engine::Impl {
             + " top_p=" + std::to_string(sp.top_p)
             + " min_p=" + std::to_string(sp.min_p)
             + " repeat_penalty=" + std::to_string(sp.repeat_penalty)
+            + " repeat_last_n=" + std::to_string(REPEAT_PENALTY_LAST_N)
+            + " repeat_stop=" + std::to_string(REPEAT_STOP_CONSECUTIVE)
             + " cfg_weight=" + std::to_string(sp.cfg_weight));
 
         std::vector<int32_t> text_tokens;
@@ -309,7 +311,10 @@ struct Engine::Impl {
                 if (!opts.audit_dir.empty()) logits_hashes.push_back(float_hash(logits));
                 token = sample_next_token_ex(logits, out, sp, rng);
             }
-            if (fifth_consecutive(out, token)) { repeat_stopped = true; token = model.hparams.stop_speech_token; }
+            if (consecutive_repeat(out, token, REPEAT_STOP_CONSECUTIVE)) {
+                repeat_stopped = true;
+                token = model.hparams.stop_speech_token;
+            }
             out.push_back(token);
             publish(token);
         }
