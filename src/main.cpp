@@ -1,5 +1,4 @@
-#include "replay_capture.h"
-#include "tts-cpp/chatterbox/context.h"
+#include "tts-cpp/chatterbox/log.h"
 #include "gpt2_bpe.h"
 #include "mtl_tokenizer.h"
 #include "ggml.h"
@@ -209,6 +208,7 @@ ggml_backend_t init_backend(int n_gpu_layers) {
 #else
 #error "No Chatterbox GPU backend selected"
 #endif
+    tts_emit("t3.backend", std::string(" backend=") + backend_name + " device=" + desc);
     return b;
 }
 bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
@@ -461,33 +461,14 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
     ggml_free(ctx);
     return gf;
 }
-// Snapshot the actual active incoming cache, including any unexpected old-row changes.
-static void capture_cache(const chatterbox_model& model, const std::string& prefix, int end) {
-    if (prefix.empty()) return;
-    const auto& hp = model.hparams;
-    const int hd = hp.n_embd / hp.n_head, count = end;
-    for (const auto& item : {std::make_pair("kv-k-in", model.memory_k),
-                             std::make_pair("kv-v-in", model.memory_v)}) {
-        std::vector<float> rows((size_t)hp.n_layer * hp.n_head * count * hd);
-        for (int layer = 0; count && layer < hp.n_layer; ++layer)
-            for (int head = 0; head < hp.n_head; ++head) {
-                const size_t group = (size_t)layer * hp.n_head + head;
-                ggml_backend_tensor_get(item.second, rows.data() + group * count * hd,
-                    (group * hp.n_ctx) * hd * sizeof(float), count * hd * sizeof(float));
-            }
-        diagnostic::tensor(prefix, item.first, rows, {hp.n_layer,hp.n_head,count,hd});
-    }
-
-}
 bool eval_prompt(
     const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
-    const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len, const std::string& audit_prefix) {
+    const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
     prompt_len = 1 + model.hparams.cond_prompt_len + (int)text_tokens.size() + 1;
     if (prompt_len > model.hparams.n_ctx) {
         fprintf(stderr, "%s: prompt %d exceeds context %d\n", __func__, prompt_len, model.hparams.n_ctx);
         return false;
     }
-    capture_cache(model, audit_prefix, 0);
     ggml_cgraph * gf = build_prompt_graph(model, (int)text_tokens.size());
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
@@ -497,8 +478,6 @@ bool eval_prompt(
     std::vector<int32_t> pos(prompt_len);
     for (int i = 0; i < prompt_len; ++i) pos[i] = i;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), pos.data(), 0, pos.size()*sizeof(int32_t));
-    diagnostic::tensor(audit_prefix, "position", pos);
-    diagnostic::tensor(audit_prefix, "input-speech-token", std::vector<int32_t>{st});
     {
         const int N = prompt_len;
         ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "kq_mask");
@@ -512,7 +491,6 @@ bool eval_prompt(
                 }
             }
             ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
-            diagnostic::raw(audit_prefix, "attention-mask", mask.data(), mask.size()*sizeof(ggml_fp16_t), "f16", {N,N});
         }
     }
     const auto status = ggml_backend_graph_compute(model.backend, gf);
@@ -526,14 +504,11 @@ bool eval_prompt(
 }
 bool eval_step(
     const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
-    int n_past, int32_t token, std::vector<float> & logits_out, const std::string& audit_prefix) {
-    capture_cache(model, audit_prefix, n_past);
+    int n_past, int32_t token, std::vector<float> & logits_out) {
     ggml_cgraph * gf = build_step_graph(model, n_past);
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
-    diagnostic::tensor(audit_prefix, "input-speech-token", std::vector<int32_t>{token});
-    diagnostic::tensor(audit_prefix, "position", std::vector<int32_t>{n_past});
     int32_t position = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), &position, 0, sizeof(position));
     const auto status = ggml_backend_graph_compute(model.backend, gf);
@@ -547,28 +522,7 @@ int32_t sample_next_token_ex(
     const std::vector<float> & logits,
     const std::vector<int32_t> & generated,
     const chatterbox_sampling_params & params,
-    std::mt19937 & rng, const std::string& audit_prefix) {
-    auto capture = [&](const char* name, const std::vector<float>& value) {
-        diagnostic::tensor(audit_prefix, name, value);
-    };
-    auto finish = [&](int32_t selected, const char* reason) {
-        if (!audit_prefix.empty()) {
-            std::ostringstream state; state << rng;
-            diagnostic::event(audit_prefix, "sample", "\"selected\":"+std::to_string(selected)+
-                ",\"reason\":"+diagnostic::quote(reason)+",\"rng_after\":"+diagnostic::quote(state.str()));
-        }
-        return selected;
-    };
-    if (!audit_prefix.empty()) {
-        std::ostringstream state; state << rng;
-        std::ostringstream settings; settings << std::setprecision(9)
-            << "\"temperature\":" << params.temp << ",\"top_k\":" << params.top_k
-            << ",\"top_p\":" << params.top_p << ",\"repeat_penalty\":" << params.repeat_penalty
-            << ",\"min_p\":" << params.min_p << ",\"min_p_applied\":false,\"rng_before\":" << diagnostic::quote(state.str());
-        diagnostic::event(audit_prefix, "sampling.begin", settings.str());
-        diagnostic::tensor(audit_prefix, "prefix", generated);
-    }
-    capture("raw", logits);
+    std::mt19937 & rng) {
     const int n = (int)logits.size();
     
     std::vector<float> scores(logits.begin(), logits.end());
@@ -576,7 +530,6 @@ int32_t sample_next_token_ex(
         float inv_t = 1.0f / params.temp;
         for (float & s : scores) s *= inv_t;
     }
-    capture("temperature", scores);
     if (params.top_k > 0 && params.top_k < n) {
         std::vector<float> tmp(scores);
         std::nth_element(tmp.begin(), tmp.begin() + params.top_k, tmp.end(), std::greater<float>());
@@ -586,7 +539,6 @@ int32_t sample_next_token_ex(
         if (kept < params.top_k) threshold -= 1e-10f;
         for (float & s : scores) if (s <= threshold) s = -INFINITY;
     }
-    capture("top_k", scores);
     if (params.top_p < 1.0f) {
         struct IS { int idx; float s; };
         std::vector<IS> sorted;
@@ -608,7 +560,6 @@ int32_t sample_next_token_ex(
         if (keep_set.empty() && !sorted.empty()) keep_set.insert(sorted[0].idx);
         for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
-    capture("top_p", scores);
     if (params.repeat_penalty != 1.0f && !generated.empty()) {
         std::set<int32_t> seen(generated.begin(), generated.end());
         for (int32_t t : seen) {
@@ -617,7 +568,6 @@ int32_t sample_next_token_ex(
             scores[t] = scores[t] > 0 ? scores[t] / params.repeat_penalty : scores[t] * params.repeat_penalty;
         }
     }
-    capture("repeat_penalty", scores);
     float mx = -INFINITY;
     for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
     std::vector<float> probs(n);
@@ -626,14 +576,13 @@ int32_t sample_next_token_ex(
         probs[i] = (scores[i] == -INFINITY) ? 0.0f : std::exp(scores[i] - mx);
         psum += probs[i];
     }
-    if (psum == 0.0f) { capture("probabilities", probs); return finish(0, "zero_probability_sum"); }
+    if (psum == 0.0f) return 0;
     for (float & p : probs) p /= psum;
-    capture("probabilities", probs);
     if (params.temp <= 0.0f) {
-        return finish((int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end())), "argmax");
+        return (int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end()));
     }
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    return finish(dist(rng), "discrete_distribution");
+    return dist(rng);
 }
 void chatterbox_log_cb(ggml_log_level level, const char * text, void * ) {
     if (level >= GGML_LOG_LEVEL_ERROR && text) fputs(text, stderr);
