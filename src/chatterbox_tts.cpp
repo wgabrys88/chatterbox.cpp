@@ -1,3 +1,4 @@
+#include "diagnostic_audit.h"
 #include "tts-cpp/chatterbox/log.h"
 #include "s3gen_pipeline.h"
 #include "ggml.h"
@@ -95,16 +96,13 @@ static std::string audit_hash(const std::vector<T>& values) {
 template <class T>
 static std::string audit_dump(const std::string& prefix, const char* stage, const std::vector<T>& values) {
     if (prefix.empty()) return {};
-    const char* ext = ".bin";
-    if constexpr (std::is_same_v<T, float>) ext = ".f32";
-    else if constexpr (std::is_same_v<T, double>) ext = ".f64";
-    else if constexpr (std::is_same_v<T, int32_t>) ext = ".i32";
-    const std::string path = prefix + "." + stage + ext;
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) throw std::runtime_error("cannot create S3 audit artifact");
-    if (!values.empty())
-        out.write(reinterpret_cast<const char*>(values.data()), (std::streamsize)(values.size() * sizeof(T)));
-    if (!out) throw std::runtime_error("cannot write S3 audit artifact");
+    std::vector<int64_t> shape;
+    const std::string name(stage);
+    if (name == "input-embedding") shape = {int64_t(values.size()/512),512};
+    else if (name == "encoder-mu" || name.rfind("cfm-z",0)==0 || name.rfind("mel-",0)==0 || name.rfind("state-mel-",0)==0)
+        shape = {80,int64_t(values.size()/80)};
+    else if (name == "stft") shape = {18,int64_t(values.size()/18)};
+    diagnostic::tensor(prefix, stage, values, shape);
     return audit_hash(values);
 }
 static std::string audit_blocks(const std::vector<float>& values, std::size_t block) {
@@ -1323,6 +1321,15 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         audit_dump(opts.audit_prefix, "state-phase-in", state.phase);
         audit_dump(opts.audit_prefix, "state-pending-in", state.pending_pcm);
         audit_dump(opts.audit_prefix, "speech-window", speech_tokens);
+        diagnostic::tensor(opts.audit_prefix, "voice-embedding", opts.embedding);
+        diagnostic::tensor(opts.audit_prefix, "voice-prompt-tokens", opts.prompt_token);
+        diagnostic::tensor(opts.audit_prefix, "voice-prompt-features", opts.prompt_feat, {opts.prompt_rows,80});
+        diagnostic::event(opts.audit_prefix, "s3.begin", "\"seed\":"+std::to_string(opts.seed)+
+            ",\"token_start\":"+std::to_string(opts.token_start)+",\"token_end\":"+std::to_string(opts.token_end)+
+            ",\"state_token_end\":"+std::to_string(state.token_end)+",\"prompt_rows\":"+std::to_string(opts.prompt_rows)+
+            ",\"cfm_steps\":"+std::to_string(opts.cfm_steps)+",\"first_piece\":"+std::to_string(opts.first_piece)+
+            ",\"last_piece\":"+std::to_string(opts.last_piece)+",\"final\":"+std::to_string(opts.final)+
+            ",\"chunk_id\":"+std::to_string(opts.chunk_id)+",\"fastconv\":"+std::to_string(opts.fastconv));
     }
     const int history_tokens = state.token_end - opts.token_start;
     const int output_tokens = opts.token_end - opts.token_start;
@@ -1368,9 +1375,20 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         if (tok < 0 || tok >= vocab_size) throw std::runtime_error("S3Gen token out of range");
         std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)tok * D, D * sizeof(float));
     }
+    if (audit) {
+        diagnostic::tensor(opts.audit_prefix, "flow-tokens", flow_tokens);
+        std::vector<float> pos1, pos2;
+        compute_pos_emb(pos1,n_total,D); compute_pos_emb(pos2,2*n_total,D);
+        diagnostic::tensor(opts.audit_prefix,"encoder-position1",pos1,{n_total,D});
+        diagnostic::tensor(opts.audit_prefix,"encoder-position2",pos2,{2*n_total,D});
+        auto device = ggml_backend_get_device(m.backend);
+        diagnostic::event(opts.audit_prefix,"s3.backend","\"backend\":"+diagnostic::quote(ggml_backend_name(m.backend))+
+            ",\"device\":"+diagnostic::quote(ggml_backend_dev_description(device)));
+    }
     const std::string input_embed_hash = audit ? audit_dump(opts.audit_prefix, "input-embedding", input_embed) : std::string();
     { const double t0 = now_ms();
       std::vector<float> tmp = run_encoder(m, input_embed, n_total, D, opts.chunk_id == 0); encoder_ms = now_ms() - t0; mu_T.swap(tmp); }
+    diagnostic::tensor(opts.audit_prefix, "encoder-full", mu_T, {2*n_total,MEL});
     int T_mu = 2 * n_total;
     // Dummy pad is encoder lookahead, not audio. Each hop speaks its own tokens once.
     const int dropped_lookahead_tokens = pre_lookahead_len;
@@ -1403,6 +1421,9 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < mel_len1; ++t)
             cond[m2 * T_mu + t] = pf_raw[t * MEL + m2];
+    diagnostic::tensor(opts.audit_prefix,"speaker-normalized",emb_norm);
+    diagnostic::tensor(opts.audit_prefix,"cfm-speaker",spks);
+    diagnostic::tensor(opts.audit_prefix,"cfm-conditioning",cond,{MEL,T_mu});
     const bool meanflow = m.meanflow;
     std::vector<float> z(T_mu * MEL);
     for (int m2 = 0; m2 < MEL; ++m2)
@@ -1422,6 +1443,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         float t = (float)i / (float)cfm_steps;
         t_span.push_back(meanflow ? t : 1.0f - std::cos(t * .5f * (float)M_PI));
     }
+    diagnostic::tensor(opts.audit_prefix,"cfm-time-span",t_span);
     const std::vector<float> zeros_tm(T_mu * MEL, 0.0f), zeros_m(MEL, 0.0f);
     cfm_estimator_cache later_cfm;
     if (opts.first_piece && !m.first_cfm) m.first_cfm = std::make_unique<cfm_estimator_cache>();
@@ -1431,6 +1453,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
             const float t = t_span[step], r = t_span[step + 1], dt = r - t;
         auto t_emb = compute_time_mlp(m, t);
         if (meanflow) t_emb = compute_time_mixed(m, t_emb, compute_time_mlp(m, r));
+        diagnostic::tensor(opts.audit_prefix,"cfm-time-embedding"+std::to_string(step),t_emb);
         std::vector<float> dxdt;
         if (!meanflow && m.cfg_rate != 0.0f) {
             std::vector<float> uncond;
@@ -1440,6 +1463,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         } else {
             dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, false);
         }
+            diagnostic::tensor(opts.audit_prefix,"cfm-velocity"+std::to_string(step),dxdt,{MEL,T_mu});
             for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
             if (audit) {
                 const std::string stage = "cfm-z" + std::to_string(step + 1);
@@ -1471,6 +1495,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     std::vector<float> f0_up(T_wav);
     for (int i = 0; i < T_mel; ++i)
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
+    diagnostic::tensor(opts.audit_prefix,"f0-upsampled",f0_up);
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, m_hift.hift_linear_w, m_hift.hift_linear_b,
         (uint32_t)(seed + 1), state, history_frames * upsample, (int64_t)opts.token_start * kSamplesPerToken);
     const std::string source_hash = audit ? audit_dump(opts.audit_prefix, "source", src) : std::string();
@@ -1513,6 +1538,10 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     wav.swap(emitted);
     state.token_end = opts.token_end;
     if (audit) {
+        diagnostic::event(opts.audit_prefix,"s3.end","\"raw_samples\":"+std::to_string(T_wav)+
+            ",\"emit_begin\":"+std::to_string(begin)+",\"emit_end\":"+std::to_string(end)+
+            ",\"hold\":"+std::to_string(hold)+",\"emitted\":"+std::to_string(wav.size())+
+            ",\"state_token_end\":"+std::to_string(state.token_end));
         const std::string mel_cache_out_hash = audit_dump(opts.audit_prefix, "state-mel-out", state.mel);
         const std::string source_cache_out_hash = audit_dump(opts.audit_prefix, "state-source-out", state.source);
         const std::string phase_out_hash = audit_dump(opts.audit_prefix, "state-phase-out", state.phase);

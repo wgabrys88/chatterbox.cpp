@@ -1,3 +1,4 @@
+#include "diagnostic_audit.h"
 #include "tts-cpp/chatterbox/log.h"
 #include "gpt2_bpe.h"
 #include "mtl_tokenizer.h"
@@ -522,7 +523,28 @@ int32_t sample_next_token_ex(
     const std::vector<float> & logits,
     const std::vector<int32_t> & generated,
     const chatterbox_sampling_params & params,
-    std::mt19937 & rng) {
+    std::mt19937 & rng, const std::string& audit_prefix) {
+    auto capture = [&](const char* name, const std::vector<float>& value) {
+        diagnostic::tensor(audit_prefix, name, value);
+    };
+    auto finish = [&](int32_t selected, const char* reason) {
+        if (!audit_prefix.empty()) {
+            std::ostringstream state; state << rng;
+            diagnostic::event(audit_prefix, "sample", "\"selected\":"+std::to_string(selected)+
+                ",\"reason\":"+diagnostic::quote(reason)+",\"rng_after\":"+diagnostic::quote(state.str()));
+        }
+        return selected;
+    };
+    if (!audit_prefix.empty()) {
+        std::ostringstream state; state << rng;
+        std::ostringstream settings; settings << std::setprecision(9)
+            << "\"temperature\":" << params.temp << ",\"top_k\":" << params.top_k
+            << ",\"top_p\":" << params.top_p << ",\"repeat_penalty\":" << params.repeat_penalty
+            << ",\"min_p\":" << params.min_p << ",\"min_p_applied\":false,\"rng_before\":" << diagnostic::quote(state.str());
+        diagnostic::event(audit_prefix, "sampling.begin", settings.str());
+        diagnostic::tensor(audit_prefix, "prefix", generated);
+    }
+    capture("raw", logits);
     const int n = (int)logits.size();
     
     std::vector<float> scores(logits.begin(), logits.end());
@@ -530,6 +552,7 @@ int32_t sample_next_token_ex(
         float inv_t = 1.0f / params.temp;
         for (float & s : scores) s *= inv_t;
     }
+    capture("temperature", scores);
     if (params.top_k > 0 && params.top_k < n) {
         std::vector<float> tmp(scores);
         std::nth_element(tmp.begin(), tmp.begin() + params.top_k, tmp.end(), std::greater<float>());
@@ -539,6 +562,7 @@ int32_t sample_next_token_ex(
         if (kept < params.top_k) threshold -= 1e-10f;
         for (float & s : scores) if (s <= threshold) s = -INFINITY;
     }
+    capture("top_k", scores);
     if (params.top_p < 1.0f) {
         struct IS { int idx; float s; };
         std::vector<IS> sorted;
@@ -560,6 +584,7 @@ int32_t sample_next_token_ex(
         if (keep_set.empty() && !sorted.empty()) keep_set.insert(sorted[0].idx);
         for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
+    capture("top_p", scores);
     if (params.repeat_penalty != 1.0f && !generated.empty()) {
         std::set<int32_t> seen(generated.begin(), generated.end());
         for (int32_t t : seen) {
@@ -568,6 +593,7 @@ int32_t sample_next_token_ex(
             scores[t] = scores[t] > 0 ? scores[t] / params.repeat_penalty : scores[t] * params.repeat_penalty;
         }
     }
+    capture("repeat_penalty", scores);
     float mx = -INFINITY;
     for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
     std::vector<float> probs(n);
@@ -576,13 +602,14 @@ int32_t sample_next_token_ex(
         probs[i] = (scores[i] == -INFINITY) ? 0.0f : std::exp(scores[i] - mx);
         psum += probs[i];
     }
-    if (psum == 0.0f) return 0;
+    if (psum == 0.0f) { capture("probabilities", probs); return finish(0, "zero_probability_sum"); }
     for (float & p : probs) p /= psum;
+    capture("probabilities", probs);
     if (params.temp <= 0.0f) {
-        return (int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end()));
+        return finish((int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end())), "argmax");
     }
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    return dist(rng);
+    return finish(dist(rng), "discrete_distribution");
 }
 void chatterbox_log_cb(ggml_log_level level, const char * text, void * ) {
     if (level >= GGML_LOG_LEVEL_ERROR && text) fputs(text, stderr);

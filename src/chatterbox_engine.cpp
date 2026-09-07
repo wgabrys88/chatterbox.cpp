@@ -1,3 +1,4 @@
+#include "diagnostic_audit.h"
 #include "tts-cpp/chatterbox/engine.h"
 #include "tts-cpp/chatterbox/log.h"
 #include <algorithm>
@@ -266,6 +267,24 @@ struct Engine::Impl {
         if (!opts.audit_dir.empty())
             tts_emit_piece("t3.audit.text", "text_seq=" + token_csv(text_tokens));
 
+        const auto audit_context = tts_get_context();
+        const std::string audit_prefix = opts.audit_dir.empty() ? "" : opts.audit_dir + "/r" +
+            std::to_string(audit_context.response) + "_p" + std::to_string(external_piece);
+        diagnostic::tensor(audit_prefix, "t3-text", text_tokens);
+        diagnostic::event(audit_prefix, "t3.begin", "\"seed\":"+std::to_string(opts.seed)+
+            ",\"stop_token\":"+std::to_string(model.hparams.stop_speech_token)+
+            ",\"start_token\":"+std::to_string(model.hparams.start_speech_token)+
+            ",\"backend\":"+diagnostic::quote(ggml_backend_name(model.backend)));
+        int audit_step = 0;
+        auto sample_prefix = [&]() { return audit_prefix.empty() ? std::string() : audit_prefix + ".t3-s" + std::to_string(audit_step++); };
+        auto decision = [&](int32_t selected, int32_t effective, size_t published, int position) {
+            diagnostic::event(audit_prefix, "t3.decision", "\"step\":"+std::to_string(audit_step-1)+
+                ",\"selected\":"+std::to_string(selected)+",\"effective\":"+std::to_string(effective)+
+                ",\"published\":"+(published ? std::to_string(effective) : "null")+
+                ",\"kv_position\":"+std::to_string(position)+
+                ",\"termination\":"+diagnostic::quote(selected != effective ? "forced_repeat_eos" :
+                    effective == model.hparams.stop_speech_token ? "sampled_eos" : "none"));
+        };
         int n_past = 0, speech_pos = 1;
         int32_t token = 0, pending_mtl = -1;
         bool repeat_stopped = false;
@@ -291,10 +310,11 @@ struct Engine::Impl {
             std::vector<float> logits;
             if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past)) throw std::runtime_error("Turbo prompt failed");
             if (!opts.audit_dir.empty()) logits_hashes.push_back(float_hash(logits));
-            token = sample_next_token_ex(logits, out, sp, rng);
+            token = sample_next_token_ex(logits, out, sp, rng, sample_prefix());
         }
         out.push_back(token);
         publish(token);
+        if (model.hparams.variant != CHBX_VARIANT_MTL) decision(token, token, tokens.size(), n_past);
 
         for (int i = 0; i < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++i) {
             if (model.hparams.variant == CHBX_VARIANT_MTL) {
@@ -307,11 +327,14 @@ struct Engine::Impl {
                 std::vector<float> logits;
                 if (!eval_step(model, allocr, n_threads, n_past++, token, logits)) throw std::runtime_error("Turbo step failed");
                 if (!opts.audit_dir.empty()) logits_hashes.push_back(float_hash(logits));
-                token = sample_next_token_ex(logits, out, sp, rng);
+                token = sample_next_token_ex(logits, out, sp, rng, sample_prefix());
             }
+            const int32_t selected = token;
+            const size_t published_before = tokens.size();
             if (fifth_consecutive(out, token)) { repeat_stopped = true; token = model.hparams.stop_speech_token; }
             out.push_back(token);
             publish(token);
+            if (model.hparams.variant != CHBX_VARIANT_MTL) decision(selected, token, tokens.size()-published_before, n_past);
         }
 
         if (token != model.hparams.stop_speech_token) throw std::runtime_error("T3 stopped without EOS");
@@ -332,6 +355,9 @@ struct Engine::Impl {
         if (!opts.audit_dir.empty())
             tts_emit_piece("t3.audit.logits", "steps=" + std::to_string(logits_hashes.size()) +
                 " hashes=" + string_csv(logits_hashes));
+        diagnostic::tensor(audit_prefix, "t3-speech", tokens);
+        diagnostic::event(audit_prefix, "t3.end", "\"steps\":"+std::to_string(audit_step)+
+            ",\"termination\":"+diagnostic::quote(repeat_stopped ? "forced_repeat_eos" : "sampled_eos"));
         return tokens;
     }
     void emit_s3_line() {
