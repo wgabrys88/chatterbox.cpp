@@ -19,6 +19,7 @@ extern "C" void ggml_vk_overlap_counters(ggml_backend_t, unsigned long long *, u
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -28,6 +29,7 @@ extern "C" void ggml_vk_overlap_counters(ggml_backend_t, unsigned long long *, u
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 static int g_n_threads = 1;
 static double now_ms() {
@@ -73,6 +75,66 @@ static float positioned_noise(uint32_t seed, uint64_t position) {
     const uint64_t key = (uint64_t(seed) << 32) ^ (position * 2);
     return (float)(std::sqrt(-2.0 * std::log(std::max(1e-15, uniform(key)))) *
         std::cos(2.0 * M_PI * uniform(key + 1)));
+}
+
+static std::uint64_t audit_hash_bytes(const void* data, std::size_t size) {
+    const auto* p = static_cast<const std::uint8_t*>(data);
+    std::uint64_t h = 1469598103934665603ull;
+    for (std::size_t i = 0; i < size; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+static std::string audit_hash_hex(const void* data, std::size_t size) {
+    char out[17];
+    std::snprintf(out, sizeof(out), "%016llx", (unsigned long long)audit_hash_bytes(data, size));
+    return out;
+}
+template <class T>
+static std::string audit_hash(const std::vector<T>& values) {
+    return audit_hash_hex(values.data(), values.size() * sizeof(T));
+}
+template <class T>
+static std::string audit_dump(const std::string& prefix, const char* stage, const std::vector<T>& values) {
+    if (prefix.empty()) return {};
+    const char* ext = ".bin";
+    if constexpr (std::is_same_v<T, float>) ext = ".f32";
+    else if constexpr (std::is_same_v<T, double>) ext = ".f64";
+    else if constexpr (std::is_same_v<T, int32_t>) ext = ".i32";
+    const std::string path = prefix + "." + stage + ext;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("cannot create S3 audit artifact");
+    if (!values.empty())
+        out.write(reinterpret_cast<const char*>(values.data()), (std::streamsize)(values.size() * sizeof(T)));
+    if (!out) throw std::runtime_error("cannot write S3 audit artifact");
+    return audit_hash(values);
+}
+static std::string audit_blocks(const std::vector<float>& values, std::size_t block) {
+    if (!block || values.empty() || values.size() % block) return "-";
+    std::string out;
+    for (std::size_t pos = 0; pos < values.size(); pos += block) {
+        if (!out.empty()) out += ',';
+        out += audit_hash_hex(values.data() + pos, block * sizeof(float));
+    }
+    return out;
+}
+static std::string audit_join(const std::vector<std::string>& values) {
+    std::string out;
+    for (const auto& value : values) {
+        if (!out.empty()) out += ',';
+        out += value;
+    }
+    return out.empty() ? "-" : out;
+}
+static std::vector<float> audit_frame_major(const std::vector<float>& channel_major,
+                                            int channels, int total_frames, int offset, int frames) {
+    if (offset < 0 || frames < 0 || offset + frames > total_frames ||
+        channel_major.size() != (std::size_t)channels * total_frames)
+        throw std::runtime_error("invalid S3 audit frame range");
+    std::vector<float> out((std::size_t)frames * channels);
+    for (int t = 0; t < frames; ++t)
+        for (int c = 0; c < channels; ++c)
+            out[(std::size_t)t * channels + c] =
+                channel_major[(std::size_t)c * total_frames + offset + t];
+    return out;
 }
 
 struct encoder_cache {
@@ -1248,6 +1310,20 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     if (!opts.pcm_out) throw std::runtime_error("S3Gen PCM output missing");
     if (!opts.state) throw std::runtime_error("S3Gen piece state missing");
     auto& state = *opts.state;
+    state.audit_summary.clear();
+    state.audit_local.clear();
+    const bool audit = !opts.audit_prefix.empty();
+    const std::string mel_cache_in_hash = audit ? audit_hash(state.mel) : std::string();
+    const std::string source_cache_in_hash = audit ? audit_hash(state.source) : std::string();
+    const std::string phase_in_hash = audit ? audit_hash(state.phase) : std::string();
+    const std::string pending_in_hash = audit ? audit_hash(state.pending_pcm) : std::string();
+    if (audit) {
+        audit_dump(opts.audit_prefix, "state-mel-in", state.mel);
+        audit_dump(opts.audit_prefix, "state-source-in", state.source);
+        audit_dump(opts.audit_prefix, "state-phase-in", state.phase);
+        audit_dump(opts.audit_prefix, "state-pending-in", state.pending_pcm);
+        audit_dump(opts.audit_prefix, "speech-window", speech_tokens);
+    }
     const int history_tokens = state.token_end - opts.token_start;
     const int output_tokens = opts.token_end - opts.token_start;
     if (history_tokens < 0 || history_tokens > kSpeechHistoryTokens || output_tokens <= history_tokens ||
@@ -1292,6 +1368,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         if (tok < 0 || tok >= vocab_size) throw std::runtime_error("S3Gen token out of range");
         std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)tok * D, D * sizeof(float));
     }
+    const std::string input_embed_hash = audit ? audit_dump(opts.audit_prefix, "input-embedding", input_embed) : std::string();
     { const double t0 = now_ms();
       std::vector<float> tmp = run_encoder(m, input_embed, n_total, D, opts.chunk_id == 0); encoder_ms = now_ms() - t0; mu_T.swap(tmp); }
     int T_mu = 2 * n_total;
@@ -1304,6 +1381,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mu; ++t)
             mu[m2 * T_mu + t] = mu_T[t * MEL + m2];
+    const std::string encoder_hash = audit ? audit_dump(opts.audit_prefix, "encoder-mu", mu) : std::string();
     const float * emb_raw = emb_data.data();
     float norm = 0.0f;
     for (int i = 0; i < 192; ++i) norm += emb_raw[i] * emb_raw[i];
@@ -1333,6 +1411,9 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
             const int64_t frame = generated ? t - mel_len1 + 2 * opts.token_start : t;
             z[m2 * T_mu + t] = positioned_noise(seed + (generated && meanflow ? 2 : 0), frame * MEL + m2);
         }
+    const std::string cfm_initial_hash = audit ? audit_dump(opts.audit_prefix, "cfm-z0", z) : std::string();
+    const std::vector<float> cfm_initial = audit ? z : std::vector<float>();
+    std::vector<std::string> cfm_step_hashes;
     const int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps : (meanflow ? 2 : m.n_timesteps);
     if (!meanflow && cfm_steps < 5) throw std::runtime_error("non-meanflow CFM requires at least 5 steps");
     std::vector<float> t_span;
@@ -1360,6 +1441,10 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
             dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, false);
         }
             for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
+            if (audit) {
+                const std::string stage = "cfm-z" + std::to_string(step + 1);
+                cfm_step_hashes.push_back(audit_dump(opts.audit_prefix, stage.c_str(), z));
+            }
     }
     cfm_ms = now_ms() - cfm_started;
     const int T_mel = T_mu - mel_len1;
@@ -1369,14 +1454,18 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mel; ++t)
             mel[m2 * T_mel + t] = z[m2 * T_mu + (t + mel_off)];
+    const std::string mel_generated_hash = audit ? audit_dump(opts.audit_prefix, "mel-generated", mel) : std::string();
+    const std::vector<float> mel_generated = audit ? mel : std::vector<float>();
     const int history_frames = history_tokens * 2;
     const int cached_frames = (int)state.mel.size() / MEL;
     if (cached_frames < history_frames) throw std::runtime_error("S3Gen mel history missing");
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < history_frames; ++t)
             mel[m2 * T_mel + t] = state.mel[m2 * cached_frames + cached_frames - history_frames + t];
+    const std::string mel_conditioned_hash = audit ? audit_dump(opts.audit_prefix, "mel-conditioned", mel) : std::string();
     const double f0_started = now_ms();
     auto f0 = run_f0_predictor(m_hift, mel, T_mel); f0_ms = now_ms() - f0_started;
+    const std::string f0_hash = audit ? audit_dump(opts.audit_prefix, "f0", f0) : std::string();
     int upsample = 8 * 5 * 3 * 4;
     int T_wav = T_mel * upsample;
     std::vector<float> f0_up(T_wav);
@@ -1384,11 +1473,15 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, m_hift.hift_linear_w, m_hift.hift_linear_b,
         (uint32_t)(seed + 1), state, history_frames * upsample, (int64_t)opts.token_start * kSamplesPerToken);
+    const std::string source_hash = audit ? audit_dump(opts.audit_prefix, "source", src) : std::string();
     const double stft_started = now_ms();
     auto s_stft = run_stft(m_hift, src); stft_ms = now_ms() - stft_started;
+    const std::string stft_hash = audit ? audit_dump(opts.audit_prefix, "stft", s_stft) : std::string();
     int T_stft = (int)(s_stft.size() / 18);
     const double hift_started = now_ms();
     auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft); hift_ms = now_ms() - hift_started;
+    const std::string hift_hash = audit ? audit_dump(opts.audit_prefix, "hift-wav", wav) : std::string();
+    const std::vector<float> hift_generated = audit ? wav : std::vector<float>();
     const int n_trim = sr / 50;
     const int fade_len = 2 * n_trim;
     const int fade_in_samples = (opts.first_piece && opts.chunk_id == 0 && (int)wav.size() >= fade_len) ? n_trim : 0;
@@ -1419,6 +1512,55 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     std::vector<float> emitted(wav.begin() + begin, wav.begin() + end);
     wav.swap(emitted);
     state.token_end = opts.token_end;
+    if (audit) {
+        const std::string mel_cache_out_hash = audit_dump(opts.audit_prefix, "state-mel-out", state.mel);
+        const std::string source_cache_out_hash = audit_dump(opts.audit_prefix, "state-source-out", state.source);
+        const std::string phase_out_hash = audit_dump(opts.audit_prefix, "state-phase-out", state.phase);
+        const std::string pending_out_hash = audit_dump(opts.audit_prefix, "state-pending-out", state.pending_pcm);
+        const std::string emitted_hash = audit_dump(opts.audit_prefix, "pcm-emitted-f32", wav);
+        const auto encoder_local = audit_frame_major(mu, MEL, T_mu, mel_len1, T_mel);
+        const auto cfm0_local = audit_frame_major(cfm_initial, MEL, T_mu, mel_len1, T_mel);
+        const auto cfm_local = audit_frame_major(mel_generated, MEL, T_mel, 0, T_mel);
+        const auto mel_local = audit_frame_major(mel, MEL, T_mel, 0, T_mel);
+        state.audit_summary =
+            "dir=" + opts.audit_prefix +
+            " output_tokens=" + std::to_string(output_tokens) +
+            " history_tokens=" + std::to_string(history_tokens) +
+            " n_total=" + std::to_string(n_total) +
+            " n_prompt=" + std::to_string(n_prompt) +
+            " padded_tokens=" + std::to_string(padded.size()) +
+            " mel_len1=" + std::to_string(mel_len1) +
+            " t_mu=" + std::to_string(T_mu) +
+            " t_mel=" + std::to_string(T_mel) +
+            " channels=80 input_dim=512 token_start=" + std::to_string(opts.token_start) +
+            " input_embed=" + input_embed_hash +
+            " encoder=" + encoder_hash +
+            " cfm0=" + cfm_initial_hash +
+            " cfm_steps_hashes=" + audit_join(cfm_step_hashes) +
+            " mel_generated=" + mel_generated_hash +
+            " mel_conditioned=" + mel_conditioned_hash +
+            " f0=" + f0_hash +
+            " source=" + source_hash +
+            " stft=" + stft_hash +
+            " hift=" + hift_hash +
+            " emitted=" + emitted_hash +
+            " mel_cache_in=" + mel_cache_in_hash +
+            " mel_cache_out=" + mel_cache_out_hash +
+            " source_cache_in=" + source_cache_in_hash +
+            " source_cache_out=" + source_cache_out_hash +
+            " phase_in=" + phase_in_hash +
+            " phase_out=" + phase_out_hash +
+            " pending_in=" + pending_in_hash +
+            " pending_out=" + pending_out_hash;
+        state.audit_local =
+            "encoder=" + audit_blocks(encoder_local, (std::size_t)MEL * 2) +
+            " cfm0=" + audit_blocks(cfm0_local, (std::size_t)MEL * 2) +
+            " cfm=" + audit_blocks(cfm_local, (std::size_t)MEL * 2) +
+            " mel=" + audit_blocks(mel_local, (std::size_t)MEL * 2) +
+            " f0=" + audit_blocks(f0, 2) +
+            " source=" + audit_blocks(src, kSamplesPerToken) +
+            " hift=" + audit_blocks(hift_generated, kSamplesPerToken);
+    }
     const double pipeline_total = now_ms() - pipeline_t0;
     state.encoder_ms += encoder_ms;
     state.cfm_ms += cfm_ms;

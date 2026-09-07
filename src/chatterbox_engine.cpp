@@ -16,6 +16,7 @@
 #include "mtl_tokenizer.h"
 #include "t3_mtl.h"
 #include "s3gen_pipeline.h"
+#include "s3tokenizer.h"
 #include "voice_encoder.h"
 #include "voice_features.h"
 #include "ggml.h"
@@ -52,6 +53,32 @@ std::string token_csv(const std::vector<int32_t>& tokens) {
         out += std::to_string(tokens[i]);
     }
     return out;
+}
+std::string string_csv(const std::vector<std::string>& values) {
+    std::string out;
+    for (const auto& value : values) {
+        if (!out.empty()) out += ',';
+        out += value;
+    }
+    return out.empty() ? "-" : out;
+}
+std::string float_hash(const std::vector<float>& values) {
+    return hash_hex(hash_bytes(values.data(), values.size() * sizeof(float)));
+}
+std::size_t token_edit_distance(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
+    std::vector<std::size_t> row(b.size() + 1);
+    for (std::size_t j = 0; j <= b.size(); ++j) row[j] = j;
+    for (std::size_t i = 1; i <= a.size(); ++i) {
+        std::size_t previous = row[0];
+        row[0] = i;
+        for (std::size_t j = 1; j <= b.size(); ++j) {
+            const std::size_t old = row[j];
+            row[j] = std::min({row[j] + 1, row[j - 1] + 1,
+                               previous + (a[i - 1] == b[j - 1] ? 0u : 1u)});
+            previous = old;
+        }
+    }
+    return row.back();
 }
 bool fifth_consecutive(const std::vector<int32_t>& generated, int32_t token) {
     if (generated.size() < 4) return false;
@@ -102,6 +129,7 @@ struct Engine::Impl {
     std::vector<float> embedding;
     std::vector<int32_t> prompt_token;
     std::unique_ptr<mtl_tokenizer> mtl_tok;
+    std::unique_ptr<s3tokv2_weights> audit_tok;
     s3gen_piece_state acoustic;
     std::vector<int32_t> speech_history;
     explicit Impl(const EngineOptions& o) : opts(o) {}
@@ -131,6 +159,13 @@ struct Engine::Impl {
         preload = std::thread([this] { s3gen_preload(opts.s3gen_gguf_path, opts.n_gpu_layers, opts.fastconv); });
         bake_voice();
         join(preload);
+        if (!opts.audit_dir.empty()) {
+            std::filesystem::create_directories(opts.audit_dir);
+            audit_tok = std::make_unique<s3tokv2_weights>();
+            if (!s3tokv2_load(opts.s3gen_gguf_path, *audit_tok))
+                throw std::runtime_error("S3 audit tokenizer load failed");
+            tts_emit("audit.ready", "dir=" + opts.audit_dir);
+        }
     }
     ~Impl() {
         join(preload);
@@ -228,11 +263,14 @@ struct Engine::Impl {
         if (text_tokens.empty()) throw std::runtime_error("empty T3 text tokens");
         tts_emit_piece("t3.text", std::string("session_piece=") + std::to_string(session_index)
             + " tokens=" + std::to_string(text_tokens.size()) + " token_hash=" + token_hash(text_tokens));
+        if (!opts.audit_dir.empty())
+            tts_emit_piece("t3.audit.text", "text_seq=" + token_csv(text_tokens));
 
         int n_past = 0, speech_pos = 1;
         int32_t token = 0, pending_mtl = -1;
         bool repeat_stopped = false;
         std::vector<int32_t> out, tokens;
+        std::vector<std::string> logits_hashes;
         out.reserve((size_t)opts.n_predict + 1);
         tokens.reserve((size_t)opts.n_predict);
         auto publish = [&](int32_t value) {
@@ -247,10 +285,12 @@ struct Engine::Impl {
             std::vector<float> logits_c, logits_u;
             if (!eval_prompt_mtl(model, allocr, n_threads, text_tokens, opts.exaggeration, logits_c, logits_u, n_past))
                 throw std::runtime_error("MTL prompt failed");
+            if (!opts.audit_dir.empty()) logits_hashes.push_back(float_hash(logits_c) + "/" + float_hash(logits_u));
             token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
         } else {
             std::vector<float> logits;
             if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past)) throw std::runtime_error("Turbo prompt failed");
+            if (!opts.audit_dir.empty()) logits_hashes.push_back(float_hash(logits));
             token = sample_next_token_ex(logits, out, sp, rng);
         }
         out.push_back(token);
@@ -261,10 +301,12 @@ struct Engine::Impl {
                 std::vector<float> logits_c, logits_u;
                 if (!eval_step_mtl(model, allocr, n_threads, n_past++, speech_pos++, token, logits_c, logits_u))
                     throw std::runtime_error("MTL step failed");
+                if (!opts.audit_dir.empty()) logits_hashes.push_back(float_hash(logits_c) + "/" + float_hash(logits_u));
                 token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
             } else {
                 std::vector<float> logits;
                 if (!eval_step(model, allocr, n_threads, n_past++, token, logits)) throw std::runtime_error("Turbo step failed");
+                if (!opts.audit_dir.empty()) logits_hashes.push_back(float_hash(logits));
                 token = sample_next_token_ex(logits, out, sp, rng);
             }
             if (fifth_consecutive(out, token)) { repeat_stopped = true; token = model.hparams.stop_speech_token; }
@@ -287,6 +329,9 @@ struct Engine::Impl {
             + " kv_pos=" + std::to_string(n_past)
             + " speech_pos=" + std::to_string(speech_pos)
             + vk_overlap_fields(model.backend));
+        if (!opts.audit_dir.empty())
+            tts_emit_piece("t3.audit.logits", "steps=" + std::to_string(logits_hashes.size()) +
+                " hashes=" + string_csv(logits_hashes));
         return tokens;
     }
     void emit_s3_line() {
@@ -318,6 +363,8 @@ struct Engine::Impl {
             + " samples=" + std::to_string(acoustic.samples)
             + " prompt_tokens=" + std::to_string(acoustic.prompt_tokens)
             + s3_overlap_fields());
+        if (!acoustic.audit_summary.empty()) tts_emit_piece("s3.audit", acoustic.audit_summary);
+        if (!acoustic.audit_local.empty()) tts_emit_piece("s3.audit.local", acoustic.audit_local);
     }
     void run_s3(const std::vector<int32_t>& tokens, int session_index, std::uint32_t external_piece, bool last_piece, const PieceCallback& cb) {
         auto synthesis_context = tts_get_context();
@@ -338,7 +385,9 @@ struct Engine::Impl {
             + " history_hash=" + token_hash(speech_history)
             + " new_tokens=" + std::to_string(tokens.size())
             + " new_hash=" + token_hash(tokens)
-            + " window_hash=" + token_hash(window));
+            + " window_hash=" + token_hash(window)
+            + " token_start=0 internal_final=1 lookahead=" + std::to_string(kSpeechLookaheadTokens)
+            + " audit=" + (opts.audit_dir.empty() ? "0" : "1"));
         s3gen_synthesize_opts s;
         s.s3gen_gguf_path = opts.s3gen_gguf_path;
         s.seed = opts.seed;
@@ -357,9 +406,28 @@ struct Engine::Impl {
         s.last_piece = last_piece;
         s.first_piece = (session_index <= 0);
         s.chunk_id = 0;
+        if (!opts.audit_dir.empty()) {
+            const auto ctx = tts_get_context();
+            s.audit_prefix = opts.audit_dir + "/r" + std::to_string(ctx.response) +
+                "_p" + std::to_string(external_piece);
+        }
         std::vector<float> pcm;
         s.pcm_out = &pcm;
         s3gen_synthesize(window, s);
+        if (audit_tok && !pcm.empty()) {
+            std::vector<float> audit_pcm = pcm;
+            normalise_lufs(audit_pcm, 24000, -27.0);
+            audit_pcm = resample_sinc(audit_pcm, 24000, 16000);
+            std::vector<int32_t> roundtrip;
+            if (!s3tokv2_tokenize(audit_pcm, *audit_tok, -1, roundtrip, threads(opts.n_threads), model.backend))
+                throw std::runtime_error("S3 audit round-trip tokenize failed");
+            tts_emit_piece("s3.roundtrip", "expected_tokens=" + std::to_string(tokens.size()) +
+                " expected_hash=" + token_hash(tokens) +
+                " observed_tokens=" + std::to_string(roundtrip.size()) +
+                " observed_hash=" + token_hash(roundtrip) +
+                " edit_distance=" + std::to_string(token_edit_distance(tokens, roundtrip)) +
+                " observed_seq=" + token_csv(roundtrip));
+        }
         if (!pcm.empty()) tts_session_note_first_audio();
         if (cb) cb(session_index, pcm.data(), pcm.size(), 0, true);
         if ((int)window.size() > kSpeechHistoryTokens) {

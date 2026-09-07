@@ -1,6 +1,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -45,9 +48,29 @@ void send_all(SOCKET socket, const void* src, std::size_t size) {
 std::string elapsed_ms(mono_clock::time_point start) {
     return std::to_string((int)std::chrono::duration<double, std::milli>(mono_clock::now() - start).count());
 }
+std::uint64_t wire_hash(const void* data, std::size_t size) {
+    const auto* p = static_cast<const std::uint8_t*>(data);
+    std::uint64_t h = 1469598103934665603ull;
+    for (std::size_t i = 0; i < size; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+std::string wire_hash_hex(const void* data, std::size_t size) {
+    char out[17];
+    std::snprintf(out, sizeof(out), "%016llx", (unsigned long long)wire_hash(data, size));
+    return out;
+}
+void audit_write(const std::string& dir, const std::string& name, const void* data, std::size_t size) {
+    if (dir.empty()) return;
+    std::filesystem::create_directories(dir);
+    std::ofstream out(std::filesystem::path(dir) / name, std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("cannot create wire audit artifact");
+    if (size) out.write(static_cast<const char*>(data), (std::streamsize)size);
+    if (!out) throw std::runtime_error("cannot write wire audit artifact");
+}
 
 struct wire_writer {
     SOCKET socket;
+    std::string audit_dir;
     std::vector<std::int16_t> pcm_buffer;
 
     void frame(response_kind kind, const request_t& request, std::uint32_t chunk,
@@ -64,7 +87,14 @@ struct wire_writer {
         pcm_buffer.resize(count);
         for (std::size_t i = 0; i < count; ++i)
             pcm_buffer[i] = static_cast<std::int16_t>(std::clamp(samples[i], -1.0f, 1.0f) * 32767.0f);
-        frame(response_kind::pcm, request, chunk, pcm_buffer.data(), pcm_buffer.size() * sizeof(std::int16_t));
+        const auto bytes = pcm_buffer.size() * sizeof(std::int16_t);
+        const std::string name = "native-r" + std::to_string(request.response) + "_p" +
+            std::to_string(request.piece) + "_c" + std::to_string(chunk) + ".pcm16";
+        audit_write(audit_dir, name, pcm_buffer.data(), bytes);
+        tts_emit("wire.pcm", "chunk=" + std::to_string(chunk) + " bytes=" + std::to_string(bytes) +
+            " fnv64=" + wire_hash_hex(pcm_buffer.data(), bytes) +
+            (audit_dir.empty() ? "" : " file=" + name));
+        frame(response_kind::pcm, request, chunk, pcm_buffer.data(), bytes);
     }
     void terminal(response_kind kind, const request_t& request, const std::string& message = {}) {
         frame(kind, request, 0, message.data(), message.size());
@@ -83,7 +113,7 @@ tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
     o.top_p = f("--top-p"); o.min_p = f("--min-p"); o.temperature = f("--temperature");
     o.repeat_penalty = f("--repeat-penalty"); o.cfg_weight = f("--cfg-weight");
     o.exaggeration = f("--exaggeration"); o.cfm_steps = i("--cfm-steps");
-    o.fastconv = i("--fastconv") != 0;
+    o.fastconv = i("--fastconv") != 0; o.audit_dir = s("--audit-dir");
     return tts_cpp::chatterbox::Engine(o);
 }
 
@@ -110,8 +140,8 @@ bool receive(SOCKET socket, request_t& request) {
     return true;
 }
 
-void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
-    wire_writer writer{client};
+void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts, const std::string& audit_dir) {
+    wire_writer writer{client, audit_dir};
     request_t first;
     if (!receive(client, first)) return;
     if (first.kind == request_kind::close) {
@@ -141,7 +171,12 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
     pieces.reserve(requests.size());
     for (const auto& request : requests) {
         tts_context_scope context(request.response, request.piece);
-        tts_emit("synthesis.queued", "chars=" + std::to_string(request.text.size()));
+        const std::string name = "native-r" + std::to_string(request.response) + "_p" +
+            std::to_string(request.piece) + ".request.utf8";
+        audit_write(audit_dir, name, request.text.data(), request.text.size());
+        tts_emit("synthesis.queued", "chars=" + std::to_string(request.text.size()) +
+            " fnv64=" + wire_hash_hex(request.text.data(), request.text.size()) +
+            (audit_dir.empty() ? "" : " file=" + name));
         pieces.push_back({request.piece, request.text});
     }
 
@@ -225,7 +260,7 @@ int main(int argc, char** argv) {
             if (client == INVALID_SOCKET) break;
             tts_set_connection(++connection);
             tts_emit("client.accepted", "ok");
-            try { serve(client, tts); }
+            try { serve(client, tts, args.at("--audit-dir")); }
             catch (const std::exception& error) { tts_emit("serve.failed", "error=" + std::string(error.what())); }
             closesocket(client); client = INVALID_SOCKET;
             tts_emit("client.done", "ok");
