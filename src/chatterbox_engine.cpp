@@ -360,7 +360,6 @@ struct Engine::Impl {
         std::vector<float> pcm;
         s.pcm_out = &pcm;
         s3gen_synthesize(window, s);
-        check();
         if (!pcm.empty()) tts_session_note_first_audio();
         if (cb) cb(session_index, pcm.data(), pcm.size(), 0, true);
         if ((int)window.size() > kSpeechHistoryTokens) {
