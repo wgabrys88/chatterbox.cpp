@@ -1433,7 +1433,6 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
             z[m2 * T_mu + t] = positioned_noise(seed + (generated && meanflow ? 2 : 0), frame * MEL + m2);
         }
     const std::string cfm_initial_hash = audit ? audit_dump(opts.audit_prefix, "cfm-z0", z) : std::string();
-    const std::vector<float> cfm_initial = audit ? z : std::vector<float>();
     std::vector<std::string> cfm_step_hashes;
     const int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps : (meanflow ? 2 : m.n_timesteps);
     if (!meanflow && cfm_steps < 5) throw std::runtime_error("non-meanflow CFM requires at least 5 steps");
@@ -1479,7 +1478,6 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         for (int t = 0; t < T_mel; ++t)
             mel[m2 * T_mel + t] = z[m2 * T_mu + (t + mel_off)];
     const std::string mel_generated_hash = audit ? audit_dump(opts.audit_prefix, "mel-generated", mel) : std::string();
-    const std::vector<float> mel_generated = audit ? mel : std::vector<float>();
     const int history_frames = history_tokens * 2;
     const int cached_frames = (int)state.mel.size() / MEL;
     if (cached_frames < history_frames) throw std::runtime_error("S3Gen mel history missing");
@@ -1506,7 +1504,6 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     const double hift_started = now_ms();
     auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft); hift_ms = now_ms() - hift_started;
     const std::string hift_hash = audit ? audit_dump(opts.audit_prefix, "hift-wav", wav) : std::string();
-    const std::vector<float> hift_generated = audit ? wav : std::vector<float>();
     const int n_trim = sr / 50;
     const int fade_len = 2 * n_trim;
     const int fade_in_samples = (opts.first_piece && opts.chunk_id == 0 && (int)wav.size() >= fade_len) ? n_trim : 0;
@@ -1547,10 +1544,6 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         const std::string phase_out_hash = audit_dump(opts.audit_prefix, "state-phase-out", state.phase);
         const std::string pending_out_hash = audit_dump(opts.audit_prefix, "state-pending-out", state.pending_pcm);
         const std::string emitted_hash = audit_dump(opts.audit_prefix, "pcm-emitted-f32", wav);
-        const auto encoder_local = audit_frame_major(mu, MEL, T_mu, mel_len1, T_mel);
-        const auto cfm0_local = audit_frame_major(cfm_initial, MEL, T_mu, mel_len1, T_mel);
-        const auto cfm_local = audit_frame_major(mel_generated, MEL, T_mel, 0, T_mel);
-        const auto mel_local = audit_frame_major(mel, MEL, T_mel, 0, T_mel);
         state.audit_summary =
             "dir=" + opts.audit_prefix +
             " output_tokens=" + std::to_string(output_tokens) +
@@ -1581,14 +1574,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
             " phase_out=" + phase_out_hash +
             " pending_in=" + pending_in_hash +
             " pending_out=" + pending_out_hash;
-        state.audit_local =
-            "encoder=" + audit_blocks(encoder_local, (std::size_t)MEL * 2) +
-            " cfm0=" + audit_blocks(cfm0_local, (std::size_t)MEL * 2) +
-            " cfm=" + audit_blocks(cfm_local, (std::size_t)MEL * 2) +
-            " mel=" + audit_blocks(mel_local, (std::size_t)MEL * 2) +
-            " f0=" + audit_blocks(f0, 2) +
-            " source=" + audit_blocks(src, kSamplesPerToken) +
-            " hift=" + audit_blocks(hift_generated, kSamplesPerToken);
+
     }
     const double pipeline_total = now_ms() - pipeline_t0;
     state.encoder_ms += encoder_ms;

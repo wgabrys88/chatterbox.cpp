@@ -265,7 +265,7 @@ struct Engine::Impl {
         tts_emit_piece("t3.text", std::string("session_piece=") + std::to_string(session_index)
             + " tokens=" + std::to_string(text_tokens.size()) + " token_hash=" + token_hash(text_tokens));
         if (!opts.audit_prefix.empty())
-            tts_emit_piece("t3.audit.text", "text_seq=" + token_csv(text_tokens));
+            tts_emit_piece("t3.audit.text", "tokens=" + std::to_string(text_tokens.size()));
 
         const auto audit_context = tts_get_context();
         const std::string audit_prefix = opts.audit_prefix.empty() ? "" : opts.audit_prefix + ".r" +
@@ -344,7 +344,6 @@ struct Engine::Impl {
         tts_emit_piece("t3.end", std::string("session_piece=") + std::to_string(session_index)
             + " speech_tokens=" + std::to_string(tokens.size())
             + " speech_hash=" + token_hash(tokens)
-            + " speech_seq=" + token_csv(tokens)
             + " tail_drop=" + std::to_string(tail_drop)
             + " tail_token=" + std::to_string(tail_drop ? pending_mtl : -1)
             + " ms=" + std::to_string((int)(elapsed + .5))
@@ -353,8 +352,7 @@ struct Engine::Impl {
             + " speech_pos=" + std::to_string(speech_pos)
             + vk_overlap_fields(model.backend));
         if (!opts.audit_prefix.empty())
-            tts_emit_piece("t3.audit.logits", "steps=" + std::to_string(logits_hashes.size()) +
-                " hashes=" + string_csv(logits_hashes));
+            tts_emit_piece("t3.audit.logits", "steps=" + std::to_string(logits_hashes.size()));
         diagnostic::tensor(audit_prefix, "t3-speech", tokens);
         diagnostic::event(audit_prefix, "t3.end", "\"steps\":"+std::to_string(audit_step)+
             ",\"termination\":"+diagnostic::quote(repeat_stopped ? "forced_repeat_eos" : "sampled_eos"));
@@ -390,7 +388,6 @@ struct Engine::Impl {
             + " prompt_tokens=" + std::to_string(acoustic.prompt_tokens)
             + s3_overlap_fields());
         if (!acoustic.audit_summary.empty()) tts_emit_piece("s3.audit", acoustic.audit_summary);
-        if (!acoustic.audit_local.empty()) tts_emit_piece("s3.audit.local", acoustic.audit_local);
     }
     void run_s3(const std::vector<int32_t>& tokens, int session_index, std::uint32_t external_piece, bool last_piece, const PieceCallback& cb) {
         auto synthesis_context = tts_get_context();
@@ -447,12 +444,12 @@ struct Engine::Impl {
             std::vector<int32_t> roundtrip;
             if (!s3tokv2_tokenize(audit_pcm, *audit_tok, -1, roundtrip, threads(opts.n_threads), model.backend))
                 throw std::runtime_error("S3 audit round-trip tokenize failed");
+            diagnostic::tensor(s.audit_prefix, "roundtrip-tokens", roundtrip);
             tts_emit_piece("s3.roundtrip", "expected_tokens=" + std::to_string(tokens.size()) +
                 " expected_hash=" + token_hash(tokens) +
                 " observed_tokens=" + std::to_string(roundtrip.size()) +
                 " observed_hash=" + token_hash(roundtrip) +
-                " edit_distance=" + std::to_string(token_edit_distance(tokens, roundtrip)) +
-                " observed_seq=" + token_csv(roundtrip));
+                " edit_distance=" + std::to_string(token_edit_distance(tokens, roundtrip)));
         }
         if (!pcm.empty()) tts_session_note_first_audio();
         if (cb) cb(session_index, pcm.data(), pcm.size(), 0, true);
