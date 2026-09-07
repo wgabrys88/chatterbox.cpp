@@ -461,7 +461,7 @@ static void build_encoder_cache(const model_ctx & m, encoder_cache & cache, int 
     cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
     ggml_gallocr_reserve(cache.allocr, gf); ggml_gallocr_alloc_graph(cache.allocr, gf);
 }
-static std::vector<float> run_encoder(model_ctx & m, const std::vector<float> & input_embed, int T, int D, bool first_window) {
+static std::vector<float> run_encoder(model_ctx & m, const std::vector<float> & input_embed, int T, int D, bool first_window, const std::string& audit_prefix) {
     encoder_cache local;
     if (first_window && !m.first_encoder) m.first_encoder = std::make_unique<encoder_cache>();
     encoder_cache & cache = first_window ? *m.first_encoder : local;
@@ -469,6 +469,8 @@ static std::vector<float> run_encoder(model_ctx & m, const std::vector<float> & 
     ggml_backend_tensor_set(cache.x_in, input_embed.data(), 0, input_embed.size()*sizeof(float));
     std::vector<float> pe1, pe2; compute_pos_emb(pe1, T, D); compute_pos_emb(pe2, 2*T, D);
     ggml_backend_tensor_set(cache.pos1, pe1.data(), 0, pe1.size()*sizeof(float)); ggml_backend_tensor_set(cache.pos2, pe2.data(), 0, pe2.size()*sizeof(float));
+    diagnostic::tensor(audit_prefix, "encoder-position1", pe1, {2*T-1,D});
+    diagnostic::tensor(audit_prefix, "encoder-position2", pe2, {4*T-1,D});
     compute(m.backend, cache.gf);
     std::vector<float> out((size_t)ggml_nelements(cache.mu)); ggml_backend_tensor_get(cache.mu, out.data(), 0, ggml_nbytes(cache.mu)); return out;
 }
@@ -1291,16 +1293,12 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     }
     if (audit) {
         diagnostic::tensor(opts.audit_prefix, "flow-tokens", flow_tokens);
-        std::vector<float> pos1, pos2;
-        compute_pos_emb(pos1,n_total,D); compute_pos_emb(pos2,2*n_total,D);
-        diagnostic::tensor(opts.audit_prefix,"encoder-position1",pos1,{n_total,D});
-        diagnostic::tensor(opts.audit_prefix,"encoder-position2",pos2,{2*n_total,D});
         auto device = ggml_backend_get_device(m.backend);
         diagnostic::event(opts.audit_prefix,"s3.backend","\"backend\":"+diagnostic::quote(ggml_backend_name(m.backend))+
             ",\"device\":"+diagnostic::quote(ggml_backend_dev_description(device)));
     }
     audit_dump(opts.audit_prefix, "input-embedding", input_embed);
-    mu_T = run_encoder(m, input_embed, n_total, D, opts.chunk_id == 0);
+    mu_T = run_encoder(m, input_embed, n_total, D, opts.chunk_id == 0, opts.audit_prefix);
     diagnostic::tensor(opts.audit_prefix, "encoder-full", mu_T, {2*n_total,MEL});
     int T_mu = 2 * n_total;
     // Dummy pad is encoder lookahead, not audio. Each hop speaks its own tokens once.
