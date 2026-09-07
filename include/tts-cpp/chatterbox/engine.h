@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -25,6 +26,11 @@ struct EngineOptions {
     int cfm_steps = 0;
     bool fastconv = false;
 };
+struct SynthesisPiece {
+    std::uint32_t id = 0;
+    bool last = false;
+    std::string text;
+};
 using PieceCallback = std::function<void(int, const float*, std::size_t, int, bool)>;
 class Engine {
 public:
@@ -35,7 +41,7 @@ public:
     Engine(Engine&&) noexcept;
     Engine& operator=(Engine&&) noexcept;
     void begin_synthesis();
-    void synthesize_pieces_streaming(const std::vector<std::string>&, const PieceCallback&);
+    void synthesize_pieces_streaming(const std::vector<SynthesisPiece>&, const PieceCallback&);
     void warm_up();
     void cancel();
 private:

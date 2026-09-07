@@ -1441,6 +1441,14 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     state.samples += (int)wav.size();
     state.prompt_tokens = n_prompt;
     state.speech_tokens = output_tokens - history_tokens;
+    state.history_tokens = history_tokens;
+    state.window_tokens = output_tokens;
+    state.cfm_steps_used = cfm_steps;
+    state.pending_in = pending;
+    state.emit_begin = begin;
+    state.emit_end = end;
+    state.hold = hold;
+    state.emitted = wav.size();
     *opts.pcm_out = std::move(wav);
 }
 void s3gen_preload(const std::string& path, int n_gpu_layers, bool fastconv) {

@@ -525,22 +525,6 @@ int32_t sample_next_token_ex(
     std::mt19937 & rng) {
     const int n = (int)logits.size();
     
-    if (generated.size() <= 5) {
-        std::vector<std::pair<int, float>> top5;
-        for (int i = 0; i < n; i++) {
-            top5.emplace_back(i, logits[i]);
-        }
-        std::partial_sort(top5.begin(), top5.begin() + 5, top5.end(),
-                         [](auto& a, auto& b){ return a.second > b.second; });
-        fprintf(stderr, "t3.top5: pos=%zu [(%d,%.3f),(%d,%.3f),(%d,%.3f),(%d,%.3f),(%d,%.3f)]\n",
-                generated.size(),
-                top5[0].first, top5[0].second,
-                top5[1].first, top5[1].second,
-                top5[2].first, top5[2].second,
-                top5[3].first, top5[3].second,
-                top5[4].first, top5[4].second);
-    }
-    
     std::vector<float> scores(logits.begin(), logits.end());
     if (params.temp > 0.0f && params.temp != 1.0f) {
         float inv_t = 1.0f / params.temp;
@@ -595,14 +579,10 @@ int32_t sample_next_token_ex(
     if (psum == 0.0f) return 0;
     for (float & p : probs) p /= psum;
     if (params.temp <= 0.0f) {
-        int selected = (int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end()));
-        fprintf(stderr, "t3.selected: pos=%zu token=%d temp=0\n", generated.size(), selected);
-        return selected;
+        return (int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end()));
     }
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    int selected = dist(rng);
-    fprintf(stderr, "t3.selected: pos=%zu token=%d temp=%.2f\n", generated.size(), selected, params.temp);
-    return selected;
+    return dist(rng);
 }
 void chatterbox_log_cb(ggml_log_level level, const char * text, void * ) {
     if (level >= GGML_LOG_LEVEL_ERROR && text) fputs(text, stderr);

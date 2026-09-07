@@ -629,6 +629,7 @@ bool run_step_pass_b2(const chatterbox_model & model,
                       ggml_gallocr_t allocr,
                       int n_threads,
                       int n_past,
+                      int speech_pos,
                       int32_t token,
                       std::vector<float> & logits_cond_out,
                       std::vector<float> & logits_uncond_out) {
@@ -646,7 +647,7 @@ bool run_step_pass_b2(const chatterbox_model & model,
         return false;
     }
     ggml_backend_tensor_set(t_tok, &token, 0, sizeof(token));
-    int32_t sp = n_past;
+    int32_t sp = speech_pos;
     ggml_backend_tensor_set(t_spos, &sp, 0, sizeof(sp));
     int32_t pos = n_past;
     ggml_backend_tensor_set(t_pos, &pos, 0, sizeof(pos));
@@ -661,6 +662,7 @@ bool run_step_pass(const chatterbox_model & model,
                    ggml_gallocr_t allocr,
                    int n_threads,
                    int n_past,
+                   int speech_pos,
                    int32_t token,
                    bool is_uncond,
                    std::vector<float> & logits_out) {
@@ -670,7 +672,7 @@ bool run_step_pass(const chatterbox_model & model,
         return false;
     }
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
-    int32_t sp = n_past;
+    int32_t sp = speech_pos;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_pos"), &sp, 0, sizeof(sp));
     int32_t pos = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos_ids"), &pos, 0, sizeof(pos));
@@ -1108,24 +1110,25 @@ bool eval_step_mtl(const chatterbox_model & model,
                    ggml_gallocr_t allocr,
                    int n_threads,
                    int n_past,
+                   int speech_pos,
                    int32_t token,
                    std::vector<float> & logits_cond_out,
                    std::vector<float> & logits_uncond_out) {
     if (model.hparams.max_speech_tokens > 0 &&
-        n_past >= model.hparams.max_speech_tokens) {
-        fprintf(stderr, "eval_step_mtl: n_past=%d exceeds max_speech_tokens=%d; "
+        speech_pos >= model.hparams.max_speech_tokens) {
+        fprintf(stderr, "eval_step_mtl: speech_pos=%d exceeds max_speech_tokens=%d; "
                         "stopping generation to avoid out-of-range speech_pos_emb lookup\n",
-                n_past, model.hparams.max_speech_tokens);
+                speech_pos, model.hparams.max_speech_tokens);
         return false;
     }
     const bool use_b2 = !ggml_backend_is_cpu(model.backend);
     if (use_b2) {
-        return run_step_pass_b2(model, allocr, n_threads, n_past, token,
+        return run_step_pass_b2(model, allocr, n_threads, n_past, speech_pos, token,
                                 logits_cond_out, logits_uncond_out);
     }
-    if (!run_step_pass(model, allocr, n_threads, n_past, token, false,
+    if (!run_step_pass(model, allocr, n_threads, n_past, speech_pos, token, false,
                        logits_cond_out)) return false;
-    if (!run_step_pass(model, allocr, n_threads, n_past, token, true,
+    if (!run_step_pass(model, allocr, n_threads, n_past, speech_pos, token, true,
                        logits_uncond_out)) return false;
     return true;
 }
@@ -1139,22 +1142,6 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
     std::vector<float> l(V);
     for (size_t i = 0; i < V; ++i) {
         l[i] = logits_cond[i] + p.cfg_weight * (logits_cond[i] - logits_uncond[i]);
-    }
-    
-    if (generated.size() <= 5) {
-        std::vector<std::pair<int, float>> top5;
-        for (size_t i = 0; i < V; i++) {
-            top5.emplace_back((int)i, l[i]);
-        }
-        std::partial_sort(top5.begin(), top5.begin() + 5, top5.end(),
-                         [](auto& a, auto& b){ return a.second > b.second; });
-        fprintf(stderr, "t3.mtl_top5: pos=%zu [(%d,%.3f),(%d,%.3f),(%d,%.3f),(%d,%.3f),(%d,%.3f)]\n",
-                generated.size(),
-                top5[0].first, top5[0].second,
-                top5[1].first, top5[1].second,
-                top5[2].first, top5[2].second,
-                top5[3].first, top5[3].second,
-                top5[4].first, top5[4].second);
     }
     
     if (p.repeat_penalty != 1.0f && !generated.empty()) {
@@ -1222,11 +1209,9 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
     for (size_t i = 0; i < V; ++i) {
         cum += probs[i];
         if (cum >= r) {
-            fprintf(stderr, "t3.mtl_selected: pos=%zu token=%d\n", generated.size(), (int32_t)i);
             return (int32_t) i;
         }
     }
-    fprintf(stderr, "t3.mtl_selected: pos=%zu token=%d (fallback)\n", generated.size(), (int32_t)(V - 1));
     return (int32_t)(V - 1);
 }
 }

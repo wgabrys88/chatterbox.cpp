@@ -16,9 +16,12 @@ struct tts_synthesis_context {
 
 inline std::string& tts_run_identity() { static std::string id; return id; }
 inline std::atomic<std::uint32_t>& tts_live_epoch() { static std::atomic<std::uint32_t> epoch{0}; return epoch; }
+inline std::atomic<unsigned long long>& tts_log_sequence() { static std::atomic<unsigned long long> seq{0}; return seq; }
+inline std::atomic<unsigned long long>& tts_connection() { static std::atomic<unsigned long long> id{0}; return id; }
 inline tts_synthesis_context& tts_context() { thread_local tts_synthesis_context c; return c; }
 inline void tts_set_run_identity(std::string id) { tts_run_identity() = std::move(id); }
 inline void tts_set_live_epoch(std::uint32_t epoch) { tts_live_epoch().store(epoch, std::memory_order_release); }
+inline void tts_set_connection(unsigned long long id) { tts_connection().store(id, std::memory_order_release); }
 inline void tts_set_context(std::uint32_t epoch, std::uint32_t response, std::uint32_t piece) { tts_context() = {epoch, response, piece, true}; }
 inline void tts_clear_context() { tts_context() = {}; }
 inline tts_synthesis_context tts_get_context() { return tts_context(); }
@@ -50,18 +53,23 @@ inline void tts_emit(const char* event, const char* extra, bool with_mono) {
     const auto ctx = tts_get_context();
     std::string ctx_str;
     if (ctx.valid) {
-        ctx_str = " epoch=" + std::to_string(ctx.epoch) + " piece=" + std::to_string(ctx.piece_id);
+        ctx_str = " epoch=" + std::to_string(ctx.epoch)
+            + " response=" + std::to_string(ctx.response_id)
+            + " piece=" + std::to_string(ctx.piece_id);
     }
+    const auto seq = tts_log_sequence().fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto connection = tts_connection().load(std::memory_order_acquire);
 
     if (with_mono) {
-        std::fprintf(stderr, "[%s] %s%s mono_us=%lld | %s%s%s\n",
-            ts, event, ctx_str.c_str(), tts_mono_us(), tts_run_identity().c_str(),
+        std::fprintf(stderr, "[%s] seq=%llu conn=%llu event=%s%s mono_us=%lld | %s%s%s\n",
+            ts, seq, connection, event, ctx_str.c_str(), tts_mono_us(), tts_run_identity().c_str(),
             extra ? " " : "", extra ? extra : "");
         std::fflush(stderr);
     } else {
-        std::fprintf(stderr, "[%s] %s%s | %s%s%s\n",
-            ts, event, ctx_str.c_str(), tts_run_identity().c_str(),
+        std::fprintf(stderr, "[%s] seq=%llu conn=%llu event=%s%s | %s%s%s\n",
+            ts, seq, connection, event, ctx_str.c_str(), tts_run_identity().c_str(),
             extra ? " " : "", extra ? extra : "");
+        std::fflush(stderr);
     }
 }
 
@@ -81,7 +89,6 @@ struct tts_session_acc {
     std::chrono::steady_clock::time_point t0{};
     std::chrono::steady_clock::time_point t1{};
     double first_audio_ms = -1;
-    double overlap_ms = 0;
     bool open = false;
 };
 
@@ -94,7 +101,6 @@ inline void tts_session_begin_if_needed() {
     if (s.open) return;
     s.t0 = s.t1 = std::chrono::steady_clock::now();
     s.first_audio_ms = -1;
-    s.overlap_ms = 0;
     s.open = true;
 }
 
@@ -106,10 +112,6 @@ inline void tts_session_note_first_audio() {
         std::chrono::steady_clock::now() - s.t0).count();
 }
 
-inline void tts_session_add_overlap(double ms) {
-    std::lock_guard<std::mutex> lock(tts_session_mu());
-    if (tts_session().open) tts_session().overlap_ms += ms;
-}
 
 inline void tts_session_touch_end() {
     std::lock_guard<std::mutex> lock(tts_session_mu());
@@ -117,17 +119,15 @@ inline void tts_session_touch_end() {
 }
 
 inline void tts_session_emit() {
-    int wall = 0, fa = -1, ov = 0;
+    int wall = 0, fa = -1;
     {
         std::lock_guard<std::mutex> lock(tts_session_mu());
         auto& s = tts_session();
         if (!s.open) return;
         wall = (int)(std::chrono::duration<double, std::milli>(s.t1 - s.t0).count() + 0.5);
         fa = s.first_audio_ms < 0 ? -1 : (int)(s.first_audio_ms + 0.5);
-        ov = (int)(s.overlap_ms + 0.5);
         s.open = false;
     }
     tts_emit_piece("session", std::string(" tts_synth=") + std::to_string(wall)
-        + " first_audio_ms=" + std::to_string(fa)
-        + " overlap_ms=" + std::to_string(ov));
+        + " first_audio_ms=" + std::to_string(fa));
 }

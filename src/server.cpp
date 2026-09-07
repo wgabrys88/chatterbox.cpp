@@ -22,7 +22,7 @@ using args_t = std::unordered_map<std::string, std::string>;
 
 namespace {
 constexpr std::uint32_t PROTOCOL_MAGIC = 0x32525454u; // "TTR2" little-endian
-constexpr std::uint32_t PROTOCOL_VERSION = 2;
+constexpr std::uint32_t PROTOCOL_VERSION = 3;
 constexpr std::uint32_t MAX_TEXT_BYTES = 1u << 20;
 
 enum class request_kind : std::uint32_t { synthesize = 1, advance_epoch = 2, close = 3 };
@@ -33,6 +33,7 @@ struct request_t {
     std::uint32_t epoch = 0;
     std::uint32_t response = 0;
     std::uint32_t piece = 0;
+    std::uint32_t total = 0;
     std::string text;
     mono_clock::time_point queued{};
 };
@@ -112,25 +113,27 @@ tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
 }
 
 bool receive(SOCKET socket, request_t& request) {
-    std::uint32_t header[7];
+    std::uint32_t header[8];
     if (!recv_all(socket, header, sizeof(header))) return false;
     if (header[0] != PROTOCOL_MAGIC || header[1] != PROTOCOL_VERSION) throw std::runtime_error("unsupported TTS protocol");
     if (header[2] < static_cast<std::uint32_t>(request_kind::synthesize) || header[2] > static_cast<std::uint32_t>(request_kind::close))
         throw std::runtime_error("invalid TTS request kind");
     request = {};
     request.kind = static_cast<request_kind>(header[2]);
-    request.epoch = header[3]; request.response = header[4]; request.piece = header[5];
-    if (header[6] > MAX_TEXT_BYTES) throw std::runtime_error("TTS request too large");
-    if (request.kind != request_kind::synthesize && (header[6] || request.response || request.piece))
+    request.epoch = header[3]; request.response = header[4]; request.piece = header[5]; request.total = header[6];
+    if (header[7] > MAX_TEXT_BYTES) throw std::runtime_error("TTS request too large");
+    if (request.kind != request_kind::synthesize && (header[7] || request.response || request.piece || request.total))
         throw std::runtime_error("invalid TTS control frame");
-    request.text.resize(header[6]);
-    if (header[6] && !recv_all(socket, request.text.data(), request.text.size())) throw std::runtime_error("truncated TTS request");
-    if (request.kind == request_kind::synthesize && request.text.empty()) throw std::runtime_error("empty TTS sentence");
+    request.text.resize(header[7]);
+    if (header[7] && !recv_all(socket, request.text.data(), request.text.size())) throw std::runtime_error("truncated TTS request");
+    if (request.kind == request_kind::synthesize && (request.text.empty() || request.total == 0 || request.piece >= request.total))
+        throw std::runtime_error("invalid TTS sentence frame");
     request.queued = mono_clock::now();
     return true;
 }
 
 void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
+    tts.begin_synthesis();
     wire_writer writer{client};
     std::mutex mutex;
     std::condition_variable changed;
@@ -156,8 +159,7 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
         }
     };
     std::thread synth([&] {
-        std::optional<request_t> previous;
-        mono_clock::time_point previous_ended{};
+        unsigned long long batch_id = 0;
         try {
         for (;;) {
             std::vector<request_t> batch;
@@ -166,14 +168,22 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
                 changed.wait(lock, [&] { return stop.load(std::memory_order_acquire) || !pending.empty(); });
                 if (stop.load(std::memory_order_acquire) && pending.empty()) break;
                 const auto epoch = pending.front().epoch;
-                while (!pending.empty() && pending.front().epoch == epoch) {
+                const auto response = pending.front().response;
+                while (!pending.empty() && pending.front().epoch == epoch && pending.front().response == response) {
                     batch.push_back(std::move(pending.front()));
                     pending.pop_front();
                 }
                 active = batch.front();
-                tts.begin_synthesis();
             }
             const auto started = mono_clock::now();
+            {
+                tts_context_scope batch_context(batch.front().epoch, batch.front().response, batch.front().piece);
+                tts_emit("synthesis.batch", std::string("batch=") + std::to_string(++batch_id)
+                    + " count=" + std::to_string(batch.size())
+                    + " first_piece=" + std::to_string(batch.front().piece)
+                    + " last_piece=" + std::to_string(batch.back().piece)
+                    + " total=" + std::to_string(batch.front().total));
+            }
             for (const auto& request : batch) {
                 tts_context_scope context(request.epoch, request.response, request.piece);
                 tts_emit("synthesis.start", std::string(" chars=") + std::to_string(request.text.size()));
@@ -191,10 +201,10 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
             };
             try {
                 bool first_pcm = true;
-                std::vector<std::string> texts;
-                texts.reserve(batch.size());
-                for (const auto& request : batch) texts.push_back(request.text);
-                tts.synthesize_pieces_streaming(texts, [&](int index, const float* data, std::size_t size, int chunk, bool final) {
+                std::vector<tts_cpp::chatterbox::SynthesisPiece> pieces;
+                pieces.reserve(batch.size());
+                for (const auto& request : batch) pieces.push_back({request.piece, request.piece + 1 == request.total, request.text});
+                tts.synthesize_pieces_streaming(pieces, [&](int index, const float* data, std::size_t size, int chunk, bool final) {
                     if (index < 0 || (size_t)index >= batch.size()) return;
                     const auto& request = batch[(size_t)index];
                     if (live_epoch.load(std::memory_order_acquire) != request.epoch) {
@@ -210,9 +220,9 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
                         const bool completed = live_epoch.load(std::memory_order_acquire) == request.epoch;
                         finished[(size_t)index] = 1;
                         writer.terminal(completed ? response_kind::done : response_kind::cancelled, request);
-                        previous_ended = mono_clock::now(); previous = request;
+                        const auto ended = mono_clock::now();
                         tts_context_scope piece_context(request.epoch, request.response, request.piece);
-                        if (completed) tts_emit("synthesis.completed", std::string(" ms=") + elapsed_ms(previous_ended, started) + " terminal=done");
+                        if (completed) tts_emit("synthesis.completed", std::string(" ms=") + elapsed_ms(ended, started) + " terminal=done");
                         else tts_emit("synthesis.cancelled", " state=active");
                     }
                 });
@@ -224,7 +234,6 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
                     cancelled = live_epoch.load(std::memory_order_acquire) != batch.front().epoch || stop.load(std::memory_order_acquire);
                     if (!cancelled) { failed = true; stop.store(true, std::memory_order_release); shutdown(client, SD_RECEIVE); }
                 }
-                previous_ended = mono_clock::now(); previous = batch.front();
                 if (cancelled) tts_emit("synthesis.cancelled", " state=active");
                 else tts_emit("synthesis.failed", " error=" + std::string(error.what()));
                 terminal_remaining(cancelled ? response_kind::cancelled : response_kind::error, cancelled ? std::string{} : error.what());
@@ -255,7 +264,6 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
                 notify_synth = !pending.empty() && !socket_has_data(client);
             }
             if (notify_synth) changed.notify_one();
-            tts_emit("serve.recv-wait", " entering");
             if (!receive(client, request)) {
                 tts_emit("serve.recv-false", " reason=client_closed");
                 break;
@@ -279,13 +287,11 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
                 if (request.epoch <= old_epoch) throw std::runtime_error("epoch must advance monotonically");
                 bool cancel_active = false;
                 std::vector<request_t> queued_cancelled;
-                std::optional<request_t> in_flight;
                 {
                     std::lock_guard lock(mutex);
                     live_epoch.store(request.epoch, std::memory_order_release);
                     tts_set_live_epoch(request.epoch);
                     cancel_active = active.has_value() && active->epoch != request.epoch;
-                    if (cancel_active) in_flight = active;
                     queued_cancelled = cancel_queued(request.epoch);
                 }
                 acknowledge_cancelled(queued_cancelled);
@@ -342,7 +348,7 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
     if (failed) { tts_emit("serve.failed", " ok"); }
     if (unexpected_disconnect) { tts_emit("client.disconnected", " ok"); }
     if (close_requested) {
-        request_t close_frame{request_kind::close, live_epoch.load(), 0, 0, {}};
+        request_t close_frame{request_kind::close, live_epoch.load(), 0, 0, 0, {}};
         writer.terminal(response_kind::closed, close_frame);
         tts_emit("server.closed", " ok");
     }
@@ -379,13 +385,13 @@ int main(int argc, char** argv) {
 
         static int iter = 0;
         for (;;) {
-            tts_emit("accept-loop.iteration", std::string(" iter=") + std::to_string(++iter));
+            ++iter;
             client = accept(listener, nullptr, nullptr);
-            tts_emit("accept-loop.accepted", std::string(" client=") + std::to_string(client));
             if (client == INVALID_SOCKET) {
                 tts_emit("accept-loop.broken", std::string(" error=") + std::to_string(WSAGetLastError()));
                 break;
             }
+            tts_set_connection((unsigned long long)iter);
             tts_emit("client.accepted", " ok");
             try {
                 tts_emit("serve.begin", " ok");
