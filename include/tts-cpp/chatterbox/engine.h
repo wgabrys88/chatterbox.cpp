@@ -28,7 +28,6 @@ struct EngineOptions {
 };
 struct SynthesisPiece {
     std::uint32_t id = 0;
-    bool last = false;
     std::string text;
 };
 using PieceCallback = std::function<void(int, const float*, std::size_t, int, bool)>;
@@ -40,10 +39,8 @@ public:
     Engine& operator=(const Engine&) = delete;
     Engine(Engine&&) noexcept;
     Engine& operator=(Engine&&) noexcept;
-    void begin_synthesis();
     void synthesize_pieces_streaming(const std::vector<SynthesisPiece>&, const PieceCallback&);
     void warm_up();
-    void cancel();
 private:
     struct Impl;
     std::unique_ptr<Impl> pimpl_;

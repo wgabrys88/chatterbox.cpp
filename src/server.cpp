@@ -1,15 +1,8 @@
 #include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
-#include <deque>
-#include <mutex>
-#include <optional>
-#include <set>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <winsock2.h>
@@ -21,21 +14,17 @@ using mono_clock = std::chrono::steady_clock;
 using args_t = std::unordered_map<std::string, std::string>;
 
 namespace {
-constexpr std::uint32_t PROTOCOL_MAGIC = 0x32525454u; // "TTR2" little-endian
-constexpr std::uint32_t PROTOCOL_VERSION = 3;
+constexpr std::uint32_t PROTOCOL_MAGIC = 0x32525454u;
+constexpr std::uint32_t PROTOCOL_VERSION = 4;
 constexpr std::uint32_t MAX_TEXT_BYTES = 1u << 20;
 
-enum class request_kind : std::uint32_t { synthesize = 1, advance_epoch = 2, close = 3 };
-enum class response_kind : std::uint32_t { pcm = 1, done = 2, cancelled = 3, error = 4, closed = 5 };
+enum class request_kind : std::uint32_t { synthesize = 1, close = 3 };
+enum class response_kind : std::uint32_t { pcm = 1, done = 2, error = 4, closed = 5 };
 
 struct request_t {
     request_kind kind = request_kind::synthesize;
-    std::uint32_t epoch = 0;
-    std::uint32_t response = 0;
-    std::uint32_t piece = 0;
-    std::uint32_t total = 0;
+    std::uint32_t response = 0, piece = 0, total = 0;
     std::string text;
-    mono_clock::time_point queued{};
 };
 
 bool io_all(SOCKET socket, char* data, std::size_t size, bool sending) {
@@ -48,49 +37,35 @@ bool io_all(SOCKET socket, char* data, std::size_t size, bool sending) {
     }
     return true;
 }
-
-bool recv_all(SOCKET socket, void* dst, std::size_t size) {
-    return io_all(socket, static_cast<char*>(dst), size, false);
-}
-
+bool recv_all(SOCKET socket, void* dst, std::size_t size) { return io_all(socket, static_cast<char*>(dst), size, false); }
 void send_all(SOCKET socket, const void* src, std::size_t size) {
     if (!io_all(socket, const_cast<char*>(static_cast<const char*>(src)), size, true))
         throw std::runtime_error("TTS send failed");
 }
-
-std::string elapsed_ms(mono_clock::time_point a, mono_clock::time_point b) {
-    return std::to_string((int)std::chrono::duration<double, std::milli>(a - b).count());
-}
-
-bool socket_has_data(SOCKET socket) {
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(socket, &fds);
-    timeval tv{0, 0};
-    return select(0, &fds, nullptr, nullptr, &tv) > 0;
+std::string elapsed_ms(mono_clock::time_point start) {
+    return std::to_string((int)std::chrono::duration<double, std::milli>(mono_clock::now() - start).count());
 }
 
 struct wire_writer {
     SOCKET socket;
-    std::mutex mutex;
+    std::vector<std::int16_t> pcm_buffer;
 
-    void frame(response_kind kind, const request_t& request, std::uint32_t chunk, const void* data = nullptr, std::size_t size = 0) {
+    void frame(response_kind kind, const request_t& request, std::uint32_t chunk,
+               const void* data = nullptr, std::size_t size = 0) {
         if (size > UINT32_MAX) throw std::runtime_error("TTS frame too large");
         const std::uint32_t header[] = {
             PROTOCOL_MAGIC, PROTOCOL_VERSION, static_cast<std::uint32_t>(kind),
-            request.epoch, request.response, request.piece, chunk, static_cast<std::uint32_t>(size)
+            request.response, request.piece, chunk, static_cast<std::uint32_t>(size)
         };
-        std::lock_guard lock(mutex);
         send_all(socket, header, sizeof(header));
         if (size) send_all(socket, data, size);
     }
-
     void pcm(const request_t& request, std::uint32_t chunk, const float* samples, std::size_t count) {
-        thread_local std::vector<std::int16_t> out; out.resize(count);
-        for (std::size_t i = 0; i < count; ++i) out[i] = static_cast<std::int16_t>(std::clamp(samples[i], -1.0f, 1.0f) * 32767.0f);
-        frame(response_kind::pcm, request, chunk, out.data(), out.size() * sizeof(std::int16_t));
+        pcm_buffer.resize(count);
+        for (std::size_t i = 0; i < count; ++i)
+            pcm_buffer[i] = static_cast<std::int16_t>(std::clamp(samples[i], -1.0f, 1.0f) * 32767.0f);
+        frame(response_kind::pcm, request, chunk, pcm_buffer.data(), pcm_buffer.size() * sizeof(std::int16_t));
     }
-
     void terminal(response_kind kind, const request_t& request, const std::string& message = {}) {
         frame(kind, request, 0, message.data(), message.size());
     }
@@ -113,245 +88,105 @@ tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
 }
 
 bool receive(SOCKET socket, request_t& request) {
-    std::uint32_t header[8];
+    std::uint32_t header[7];
     if (!recv_all(socket, header, sizeof(header))) return false;
-    if (header[0] != PROTOCOL_MAGIC || header[1] != PROTOCOL_VERSION) throw std::runtime_error("unsupported TTS protocol");
-    if (header[2] < static_cast<std::uint32_t>(request_kind::synthesize) || header[2] > static_cast<std::uint32_t>(request_kind::close))
+    if (header[0] != PROTOCOL_MAGIC || header[1] != PROTOCOL_VERSION)
+        throw std::runtime_error("unsupported TTS protocol");
+    if (header[2] != static_cast<std::uint32_t>(request_kind::synthesize) &&
+        header[2] != static_cast<std::uint32_t>(request_kind::close))
         throw std::runtime_error("invalid TTS request kind");
     request = {};
     request.kind = static_cast<request_kind>(header[2]);
-    request.epoch = header[3]; request.response = header[4]; request.piece = header[5]; request.total = header[6];
-    if (header[7] > MAX_TEXT_BYTES) throw std::runtime_error("TTS request too large");
-    if (request.kind != request_kind::synthesize && (header[7] || request.response || request.piece || request.total))
-        throw std::runtime_error("invalid TTS control frame");
-    request.text.resize(header[7]);
-    if (header[7] && !recv_all(socket, request.text.data(), request.text.size())) throw std::runtime_error("truncated TTS request");
-    if (request.kind == request_kind::synthesize && (request.text.empty() || request.total == 0 || request.piece >= request.total))
-        throw std::runtime_error("invalid TTS sentence frame");
-    request.queued = mono_clock::now();
+    request.response = header[3]; request.piece = header[4]; request.total = header[5];
+    if (header[6] > MAX_TEXT_BYTES) throw std::runtime_error("TTS request too large");
+    if (request.kind == request_kind::close && (header[3] || header[4] || header[5] || header[6]))
+        throw std::runtime_error("invalid TTS close frame");
+    request.text.resize(header[6]);
+    if (header[6] && !recv_all(socket, request.text.data(), request.text.size()))
+        throw std::runtime_error("truncated TTS request");
+    if (request.kind == request_kind::synthesize &&
+        (request.text.empty() || !request.total || request.piece >= request.total))
+        throw std::runtime_error("invalid TTS synthesis frame");
     return true;
 }
 
 void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
-    tts.begin_synthesis();
     wire_writer writer{client};
-    std::mutex mutex;
-    std::condition_variable changed;
-    std::deque<request_t> pending;
-    std::optional<request_t> active;
-    std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>> accepted;
-    std::atomic<std::uint32_t> live_epoch{0};
-    std::atomic<bool> stop{false};
-    bool failed = false;
-    auto cancel_queued = [&](std::uint32_t new_epoch) {
-        std::vector<request_t> cancelled;
-        for (auto it = pending.begin(); it != pending.end();) {
-            if (it->epoch != new_epoch) { cancelled.push_back(std::move(*it)); it = pending.erase(it); }
-            else ++it;
-        }
-        return cancelled;
-    };
-    auto acknowledge_cancelled = [&](const std::vector<request_t>& cancelled) {
-        for (const auto& request : cancelled) {
-            tts_context_scope context(request.epoch, request.response, request.piece);
-            writer.terminal(response_kind::cancelled, request);
-            tts_emit("synthesis.cancelled", " state=queued");
-        }
-    };
-    std::thread synth([&] {
-        unsigned long long batch_id = 0;
-        try {
-        for (;;) {
-            std::vector<request_t> batch;
-            {
-                std::unique_lock lock(mutex);
-                changed.wait(lock, [&] { return stop.load(std::memory_order_acquire) || !pending.empty(); });
-                if (stop.load(std::memory_order_acquire) && pending.empty()) break;
-                const auto epoch = pending.front().epoch;
-                const auto response = pending.front().response;
-                while (!pending.empty() && pending.front().epoch == epoch && pending.front().response == response) {
-                    batch.push_back(std::move(pending.front()));
-                    pending.pop_front();
-                }
-                active = batch.front();
-            }
-            const auto started = mono_clock::now();
-            {
-                tts_context_scope batch_context(batch.front().epoch, batch.front().response, batch.front().piece);
-                tts_emit("synthesis.batch", std::string("batch=") + std::to_string(++batch_id)
-                    + " count=" + std::to_string(batch.size())
-                    + " first_piece=" + std::to_string(batch.front().piece)
-                    + " last_piece=" + std::to_string(batch.back().piece)
-                    + " total=" + std::to_string(batch.front().total));
-            }
-            for (const auto& request : batch) {
-                tts_context_scope context(request.epoch, request.response, request.piece);
-                tts_emit("synthesis.start", std::string(" chars=") + std::to_string(request.text.size()));
-            }
-            tts_context_scope context(batch.front().epoch, batch.front().response, batch.front().piece);
-            std::vector<char> finished(batch.size(), 0);
-            auto terminal_remaining = [&](response_kind kind, const std::string& message = {}) {
-                std::lock_guard lock(mutex);
-                for (size_t i = 0; i < batch.size(); ++i) {
-                    if (finished[i]) continue;
-                    finished[i] = 1;
-                    writer.terminal(kind, batch[i], message);
-                }
-                active.reset();
-            };
-            try {
-                bool first_pcm = true;
-                std::vector<tts_cpp::chatterbox::SynthesisPiece> pieces;
-                pieces.reserve(batch.size());
-                for (const auto& request : batch) pieces.push_back({request.piece, request.piece + 1 == request.total, request.text});
-                tts.synthesize_pieces_streaming(pieces, [&](int index, const float* data, std::size_t size, int chunk, bool final) {
-                    if (index < 0 || (size_t)index >= batch.size()) return;
-                    const auto& request = batch[(size_t)index];
-                    if (live_epoch.load(std::memory_order_acquire) != request.epoch) {
-                        if (size) tts_emit("synthesis.cancelled", std::string(" state=pcm-after-advance bytes=") + std::to_string(size * sizeof(std::int16_t)));
-                        return;
-                    }
-                    if (size) {
-                        if (first_pcm) { first_pcm = false; tts_emit("synthesis.first_result", std::string(" bytes=") + std::to_string(size * sizeof(std::int16_t)) + " ms=" + elapsed_ms(mono_clock::now(), started)); }
-                        writer.pcm(request, static_cast<std::uint32_t>(chunk), data, size);
-                    }
-                    if (final) {
-                        std::lock_guard lock(mutex);
-                        const bool completed = live_epoch.load(std::memory_order_acquire) == request.epoch;
-                        finished[(size_t)index] = 1;
-                        writer.terminal(completed ? response_kind::done : response_kind::cancelled, request);
-                        const auto ended = mono_clock::now();
-                        tts_context_scope piece_context(request.epoch, request.response, request.piece);
-                        if (completed) tts_emit("synthesis.completed", std::string(" ms=") + elapsed_ms(ended, started) + " terminal=done");
-                        else tts_emit("synthesis.cancelled", " state=active");
-                    }
-                });
-                terminal_remaining(response_kind::cancelled);
-            } catch (const std::exception& error) {
-                bool cancelled = false;
-                {
-                    std::lock_guard lock(mutex);
-                    cancelled = live_epoch.load(std::memory_order_acquire) != batch.front().epoch || stop.load(std::memory_order_acquire);
-                    if (!cancelled) { failed = true; stop.store(true, std::memory_order_release); shutdown(client, SD_RECEIVE); }
-                }
-                if (cancelled) tts_emit("synthesis.cancelled", " state=active");
-                else tts_emit("synthesis.failed", " error=" + std::string(error.what()));
-                terminal_remaining(cancelled ? response_kind::cancelled : response_kind::error, cancelled ? std::string{} : error.what());
-            }
-            {
-                std::lock_guard lock(mutex);
-                if (active && active->epoch == batch.front().epoch) active.reset();
-            }
-            changed.notify_all();
-        }
-        } catch (const std::exception& error) {
-            {
-                std::lock_guard lock(mutex);
-                failed = true; stop.store(true, std::memory_order_release); active.reset();
-            }
-            tts.cancel(); shutdown(client, SD_BOTH); changed.notify_all();
-            tts_emit("synthesis.worker.failed", " error=" + std::string(error.what()));
-        }
-    });
-
-    bool close_requested = false;
-    try {
-        request_t request;
-        while (!close_requested) {
-            bool notify_synth = false;
-            {
-                std::lock_guard lock(mutex);
-                notify_synth = !pending.empty() && !socket_has_data(client);
-            }
-            if (notify_synth) changed.notify_one();
-            if (!receive(client, request)) {
-                tts_emit("serve.recv-false", " reason=client_closed");
-                break;
-            }
-            if (request.kind == request_kind::synthesize) {
-                if (request.epoch != live_epoch.load(std::memory_order_acquire)) {
-                    writer.terminal(response_kind::error, request, "sentence epoch is not live"); continue;
-                }
-                {
-                    std::lock_guard lock(mutex);
-                    if (!accepted.insert(std::make_tuple(request.epoch, request.response, request.piece)).second)
-                        throw std::runtime_error("duplicate synthesis identity");
-                    pending.push_back(request);
-                }
-                { tts_context_scope context(request.epoch, request.response, request.piece); tts_emit("synthesis.queued"); }
-                continue;
-            }
-
-            if (request.kind == request_kind::advance_epoch) {
-                const auto old_epoch = live_epoch.load(std::memory_order_acquire);
-                if (request.epoch <= old_epoch) throw std::runtime_error("epoch must advance monotonically");
-                bool cancel_active = false;
-                std::vector<request_t> queued_cancelled;
-                {
-                    std::lock_guard lock(mutex);
-                    live_epoch.store(request.epoch, std::memory_order_release);
-                    tts_set_live_epoch(request.epoch);
-                    cancel_active = active.has_value() && active->epoch != request.epoch;
-                    queued_cancelled = cancel_queued(request.epoch);
-                }
-                acknowledge_cancelled(queued_cancelled);
-                if (cancel_active) tts.cancel();
-                tts_emit("epoch.advanced", " from=" + std::to_string(old_epoch) + " to=" + std::to_string(request.epoch));
-                changed.notify_all();
-                continue;
-            }
-
-            if (request.kind == request_kind::close) {
-                close_requested = true;
-                std::vector<request_t> queued_cancelled;
-                bool cancel_active = false;
-                {
-                    std::lock_guard lock(mutex);
-                    cancel_active = active.has_value();
-                    queued_cancelled = cancel_queued(UINT32_MAX);
-                    stop.store(true, std::memory_order_release);
-                    const auto closing_epoch = live_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
-                    tts_set_live_epoch(closing_epoch);
-                }
-                acknowledge_cancelled(queued_cancelled);
-                if (cancel_active) tts.cancel();
-                tts_emit("server.close.requested", " ok");
-                changed.notify_all();
-            }
-        }
-    } catch (...) {
-        tts_emit("serve.catch-all", " entering");
-        {
-            std::lock_guard lock(mutex);
-            stop.store(true, std::memory_order_release);
-            const auto failed_epoch = live_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
-            tts_set_live_epoch(failed_epoch);
-        }
-        tts.cancel(); changed.notify_all();
-        if (synth.joinable()) synth.join();
-        tts_session_emit();
-        tts_emit("serve.catch-all", " done");
+    request_t first;
+    if (!receive(client, first)) return;
+    if (first.kind == request_kind::close) {
+        writer.terminal(response_kind::closed, first);
         return;
     }
+    if (first.piece != 0) throw std::runtime_error("first TTS piece must be zero");
 
-    const bool unexpected_disconnect = !close_requested;
-    if (unexpected_disconnect) {
-        std::lock_guard lock(mutex);
-        stop.store(true, std::memory_order_release);
-        const auto disconnected_epoch = live_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
-        tts_set_live_epoch(disconnected_epoch);
-        tts.cancel();
-        changed.notify_all();
+    std::vector<request_t> requests;
+    requests.reserve(first.total);
+    requests.push_back(std::move(first));
+    for (std::uint32_t expected = 1; expected < requests[0].total; ++expected) {
+        request_t request;
+        if (!receive(client, request)) throw std::runtime_error("TTS request ended before all pieces arrived");
+        if (request.kind != request_kind::synthesize || request.response != requests[0].response ||
+            request.total != requests[0].total || request.piece != expected)
+            throw std::runtime_error("non-contiguous TTS request");
+        requests.push_back(std::move(request));
     }
-    if (synth.joinable()) synth.join();
+
+    const auto started = mono_clock::now();
+    {
+        tts_context_scope context(requests[0].response, 0);
+        tts_emit("synthesis.request", "pieces=" + std::to_string(requests.size()));
+    }
+    std::vector<tts_cpp::chatterbox::SynthesisPiece> pieces;
+    pieces.reserve(requests.size());
+    for (const auto& request : requests) {
+        tts_context_scope context(request.response, request.piece);
+        tts_emit("synthesis.queued", "chars=" + std::to_string(request.text.size()));
+        pieces.push_back({request.piece, request.text});
+    }
+
+    std::vector<bool> done(requests.size(), false);
+    bool first_pcm = true;
+    tts_context_scope synthesis_context(requests[0].response, 0);
+    try {
+        tts.synthesize_pieces_streaming(pieces, [&](int index, const float* data, std::size_t size, int chunk, bool final) {
+            if (index < 0 || static_cast<std::size_t>(index) >= requests.size())
+                throw std::runtime_error("invalid TTS callback index");
+            const auto& request = requests[static_cast<std::size_t>(index)];
+            tts_context_scope context(request.response, request.piece);
+            if (size) {
+                if (first_pcm) {
+                    first_pcm = false;
+                    tts_emit("synthesis.first_result", "bytes=" + std::to_string(size * sizeof(std::int16_t)) +
+                        " ms=" + elapsed_ms(started));
+                }
+                writer.pcm(request, static_cast<std::uint32_t>(chunk), data, size);
+            }
+            if (final) {
+                done[static_cast<std::size_t>(index)] = true;
+                writer.terminal(response_kind::done, request);
+                tts_emit("synthesis.completed", "ms=" + elapsed_ms(started));
+            }
+        });
+    } catch (const std::exception& error) {
+        auto it = std::find(done.begin(), done.end(), false);
+        const std::size_t index = it == done.end() ? requests.size() - 1 : static_cast<std::size_t>(it - done.begin());
+        tts_context_scope context(requests[index].response, requests[index].piece);
+        writer.terminal(response_kind::error, requests[index], error.what());
+        tts_emit("synthesis.failed", "error=" + std::string(error.what()));
+        tts_session_emit();
+        return;
+    }
     tts_session_emit();
-    if (failed) { tts_emit("serve.failed", " ok"); }
-    if (unexpected_disconnect) { tts_emit("client.disconnected", " ok"); }
-    if (close_requested) {
-        request_t close_frame{request_kind::close, live_epoch.load(), 0, 0, 0, {}};
-        writer.terminal(response_kind::closed, close_frame);
-        tts_emit("server.closed", " ok");
+
+    request_t close;
+    if (!receive(client, close)) {
+        tts_emit("client.disconnected", "after=synthesis");
+        return;
     }
+    if (close.kind != request_kind::close) throw std::runtime_error("expected TTS close frame");
+    writer.terminal(response_kind::closed, close);
+    tts_emit("server.closed", "ok");
 }
 } // namespace
 
@@ -362,7 +197,7 @@ int main(int argc, char** argv) {
         args_t args;
         for (int i = 1; i + 1 < argc; i += 2) args[argv[i]] = argv[i + 1];
         tts_set_run_identity(args.at("--run-id"));
-        tts_emit("server.start", std::string(" port=") + args.at("--port"));
+        tts_emit("server.start", "port=" + args.at("--port"));
         auto tts = make_engine(args);
         tts.warm_up();
 
@@ -372,7 +207,8 @@ int main(int argc, char** argv) {
         listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (listener == INVALID_SOCKET) throw std::runtime_error("socket failed");
         int exclusive = 1;
-        if (setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)))
+        if (setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                       reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)))
             throw std::runtime_error("SO_EXCLUSIVEADDRUSE failed");
         sockaddr_in address{};
         address.sin_family = AF_INET;
@@ -380,37 +216,26 @@ int main(int argc, char** argv) {
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address))) throw std::runtime_error("bind failed");
         if (listen(listener, 1)) throw std::runtime_error("listen failed");
-        tts_emit("server.ready", std::string(" port=") + std::to_string(ntohs(address.sin_port))
-            + " family=" + args.at("--family") + " language=" + args.at("--language"));
+        tts_emit("server.ready", "port=" + std::to_string(ntohs(address.sin_port)) +
+            " family=" + args.at("--family") + " language=" + args.at("--language"));
 
-        static int iter = 0;
+        unsigned long long connection = 0;
         for (;;) {
-            ++iter;
             client = accept(listener, nullptr, nullptr);
-            if (client == INVALID_SOCKET) {
-                tts_emit("accept-loop.broken", std::string(" error=") + std::to_string(WSAGetLastError()));
-                break;
-            }
-            tts_set_connection((unsigned long long)iter);
-            tts_emit("client.accepted", " ok");
-            try {
-                tts_emit("serve.begin", " ok");
-                serve(client, tts);
-                tts_emit("serve.end", " ok");
-            }
-            catch (const std::exception& e) {
-                tts_emit("serve.catch", std::string(" error=") + e.what());
-                closesocket(client); client = INVALID_SOCKET;
-            }
+            if (client == INVALID_SOCKET) break;
+            tts_set_connection(++connection);
+            tts_emit("client.accepted", "ok");
+            try { serve(client, tts); }
+            catch (const std::exception& error) { tts_emit("serve.failed", "error=" + std::string(error.what())); }
             closesocket(client); client = INVALID_SOCKET;
-            tts_emit("client.done", std::string(" iter=") + std::to_string(iter));
+            tts_emit("client.done", "ok");
         }
         closesocket(listener); listener = INVALID_SOCKET;
         WSACleanup(); wsa_started = false;
-        tts_emit("server.stopped", " clean=true");
+        tts_emit("server.stopped", "clean=true");
         return 0;
     } catch (const std::exception& error) {
-        tts_emit("server.failed", " error=" + std::string(error.what()));
+        tts_emit("server.failed", "error=" + std::string(error.what()));
         if (client != INVALID_SOCKET) closesocket(client);
         if (listener != INVALID_SOCKET) closesocket(listener);
         if (wsa_started) WSACleanup();

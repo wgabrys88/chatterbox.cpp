@@ -15,7 +15,6 @@ extern "C" void ggml_vk_overlap_counters(ggml_backend_t, unsigned long long *, u
 #include "ggml-cuda.h"
 #endif
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -57,9 +56,6 @@ static bool s3_reserve(ggml_gallocr_t a, ggml_cgraph* g) {
 static bool s3_alloc_graph(ggml_gallocr_t a, ggml_cgraph* g) {
     const double t0 = now_ms(); const bool ok = ::ggml_gallocr_alloc_graph(a, g);
     if (g_s3_stats) g_s3_stats->workspace_ms += now_ms() - t0; return ok;
-}
-static void check_cancel(const std::atomic<bool>* cancel) {
-    if (cancel && cancel->load(std::memory_order_relaxed)) throw std::runtime_error("synthesis cancelled");
 }
 static void compute(ggml_backend_t backend, ggml_cgraph * gf) {
     const auto status = ggml_backend_graph_compute(backend, gf);
@@ -1248,7 +1244,6 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
 }
 #include "s3gen_pipeline.h"
 void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_synthesize_opts& opts) {
-    check_cancel(opts.cancel);
     if (speech_tokens.empty()) throw std::runtime_error("S3Gen speech tokens empty");
     if (!opts.pcm_out) throw std::runtime_error("S3Gen PCM output missing");
     if (!opts.state) throw std::runtime_error("S3Gen piece state missing");
@@ -1299,7 +1294,6 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     }
     { const double t0 = now_ms();
       std::vector<float> tmp = run_encoder(m, input_embed, n_total, D, opts.chunk_id == 0); encoder_ms = now_ms() - t0; mu_T.swap(tmp); }
-    check_cancel(opts.cancel);
     int T_mu = 2 * n_total;
     // Dummy pad is encoder lookahead, not audio. Each hop speaks its own tokens once.
     const int dropped_lookahead_tokens = pre_lookahead_len;
@@ -1353,8 +1347,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     cfm_estimator_cache & cfm_cache = opts.first_piece ? *m.first_cfm : later_cfm;
     const double cfm_started = now_ms();
     for (size_t step = 0; step + 1 < t_span.size(); ++step) {
-        check_cancel(opts.cancel);
-        const float t = t_span[step], r = t_span[step + 1], dt = r - t;
+            const float t = t_span[step], r = t_span[step + 1], dt = r - t;
         auto t_emb = compute_time_mlp(m, t);
         if (meanflow) t_emb = compute_time_mixed(m, t_emb, compute_time_mlp(m, r));
         std::vector<float> dxdt;
@@ -1366,11 +1359,9 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         } else {
             dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, false);
         }
-        check_cancel(opts.cancel);
-        for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
+            for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
     }
     cfm_ms = now_ms() - cfm_started;
-    check_cancel(opts.cancel);
     const int T_mel = T_mu - mel_len1;
     if (T_mel <= 0) throw std::runtime_error("S3Gen streaming mel range empty");
     std::vector<float> mel(MEL * T_mel);
@@ -1386,7 +1377,6 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
             mel[m2 * T_mel + t] = state.mel[m2 * cached_frames + cached_frames - history_frames + t];
     const double f0_started = now_ms();
     auto f0 = run_f0_predictor(m_hift, mel, T_mel); f0_ms = now_ms() - f0_started;
-    check_cancel(opts.cancel);
     int upsample = 8 * 5 * 3 * 4;
     int T_wav = T_mel * upsample;
     std::vector<float> f0_up(T_wav);
@@ -1396,11 +1386,9 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         (uint32_t)(seed + 1), state, history_frames * upsample, (int64_t)opts.token_start * kSamplesPerToken);
     const double stft_started = now_ms();
     auto s_stft = run_stft(m_hift, src); stft_ms = now_ms() - stft_started;
-    check_cancel(opts.cancel);
     int T_stft = (int)(s_stft.size() / 18);
     const double hift_started = now_ms();
     auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft); hift_ms = now_ms() - hift_started;
-    check_cancel(opts.cancel);
     const int n_trim = sr / 50;
     const int fade_len = 2 * n_trim;
     const int fade_in_samples = (opts.first_piece && opts.chunk_id == 0 && (int)wav.size() >= fade_len) ? n_trim : 0;

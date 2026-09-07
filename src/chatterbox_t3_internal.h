@@ -180,7 +180,6 @@ bool eval_step(
     ggml_gallocr_t           allocr,
     int                      n_threads,
     int                      n_past,
-    int                      speech_pos,
     int32_t                  token,
     std::vector<float> &     logits_out);
 int32_t sample_next_token_ex(

@@ -1,5 +1,4 @@
 #pragma once
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -29,7 +28,6 @@ struct s3gen_synthesize_opts {
     int n_gpu_layers = 99;
     int cfm_steps = 2;
     bool fastconv = true;
-    const std::atomic<bool>* cancel = nullptr;
     bool final = true;
     bool last_piece = true;
     bool first_piece = true;
