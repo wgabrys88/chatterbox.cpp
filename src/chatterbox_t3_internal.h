@@ -174,14 +174,16 @@ bool eval_prompt(
     int                          n_threads,
     const std::vector<int32_t> & text_tokens,
     std::vector<float> &         logits_out,
-    int &                        prompt_len);
+    int &                        prompt_len,
+    const std::string & audit_prefix = {});
 bool eval_step(
     const chatterbox_model & model,
     ggml_gallocr_t           allocr,
     int                      n_threads,
     int                      n_past,
     int32_t                  token,
-    std::vector<float> &     logits_out);
+    std::vector<float> &     logits_out,
+    const std::string & audit_prefix = {});
 int32_t sample_next_token_ex(
     const std::vector<float> &          logits,
     const std::vector<int32_t> &        generated,

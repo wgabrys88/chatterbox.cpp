@@ -1,3 +1,4 @@
+#include "replay_capture.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -11,7 +12,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "tts-cpp/chatterbox/engine.h"
-#include "tts-cpp/chatterbox/log.h"
+#include "tts-cpp/chatterbox/context.h"
 
 using mono_clock = std::chrono::steady_clock;
 using args_t = std::unordered_map<std::string, std::string>;
@@ -45,28 +46,7 @@ void send_all(SOCKET socket, const void* src, std::size_t size) {
     if (!io_all(socket, const_cast<char*>(static_cast<const char*>(src)), size, true))
         throw std::runtime_error("TTS send failed");
 }
-std::string elapsed_ms(mono_clock::time_point start) {
-    return std::to_string((int)std::chrono::duration<double, std::milli>(mono_clock::now() - start).count());
-}
-std::uint64_t wire_hash(const void* data, std::size_t size) {
-    const auto* p = static_cast<const std::uint8_t*>(data);
-    std::uint64_t h = 1469598103934665603ull;
-    for (std::size_t i = 0; i < size; ++i) { h ^= p[i]; h *= 1099511628211ull; }
-    return h;
-}
-std::string wire_hash_hex(const void* data, std::size_t size) {
-    char out[17];
-    std::snprintf(out, sizeof(out), "%016llx", (unsigned long long)wire_hash(data, size));
-    return out;
-}
-void audit_write(const std::string& dir, const std::string& name, const void* data, std::size_t size) {
-    if (dir.empty()) return;
-    // dir is a filename prefix, never a directory.
-    std::ofstream out(dir + "." + name, std::ios::binary | std::ios::trunc);
-    if (!out) throw std::runtime_error("cannot create wire audit artifact");
-    if (size) out.write(static_cast<const char*>(data), (std::streamsize)size);
-    if (!out) throw std::runtime_error("cannot write wire audit artifact");
-}
+
 
 struct wire_writer {
     SOCKET socket;
@@ -90,10 +70,7 @@ struct wire_writer {
         const auto bytes = pcm_buffer.size() * sizeof(std::int16_t);
         const std::string name = "native-r" + std::to_string(request.response) + "_p" +
             std::to_string(request.piece) + "_c" + std::to_string(chunk) + ".pcm16";
-        audit_write(audit_prefix, name, pcm_buffer.data(), bytes);
-        tts_emit("wire.pcm", "chunk=" + std::to_string(chunk) + " bytes=" + std::to_string(bytes) +
-            " fnv64=" + wire_hash_hex(pcm_buffer.data(), bytes) +
-            (audit_prefix.empty() ? "" : " file=" + name));
+        diagnostic::raw(audit_prefix, name, pcm_buffer.data(), bytes, "i16", {int64_t(count)});
         frame(response_kind::pcm, request, chunk, pcm_buffer.data(), bytes);
     }
     void terminal(response_kind kind, const request_t& request, const std::string& message = {}) {
@@ -162,26 +139,17 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts, const std::string& a
         requests.push_back(std::move(request));
     }
 
-    const auto started = mono_clock::now();
-    {
-        tts_context_scope context(requests[0].response, 0);
-        tts_emit("synthesis.request", "pieces=" + std::to_string(requests.size()));
-    }
     std::vector<tts_cpp::chatterbox::SynthesisPiece> pieces;
     pieces.reserve(requests.size());
     for (const auto& request : requests) {
         tts_context_scope context(request.response, request.piece);
         const std::string name = "native-r" + std::to_string(request.response) + "_p" +
             std::to_string(request.piece) + ".request.utf8";
-        audit_write(audit_prefix, name, request.text.data(), request.text.size());
-        tts_emit("synthesis.queued", "chars=" + std::to_string(request.text.size()) +
-            " fnv64=" + wire_hash_hex(request.text.data(), request.text.size()) +
-            (audit_prefix.empty() ? "" : " file=" + name));
+        diagnostic::raw(audit_prefix, name, request.text.data(), request.text.size(), "utf8", {int64_t(request.text.size())});
         pieces.push_back({request.piece, request.text});
     }
 
     std::vector<bool> done(requests.size(), false);
-    bool first_pcm = true;
     tts_context_scope synthesis_context(requests[0].response, 0);
     try {
         tts.synthesize_pieces_streaming(pieces, [&](int index, const float* data, std::size_t size, int chunk, bool final) {
@@ -190,17 +158,11 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts, const std::string& a
             const auto& request = requests[static_cast<std::size_t>(index)];
             tts_context_scope context(request.response, request.piece);
             if (size) {
-                if (first_pcm) {
-                    first_pcm = false;
-                    tts_emit("synthesis.first_result", "bytes=" + std::to_string(size * sizeof(std::int16_t)) +
-                        " ms=" + elapsed_ms(started));
-                }
                 writer.pcm(request, static_cast<std::uint32_t>(chunk), data, size);
             }
             if (final) {
                 done[static_cast<std::size_t>(index)] = true;
                 writer.terminal(response_kind::done, request);
-                tts_emit("synthesis.completed", "ms=" + elapsed_ms(started));
             }
         });
     } catch (const std::exception& error) {
@@ -208,20 +170,16 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts, const std::string& a
         const std::size_t index = it == done.end() ? requests.size() - 1 : static_cast<std::size_t>(it - done.begin());
         tts_context_scope context(requests[index].response, requests[index].piece);
         writer.terminal(response_kind::error, requests[index], error.what());
-        tts_emit("synthesis.failed", "error=" + std::string(error.what()));
-        tts_session_emit();
+        fprintf(stderr, "%s\n", error.what());
         return;
     }
-    tts_session_emit();
 
     request_t close;
     if (!receive(client, close)) {
-        tts_emit("client.disconnected", "after=synthesis");
         return;
     }
     if (close.kind != request_kind::close) throw std::runtime_error("expected TTS close frame");
     writer.terminal(response_kind::closed, close);
-    tts_emit("server.closed", "ok");
 }
 } // namespace
 
@@ -231,8 +189,6 @@ int main(int argc, char** argv) {
     try {
         args_t args;
         for (int i = 1; i + 1 < argc; i += 2) args[argv[i]] = argv[i + 1];
-        tts_set_run_identity(args.at("--run-id"));
-        tts_emit("server.start", "port=" + args.at("--port"));
         auto tts = make_engine(args);
         tts.warm_up();
 
@@ -251,26 +207,19 @@ int main(int argc, char** argv) {
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address))) throw std::runtime_error("bind failed");
         if (listen(listener, 1)) throw std::runtime_error("listen failed");
-        tts_emit("server.ready", "port=" + std::to_string(ntohs(address.sin_port)) +
-            " family=" + args.at("--family") + " language=" + args.at("--language"));
 
-        unsigned long long connection = 0;
         for (;;) {
             client = accept(listener, nullptr, nullptr);
             if (client == INVALID_SOCKET) break;
-            tts_set_connection(++connection);
-            tts_emit("client.accepted", "ok");
             try { serve(client, tts, args.at("--audit-prefix")); }
-            catch (const std::exception& error) { tts_emit("serve.failed", "error=" + std::string(error.what())); }
+            catch (const std::exception& error) { fprintf(stderr, "%s\n", error.what()); }
             closesocket(client); client = INVALID_SOCKET;
-            tts_emit("client.done", "ok");
         }
         closesocket(listener); listener = INVALID_SOCKET;
         WSACleanup(); wsa_started = false;
-        tts_emit("server.stopped", "clean=true");
         return 0;
     } catch (const std::exception& error) {
-        tts_emit("server.failed", "error=" + std::string(error.what()));
+        fprintf(stderr, "%s\n", error.what());
         if (client != INVALID_SOCKET) closesocket(client);
         if (listener != INVALID_SOCKET) closesocket(listener);
         if (wsa_started) WSACleanup();

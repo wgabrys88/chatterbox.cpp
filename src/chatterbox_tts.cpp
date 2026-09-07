@@ -1,5 +1,5 @@
-#include "diagnostic_audit.h"
-#include "tts-cpp/chatterbox/log.h"
+#include "replay_capture.h"
+#include "tts-cpp/chatterbox/context.h"
 #include "s3gen_pipeline.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -7,11 +7,6 @@
 #include "gguf.h"
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
-#ifdef _WIN32
-extern "C" __declspec(dllimport) void ggml_vk_overlap_counters(ggml_backend_t, unsigned long long *, unsigned long long *, unsigned long long *, int);
-#else
-extern "C" void ggml_vk_overlap_counters(ggml_backend_t, unsigned long long *, unsigned long long *, unsigned long long *, int);
-#endif
 #elif defined(GGML_USE_CUDA)
 #include "ggml-cuda.h"
 #endif
@@ -33,33 +28,6 @@ extern "C" void ggml_vk_overlap_counters(ggml_backend_t, unsigned long long *, u
 #include <type_traits>
 #include <vector>
 static int g_n_threads = 1;
-static double now_ms() {
-    using clock = std::chrono::steady_clock;
-    return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
-}
-struct s3_stage_stats { double h2d_ms = 0, d2h_ms = 0, workspace_ms = 0; };
-static thread_local s3_stage_stats* g_s3_stats = nullptr;
-struct s3_stats_scope {
-    s3_stage_stats* previous;
-    explicit s3_stats_scope(s3_stage_stats* next) : previous(g_s3_stats) { g_s3_stats = next; }
-    ~s3_stats_scope() { g_s3_stats = previous; }
-};
-static void s3_tensor_set(ggml_tensor* t, const void* data, size_t off, size_t bytes) {
-    const double t0 = now_ms(); ::ggml_backend_tensor_set(t, data, off, bytes);
-    if (g_s3_stats) g_s3_stats->h2d_ms += now_ms() - t0;
-}
-static void s3_tensor_get(const ggml_tensor* t, void* data, size_t off, size_t bytes) {
-    const double t0 = now_ms(); ::ggml_backend_tensor_get(t, data, off, bytes);
-    if (g_s3_stats) g_s3_stats->d2h_ms += now_ms() - t0;
-}
-static bool s3_reserve(ggml_gallocr_t a, ggml_cgraph* g) {
-    const double t0 = now_ms(); const bool ok = ::ggml_gallocr_reserve(a, g);
-    if (g_s3_stats) g_s3_stats->workspace_ms += now_ms() - t0; return ok;
-}
-static bool s3_alloc_graph(ggml_gallocr_t a, ggml_cgraph* g) {
-    const double t0 = now_ms(); const bool ok = ::ggml_gallocr_alloc_graph(a, g);
-    if (g_s3_stats) g_s3_stats->workspace_ms += now_ms() - t0; return ok;
-}
 static void compute(ggml_backend_t backend, ggml_cgraph * gf) {
     const auto status = ggml_backend_graph_compute(backend, gf);
     if (status != GGML_STATUS_SUCCESS) throw std::runtime_error("S3Gen graph failed");
@@ -78,24 +46,9 @@ static float positioned_noise(uint32_t seed, uint64_t position) {
         std::cos(2.0 * M_PI * uniform(key + 1)));
 }
 
-static std::uint64_t audit_hash_bytes(const void* data, std::size_t size) {
-    const auto* p = static_cast<const std::uint8_t*>(data);
-    std::uint64_t h = 1469598103934665603ull;
-    for (std::size_t i = 0; i < size; ++i) { h ^= p[i]; h *= 1099511628211ull; }
-    return h;
-}
-static std::string audit_hash_hex(const void* data, std::size_t size) {
-    char out[17];
-    std::snprintf(out, sizeof(out), "%016llx", (unsigned long long)audit_hash_bytes(data, size));
-    return out;
-}
 template <class T>
-static std::string audit_hash(const std::vector<T>& values) {
-    return audit_hash_hex(values.data(), values.size() * sizeof(T));
-}
-template <class T>
-static std::string audit_dump(const std::string& prefix, const char* stage, const std::vector<T>& values) {
-    if (prefix.empty()) return {};
+static void audit_dump(const std::string& prefix, const char* stage, const std::vector<T>& values) {
+    if (prefix.empty()) return;
     std::vector<int64_t> shape;
     const std::string name(stage);
     if (name == "input-embedding") shape = {int64_t(values.size()/512),512};
@@ -103,38 +56,7 @@ static std::string audit_dump(const std::string& prefix, const char* stage, cons
         shape = {80,int64_t(values.size()/80)};
     else if (name == "stft") shape = {18,int64_t(values.size()/18)};
     diagnostic::tensor(prefix, stage, values, shape);
-    return audit_hash(values);
 }
-static std::string audit_blocks(const std::vector<float>& values, std::size_t block) {
-    if (!block || values.empty() || values.size() % block) return "-";
-    std::string out;
-    for (std::size_t pos = 0; pos < values.size(); pos += block) {
-        if (!out.empty()) out += ',';
-        out += audit_hash_hex(values.data() + pos, block * sizeof(float));
-    }
-    return out;
-}
-static std::string audit_join(const std::vector<std::string>& values) {
-    std::string out;
-    for (const auto& value : values) {
-        if (!out.empty()) out += ',';
-        out += value;
-    }
-    return out.empty() ? "-" : out;
-}
-static std::vector<float> audit_frame_major(const std::vector<float>& channel_major,
-                                            int channels, int total_frames, int offset, int frames) {
-    if (offset < 0 || frames < 0 || offset + frames > total_frames ||
-        channel_major.size() != (std::size_t)channels * total_frames)
-        throw std::runtime_error("invalid S3 audit frame range");
-    std::vector<float> out((std::size_t)frames * channels);
-    for (int t = 0; t < frames; ++t)
-        for (int c = 0; c < channels; ++c)
-            out[(std::size_t)t * channels + c] =
-                channel_major[(std::size_t)c * total_frames + offset + t];
-    return out;
-}
-
 struct encoder_cache {
     ggml_backend_t backend = nullptr; int T = -1, D = -1;
     std::vector<uint8_t> buf; ggml_context* ctx = nullptr; ggml_cgraph* gf = nullptr; ggml_gallocr_t allocr = nullptr;
@@ -189,7 +111,6 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
 #else
 #error "No Chatterbox GPU backend selected"
 #endif
-    tts_emit("s3gen.backend", std::string(" backend=") + backend_name + " device=" + desc);
     return b;
 }
 static model_ctx load_s3gen_gguf(const std::string&, int, bool);
@@ -197,12 +118,10 @@ namespace {
 struct s3gen_cache_entry { std::string path; int gpu = 0; bool fastconv = false; std::unique_ptr<model_ctx> m; };
 static std::mutex                            g_s3gen_cache_mu;
 static std::unique_ptr<s3gen_cache_entry>    g_s3gen_cache_entry;
-static double                                g_s3gen_cache_last_load_ms = 0.0;
 }
 static void s3gen_model_cache_release() {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
     if (!g_s3gen_cache_entry) return;
-    tts_emit("s3gen.unload.begin", " start");
     model_ctx * m = g_s3gen_cache_entry->m.get();
     if (m) {
         m->first_cfm.reset(); m->time_mixed.reset(); m->time_mlp.reset(); m->first_encoder.reset();
@@ -212,7 +131,6 @@ static void s3gen_model_cache_release() {
         m->tensors.clear();
     }
     g_s3gen_cache_entry.reset();
-    tts_emit("s3gen.unload.completed", " done");
 }
 static model_ctx * s3gen_model_cache_get(const std::string& path, int n_gpu_layers, bool fastconv) {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
@@ -220,12 +138,9 @@ static model_ctx * s3gen_model_cache_get(const std::string& path, int n_gpu_laye
         g_s3gen_cache_entry->path == path &&
         g_s3gen_cache_entry->gpu  == n_gpu_layers &&
         g_s3gen_cache_entry->fastconv == fastconv) {
-        g_s3gen_cache_last_load_ms = 0.0;
         return g_s3gen_cache_entry->m.get();
     }
-    double t0 = now_ms();
     auto m = std::make_unique<model_ctx>(load_s3gen_gguf(path, n_gpu_layers, fastconv));
-    g_s3gen_cache_last_load_ms = now_ms() - t0;
     g_s3gen_cache_entry = std::make_unique<s3gen_cache_entry>(
         s3gen_cache_entry{path, n_gpu_layers, fastconv, std::move(m)});
     static bool registered = false;
@@ -235,10 +150,7 @@ static model_ctx * s3gen_model_cache_get(const std::string& path, int n_gpu_laye
     }
     return g_s3gen_cache_entry->m.get();
 }
-static double s3gen_model_cache_last_load_ms() { return g_s3gen_cache_last_load_ms; }
 static model_ctx load_s3gen_gguf(const std::string& path, int n_gpu_layers, bool fastconv) {
-    tts_emit("s3gen.model.load.begin", " path=" + path);
-    const double load_started = now_ms();
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = {  false,  &tmp_ctx };
@@ -264,11 +176,11 @@ static model_ctx load_s3gen_gguf(const std::string& path, int n_gpu_layers, bool
         if (cur->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F16 && ggml_is_3d(src)) {
             std::vector<float> f32((size_t) ggml_nelements(src));
             ggml_fp16_to_fp32_row((const ggml_fp16_t *) ggml_get_data(src), f32.data(), ggml_nelements(src));
-            s3_tensor_set(cur, f32.data(), 0, f32.size() * sizeof(float));
+            ggml_backend_tensor_set(cur, f32.data(), 0, f32.size() * sizeof(float));
             ++baked;
             baked_bytes += f32.size() * sizeof(float);
         } else {
-            s3_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+            ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
         }
     }
     int64_t k = gguf_find_key(g, "s3gen.meanflow");
@@ -280,7 +192,7 @@ static model_ctx load_s3gen_gguf(const std::string& path, int n_gpu_layers, bool
     auto cache_f32 = [&](const char* name, std::vector<float>& out) {
         auto it = m.tensors.find(name); if (it == m.tensors.end()) throw std::runtime_error(std::string("tensor not found: ") + name);
         if (it->second->type != GGML_TYPE_F32) throw std::runtime_error(std::string("immutable S3Gen tensor must be F32: ") + name);
-        out.resize((size_t)ggml_nelements(it->second)); s3_tensor_get(it->second, out.data(), 0, ggml_nbytes(it->second));
+        out.resize((size_t)ggml_nelements(it->second)); ggml_backend_tensor_get(it->second, out.data(), 0, ggml_nbytes(it->second));
     };
     cache_f32("flow/input_embedding", m.input_embedding);
     cache_f32("flow/spk_embed_affine/w", m.spk_affine_w);
@@ -290,14 +202,10 @@ static model_ctx load_s3gen_gguf(const std::string& path, int n_gpu_layers, bool
     size_t inverse_bytes = 0;
     for (const auto& [name, tensor] : m.tensors) {
         if (name.rfind("hift/", 0) || name.size() < 6 || name.compare(name.size() - 6, 6, "/alpha") || tensor->type != GGML_TYPE_F32) continue;
-        std::vector<float> values((size_t)ggml_nelements(tensor)); s3_tensor_get(tensor, values.data(), 0, ggml_nbytes(tensor));
+        std::vector<float> values((size_t)ggml_nelements(tensor)); ggml_backend_tensor_get(tensor, values.data(), 0, ggml_nbytes(tensor));
         for (float& value : values) value = 1.0f / (value + 1e-9f);
         inverse_bytes += values.size() * sizeof(float); m.inv_alpha.emplace(name, std::move(values));
     }
-    tts_emit("s3gen.model.load.completed", std::string(" ms=") + std::to_string((int)(now_ms() - load_started + .5))
-        + " weights_bytes=" + std::to_string(m.buffer_w ? ggml_backend_buffer_get_size(m.buffer_w) : 0)
-        + " baked_tensors=" + std::to_string(baked)
-        + " baked_bytes=" + std::to_string(baked_bytes));
     gguf_free(g);
     ggml_free(tmp_ctx);
     return m;
@@ -551,18 +459,18 @@ static void build_encoder_cache(const model_ctx & m, encoder_cache & cache, int 
     ggml_set_name(mu, "mu"); ggml_set_output(mu);
     cache.mu = mu; ggml_build_forward_expand(gf, cache.mu);
     cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    s3_reserve(cache.allocr, gf); s3_alloc_graph(cache.allocr, gf);
+    ggml_gallocr_reserve(cache.allocr, gf); ggml_gallocr_alloc_graph(cache.allocr, gf);
 }
 static std::vector<float> run_encoder(model_ctx & m, const std::vector<float> & input_embed, int T, int D, bool first_window) {
     encoder_cache local;
     if (first_window && !m.first_encoder) m.first_encoder = std::make_unique<encoder_cache>();
     encoder_cache & cache = first_window ? *m.first_encoder : local;
     if (!cache.ctx || cache.backend != m.backend || cache.T != T || cache.D != D) build_encoder_cache(m, cache, T, D);
-    s3_tensor_set(cache.x_in, input_embed.data(), 0, input_embed.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.x_in, input_embed.data(), 0, input_embed.size()*sizeof(float));
     std::vector<float> pe1, pe2; compute_pos_emb(pe1, T, D); compute_pos_emb(pe2, 2*T, D);
-    s3_tensor_set(cache.pos1, pe1.data(), 0, pe1.size()*sizeof(float)); s3_tensor_set(cache.pos2, pe2.data(), 0, pe2.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.pos1, pe1.data(), 0, pe1.size()*sizeof(float)); ggml_backend_tensor_set(cache.pos2, pe2.data(), 0, pe2.size()*sizeof(float));
     compute(m.backend, cache.gf);
-    std::vector<float> out((size_t)ggml_nelements(cache.mu)); s3_tensor_get(cache.mu, out.data(), 0, ggml_nbytes(cache.mu)); return out;
+    std::vector<float> out((size_t)ggml_nelements(cache.mu)); ggml_backend_tensor_get(cache.mu, out.data(), 0, ggml_nbytes(cache.mu)); return out;
 }
 
 struct cfm_resnet_w {
@@ -776,13 +684,13 @@ static std::vector<float> compute_time_mlp(model_ctx & m, float t_val) {
         cache.y_out = y;
         ggml_build_forward_expand(cache.gf, cache.y_out);
         cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-        s3_reserve(cache.allocr, cache.gf); s3_alloc_graph(cache.allocr, cache.gf);
+        ggml_gallocr_reserve(cache.allocr, cache.gf); ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
         cache.backend = m.backend;
     }
-    s3_tensor_set(cache.x_in, t_sin.data(), 0, t_sin.size() * sizeof(float));
+    ggml_backend_tensor_set(cache.x_in, t_sin.data(), 0, t_sin.size() * sizeof(float));
     compute(m.backend, cache.gf);
     std::vector<float> out(ggml_nelements(cache.y_out));
-    s3_tensor_get(cache.y_out, out.data(), 0, ggml_nbytes(cache.y_out));
+    ggml_backend_tensor_get(cache.y_out, out.data(), 0, ggml_nbytes(cache.y_out));
     return out;
 }
 static std::vector<float> compute_time_mixed(model_ctx & m,
@@ -802,14 +710,14 @@ static std::vector<float> compute_time_mixed(model_ctx & m,
         cache.out = ggml_mul_mat(cache.ctx, find_tensor(m, "cfm/time_embed_mixer/weight"), cat);
         ggml_set_name(cache.out, "out"); ggml_set_output(cache.out); ggml_build_forward_expand(cache.gf, cache.out);
         cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-        s3_reserve(cache.allocr, cache.gf); s3_alloc_graph(cache.allocr, cache.gf);
+        ggml_gallocr_reserve(cache.allocr, cache.gf); ggml_gallocr_alloc_graph(cache.allocr, cache.gf);
         cache.backend = m.backend; cache.size = total;
     }
-    s3_tensor_set(cache.t_in, t_mlp.data(), 0, t_mlp.size()*sizeof(float));
-    s3_tensor_set(cache.r_in, r_mlp.data(), 0, r_mlp.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.t_in, t_mlp.data(), 0, t_mlp.size()*sizeof(float));
+    ggml_backend_tensor_set(cache.r_in, r_mlp.data(), 0, r_mlp.size()*sizeof(float));
     compute(m.backend, cache.gf);
     std::vector<float> out((size_t)ggml_nelements(cache.out));
-    s3_tensor_get(cache.out, out.data(), 0, ggml_nbytes(cache.out));
+    ggml_backend_tensor_get(cache.out, out.data(), 0, ggml_nbytes(cache.out));
     return out;
 }
 static std::vector<float> cfm_estimator_forward(
@@ -878,17 +786,17 @@ static std::vector<float> cfm_estimator_forward(
     ggml_set_name(out, "out"); ggml_set_output(out);
     ggml_build_forward_expand(gf, out);
     cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    s3_reserve(cache.allocr, gf); s3_alloc_graph(cache.allocr, gf);
+    ggml_gallocr_reserve(cache.allocr, gf); ggml_gallocr_alloc_graph(cache.allocr, gf);
     }
-    s3_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x.data(), 0, x.size()*sizeof(float));
-    s3_tensor_set(ggml_graph_get_tensor(gf, "mu_in"), mu.data(), 0, mu.size()*sizeof(float));
-    s3_tensor_set(ggml_graph_get_tensor(gf, "spks_in"), spks.data(), 0, spks.size()*sizeof(float));
-    s3_tensor_set(ggml_graph_get_tensor(gf, "cond_in"), cond.data(), 0, cond.size()*sizeof(float));
-    s3_tensor_set(ggml_graph_get_tensor(gf, "t_emb"), t_emb.data(), 0, t_emb.size()*sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x.data(), 0, x.size()*sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mu_in"), mu.data(), 0, mu.size()*sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "spks_in"), spks.data(), 0, spks.size()*sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "cond_in"), cond.data(), 0, cond.size()*sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_emb"), t_emb.data(), 0, t_emb.size()*sizeof(float));
     compute(m.backend, gf);
     ggml_tensor * out_t = ggml_graph_get_tensor(gf, "out");
     std::vector<float> out_data(ggml_nelements(out_t));
-    s3_tensor_get(out_t, out_data.data(), 0, ggml_nbytes(out_t));
+    ggml_backend_tensor_get(out_t, out_data.data(), 0, ggml_nbytes(out_t));
     return out_data;
 }
 static void cfm_estimator_forward_b2(
@@ -960,7 +868,7 @@ static void cfm_estimator_forward_b2(
     ggml_set_name(out, "out"); ggml_set_output(out);
     ggml_build_forward_expand(gf, out);
     cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    s3_reserve(cache.allocr, gf); s3_alloc_graph(cache.allocr, gf);
+    ggml_gallocr_reserve(cache.allocr, gf); ggml_gallocr_alloc_graph(cache.allocr, gf);
     }
     const size_t one_tm = (size_t) T * MEL * sizeof(float);
     const size_t one_m  = (size_t) MEL * sizeof(float);
@@ -970,16 +878,16 @@ static void cfm_estimator_forward_b2(
     ggml_tensor * spks_t = ggml_graph_get_tensor(gf, "spks_in");
     ggml_tensor * cond_t = ggml_graph_get_tensor(gf, "cond_in");
     ggml_tensor * te_t   = ggml_graph_get_tensor(gf, "t_emb");
-    s3_tensor_set(x_t,     x_c.data(),     0 * one_tm, one_tm);
-    s3_tensor_set(x_t,     x_u.data(),     1 * one_tm, one_tm);
-    s3_tensor_set(mu_t,    mu_c.data(),    0 * one_tm, one_tm);
-    s3_tensor_set(mu_t,    mu_u.data(),    1 * one_tm, one_tm);
-    s3_tensor_set(cond_t,  cond_c.data(),  0 * one_tm, one_tm);
-    s3_tensor_set(cond_t,  cond_u.data(),  1 * one_tm, one_tm);
-    s3_tensor_set(spks_t,  spks_c.data(),  0 * one_m,  one_m);
-    s3_tensor_set(spks_t,  spks_u.data(),  1 * one_m,  one_m);
-    s3_tensor_set(te_t,    t_emb_c.data(), 0 * one_td, one_td);
-    s3_tensor_set(te_t,    t_emb_u.data(), 1 * one_td, one_td);
+    ggml_backend_tensor_set(x_t,     x_c.data(),     0 * one_tm, one_tm);
+    ggml_backend_tensor_set(x_t,     x_u.data(),     1 * one_tm, one_tm);
+    ggml_backend_tensor_set(mu_t,    mu_c.data(),    0 * one_tm, one_tm);
+    ggml_backend_tensor_set(mu_t,    mu_u.data(),    1 * one_tm, one_tm);
+    ggml_backend_tensor_set(cond_t,  cond_c.data(),  0 * one_tm, one_tm);
+    ggml_backend_tensor_set(cond_t,  cond_u.data(),  1 * one_tm, one_tm);
+    ggml_backend_tensor_set(spks_t,  spks_c.data(),  0 * one_m,  one_m);
+    ggml_backend_tensor_set(spks_t,  spks_u.data(),  1 * one_m,  one_m);
+    ggml_backend_tensor_set(te_t,    t_emb_c.data(), 0 * one_td, one_td);
+    ggml_backend_tensor_set(te_t,    t_emb_u.data(), 1 * one_td, one_td);
     compute(m.backend, gf);
     ggml_tensor * out_t = ggml_graph_get_tensor(gf, "out");
     const size_t half = (size_t) T * MEL;
@@ -989,7 +897,7 @@ static void cfm_estimator_forward_b2(
     if (want > ggml_nbytes(out_t) || both.size() < 2 * half) {
         throw std::runtime_error("cfm b2 out size mismatch");
     }
-    s3_tensor_get(out_t, both.data(), 0, want);
+    ggml_backend_tensor_get(out_t, both.data(), 0, want);
     out_c.assign(both.begin(), both.begin() + half);
     out_u.assign(both.begin() + half, both.begin() + 2 * half);
 }
@@ -1083,12 +991,12 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
     ggml_set_name(y, "out"); ggml_set_output(y);
     ggml_build_forward_expand(gf, y);
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    s3_reserve(allocr, gf);
-    s3_alloc_graph(allocr, gf);
-    s3_tensor_set(ggml_graph_get_tensor(gf, "mel_in"), mel.data(), 0, mel.size()*sizeof(float));
+    ggml_gallocr_reserve(allocr, gf);
+    ggml_gallocr_alloc_graph(allocr, gf);
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mel_in"), mel.data(), 0, mel.size()*sizeof(float));
     compute(m.backend, gf);
     std::vector<float> f0(T_mel);
-    s3_tensor_get(y, f0.data(), 0, ggml_nbytes(y));
+    ggml_backend_tensor_get(y, f0.data(), 0, ggml_nbytes(y));
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
     return f0;
@@ -1097,13 +1005,20 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
                                          int harmonic_num, float sine_amp, float noise_std,
                                          float voiced_threshold,
                                          const std::vector<float> & l_w, float l_b,
-                                         uint32_t seed, s3gen_piece_state& state, int history, int64_t sample_start) {
+                                         uint32_t seed, s3gen_piece_state& state, int history, int64_t sample_start, const std::string& audit_prefix) {
     int T_wav = (int)f0_wav.size();
     int H = harmonic_num + 1;
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> uniform(-(float)M_PI, (float)M_PI);
     std::vector<float> phase_vec(H, 0.0f);
     for (int h = 1; h < H; ++h) phase_vec[h] = uniform(rng);
+    diagnostic::tensor(audit_prefix, "source-phase-offsets", phase_vec);
+    std::vector<float> noise(audit_prefix.empty() ? 0 : (size_t)H * (T_wav-history));
+    diagnostic::event(audit_prefix, "source.settings", "\"seed\":"+std::to_string(seed)+
+        ",\"sample_rate\":"+std::to_string(sr)+",\"harmonics\":"+std::to_string(H)+
+        ",\"history_samples\":"+std::to_string(history)+",\"sample_start\":"+std::to_string(sample_start));
+    diagnostic::tensor(audit_prefix, "source-parameters", std::vector<float>{sine_amp,noise_std,voiced_threshold,l_b});
+    diagnostic::tensor(audit_prefix, "source-linear-weight", l_w);
     std::vector<float> sine_waves((size_t)H * T_wav, 0.0f);
     if (state.phase.empty()) state.phase.assign(H, 0.0);
     auto& cum_phase = state.phase;
@@ -1117,7 +1032,9 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
             float sine = sine_amp * std::sin((float)theta + phase_vec[h]);
             float namp = voiced ? noise_std : sine_amp / 3.0f;
             float uv = voiced ? 1.0f : 0.0f;
-            sine_waves[(size_t)h * T_wav + t] = sine * uv + namp * positioned_noise(seed, (sample_start + t) * H + h);
+            const float draw = positioned_noise(seed, (sample_start + t) * H + h);
+            if (!audit_prefix.empty()) noise[(size_t)h * (T_wav-history) + t-history] = draw;
+            sine_waves[(size_t)h * T_wav + t] = sine * uv + namp * draw;
         }
     }
     std::vector<float> src(T_wav, 0.0f);
@@ -1128,14 +1045,18 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
         for (int h = 0; h < H; ++h) s += l_w[h] * sine_waves[(size_t)h * T_wav + t];
         src[t] = std::tanh(s);
     }
+    diagnostic::tensor(audit_prefix, "source-noise", noise, {H,T_wav-history});
+    diagnostic::tensor(audit_prefix, "source-harmonics", sine_waves, {H,T_wav});
     return src;
 }
-static std::vector<float> run_stft(const model_ctx & m, const std::vector<float> & src) {
+static std::vector<float> run_stft(const model_ctx & m, const std::vector<float> & src, const std::string& audit_prefix) {
     const int n_fft = 16, hop = 4;
     const int F = n_fft / 2 + 1;
     int T_src = (int)src.size();
     auto window = build_hann_window(n_fft, true);
     auto kernel = build_stft_kernel(n_fft, window);
+    diagnostic::tensor(audit_prefix, "stft-window", window);
+    diagnostic::tensor(audit_prefix, "stft-kernel", kernel, {2*F,1,n_fft});
     static size_t buf_size = 4 * 1024 * 1024;
     std::vector<uint8_t> buf(buf_size);
     ggml_init_params gp = { buf_size, buf.data(), true };
@@ -1150,20 +1071,20 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
     ggml_set_name(spec, "out"); ggml_set_output(spec);
     ggml_build_forward_expand(gf, spec);
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    s3_reserve(allocr, gf);
-    s3_alloc_graph(allocr, gf);
-    s3_tensor_set(ggml_graph_get_tensor(gf, "s"), src.data(), 0, src.size()*sizeof(float));
-    s3_tensor_set(ggml_graph_get_tensor(gf, "k"), kernel.data(), 0, kernel.size()*sizeof(float));
+    ggml_gallocr_reserve(allocr, gf);
+    ggml_gallocr_alloc_graph(allocr, gf);
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "s"), src.data(), 0, src.size()*sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "k"), kernel.data(), 0, kernel.size()*sizeof(float));
     compute(m.backend, gf);
     std::vector<float> out(ggml_nelements(spec));
-    s3_tensor_get(spec, out.data(), 0, ggml_nbytes(spec));
+    ggml_backend_tensor_get(spec, out.data(), 0, ggml_nbytes(spec));
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
     return out;
 }
 static std::vector<float> run_hift_decode(const model_ctx & m,
                                           const std::vector<float> & mel, int T_mel,
-                                          const std::vector<float> & s_stft, int T_stft) {
+                                          const std::vector<float> & s_stft, int T_stft, const std::string& audit_prefix) {
     const int MEL = 80, NFFT2 = 18, BASE_CH = 512, n_fft = 16, hop = 4;
     const int F = n_fft / 2 + 1;
     std::vector<int> ups_rates  = {8, 5, 3};
@@ -1273,6 +1194,9 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     auto window = build_hann_window(n_fft, true);
     auto ik = build_istft_kernel(n_fft, window);
     auto ws = build_window_sum(T_stft, n_fft, hop, window);
+    diagnostic::tensor(audit_prefix, "istft-window", window);
+    diagnostic::tensor(audit_prefix, "istft-kernel", ik, {2*F,1,n_fft});
+    diagnostic::tensor(audit_prefix, "istft-window-sum", ws);
     ggml_tensor * istft_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_fft, 1, 2 * F);
     ggml_set_name(istft_k, "istft_k"); ggml_set_input(istft_k);
     ggml_tensor * ws_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int)ws.size(), 1);
@@ -1287,17 +1211,17 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     ggml_set_name(y_trim, "wav"); ggml_set_output(y_trim);
     ggml_build_forward_expand(gf, y_trim);
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    s3_reserve(allocr, gf);
-    s3_alloc_graph(allocr, gf);
-    s3_tensor_set(ggml_graph_get_tensor(gf, "mel_in"), mel.data(), 0, mel.size()*sizeof(float));
-    s3_tensor_set(ggml_graph_get_tensor(gf, "s_in"), s_stft.data(), 0, s_stft.size()*sizeof(float));
-    s3_tensor_set(ggml_graph_get_tensor(gf, "istft_k"), ik.data(), 0, ik.size()*sizeof(float));
-    s3_tensor_set(ggml_graph_get_tensor(gf, "w_sum"), ws.data(), 0, ws.size()*sizeof(float));
+    ggml_gallocr_reserve(allocr, gf);
+    ggml_gallocr_alloc_graph(allocr, gf);
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mel_in"), mel.data(), 0, mel.size()*sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "s_in"), s_stft.data(), 0, s_stft.size()*sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "istft_k"), ik.data(), 0, ik.size()*sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "w_sum"), ws.data(), 0, ws.size()*sizeof(float));
     for (auto & ia : inv_alphas)
-        s3_tensor_set(ggml_graph_get_tensor(gf, ia.gn.c_str()), ia.data.data(), 0, ia.data.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, ia.gn.c_str()), ia.data.data(), 0, ia.data.size()*sizeof(float));
     compute(m.backend, gf);
     std::vector<float> wav(ggml_nelements(y_trim));
-    s3_tensor_get(y_trim, wav.data(), 0, ggml_nbytes(y_trim));
+    ggml_backend_tensor_get(y_trim, wav.data(), 0, ggml_nbytes(y_trim));
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
     return wav;
@@ -1308,13 +1232,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     if (!opts.pcm_out) throw std::runtime_error("S3Gen PCM output missing");
     if (!opts.state) throw std::runtime_error("S3Gen piece state missing");
     auto& state = *opts.state;
-    state.audit_summary.clear();
-    state.audit_local.clear();
     const bool audit = !opts.audit_prefix.empty();
-    const std::string mel_cache_in_hash = audit ? audit_hash(state.mel) : std::string();
-    const std::string source_cache_in_hash = audit ? audit_hash(state.source) : std::string();
-    const std::string phase_in_hash = audit ? audit_hash(state.phase) : std::string();
-    const std::string pending_in_hash = audit ? audit_hash(state.pending_pcm) : std::string();
     if (audit) {
         audit_dump(opts.audit_prefix, "state-mel-in", state.mel);
         audit_dump(opts.audit_prefix, "state-source-in", state.source);
@@ -1354,11 +1272,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     if (padded.empty()) throw std::runtime_error("S3Gen speech tokens invalid");
     if (opts.final) padded.insert(padded.end(), pre_lookahead_len, 4299);
     model_ctx& m = *s3gen_model_cache_get(opts.s3gen_gguf_path, opts.n_gpu_layers, opts.fastconv);
-    const double load_ms = s3gen_model_cache_last_load_ms();
     const model_ctx& m_hift = m;
-    double pipeline_t0 = now_ms();
-    s3_stage_stats stats; s3_stats_scope stats_scope(&stats);
-    double encoder_ms = 0, cfm_ms = 0, f0_ms = 0, stft_ms = 0, hift_ms = 0;
     const int D = 512;
     const int MEL = 80;
     int n_prompt = (int)pt_data.size();
@@ -1385,9 +1299,8 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         diagnostic::event(opts.audit_prefix,"s3.backend","\"backend\":"+diagnostic::quote(ggml_backend_name(m.backend))+
             ",\"device\":"+diagnostic::quote(ggml_backend_dev_description(device)));
     }
-    const std::string input_embed_hash = audit ? audit_dump(opts.audit_prefix, "input-embedding", input_embed) : std::string();
-    { const double t0 = now_ms();
-      std::vector<float> tmp = run_encoder(m, input_embed, n_total, D, opts.chunk_id == 0); encoder_ms = now_ms() - t0; mu_T.swap(tmp); }
+    audit_dump(opts.audit_prefix, "input-embedding", input_embed);
+    mu_T = run_encoder(m, input_embed, n_total, D, opts.chunk_id == 0);
     diagnostic::tensor(opts.audit_prefix, "encoder-full", mu_T, {2*n_total,MEL});
     int T_mu = 2 * n_total;
     // Dummy pad is encoder lookahead, not audio. Each hop speaks its own tokens once.
@@ -1399,7 +1312,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mu; ++t)
             mu[m2 * T_mu + t] = mu_T[t * MEL + m2];
-    const std::string encoder_hash = audit ? audit_dump(opts.audit_prefix, "encoder-mu", mu) : std::string();
+    audit_dump(opts.audit_prefix, "encoder-mu", mu);
     const float * emb_raw = emb_data.data();
     float norm = 0.0f;
     for (int i = 0; i < 192; ++i) norm += emb_raw[i] * emb_raw[i];
@@ -1432,8 +1345,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
             const int64_t frame = generated ? t - mel_len1 + 2 * opts.token_start : t;
             z[m2 * T_mu + t] = positioned_noise(seed + (generated && meanflow ? 2 : 0), frame * MEL + m2);
         }
-    const std::string cfm_initial_hash = audit ? audit_dump(opts.audit_prefix, "cfm-z0", z) : std::string();
-    std::vector<std::string> cfm_step_hashes;
+    audit_dump(opts.audit_prefix, "cfm-z0", z);
     const int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps : (meanflow ? 2 : m.n_timesteps);
     if (!meanflow && cfm_steps < 5) throw std::runtime_error("non-meanflow CFM requires at least 5 steps");
     std::vector<float> t_span;
@@ -1443,11 +1355,14 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         t_span.push_back(meanflow ? t : 1.0f - std::cos(t * .5f * (float)M_PI));
     }
     diagnostic::tensor(opts.audit_prefix,"cfm-time-span",t_span);
+    diagnostic::event(opts.audit_prefix, "cfm.settings", "\"meanflow\":"+std::to_string(meanflow)+
+        ",\"steps\":"+std::to_string(cfm_steps)+",\"threads\":"+std::to_string(opts.n_threads)+
+        ",\"n_gpu_layers\":"+std::to_string(opts.n_gpu_layers));
+    diagnostic::tensor(opts.audit_prefix, "cfm-cfg-rate", std::vector<float>{m.cfg_rate});
     const std::vector<float> zeros_tm(T_mu * MEL, 0.0f), zeros_m(MEL, 0.0f);
     cfm_estimator_cache later_cfm;
     if (opts.first_piece && !m.first_cfm) m.first_cfm = std::make_unique<cfm_estimator_cache>();
     cfm_estimator_cache & cfm_cache = opts.first_piece ? *m.first_cfm : later_cfm;
-    const double cfm_started = now_ms();
     for (size_t step = 0; step + 1 < t_span.size(); ++step) {
             const float t = t_span[step], r = t_span[step + 1], dt = r - t;
         auto t_emb = compute_time_mlp(m, t);
@@ -1466,10 +1381,9 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
             for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
             if (audit) {
                 const std::string stage = "cfm-z" + std::to_string(step + 1);
-                cfm_step_hashes.push_back(audit_dump(opts.audit_prefix, stage.c_str(), z));
+                audit_dump(opts.audit_prefix, stage.c_str(), z);
             }
     }
-    cfm_ms = now_ms() - cfm_started;
     const int T_mel = T_mu - mel_len1;
     if (T_mel <= 0) throw std::runtime_error("S3Gen streaming mel range empty");
     std::vector<float> mel(MEL * T_mel);
@@ -1477,17 +1391,16 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mel; ++t)
             mel[m2 * T_mel + t] = z[m2 * T_mu + (t + mel_off)];
-    const std::string mel_generated_hash = audit ? audit_dump(opts.audit_prefix, "mel-generated", mel) : std::string();
+    audit_dump(opts.audit_prefix, "mel-generated", mel);
     const int history_frames = history_tokens * 2;
     const int cached_frames = (int)state.mel.size() / MEL;
     if (cached_frames < history_frames) throw std::runtime_error("S3Gen mel history missing");
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < history_frames; ++t)
             mel[m2 * T_mel + t] = state.mel[m2 * cached_frames + cached_frames - history_frames + t];
-    const std::string mel_conditioned_hash = audit ? audit_dump(opts.audit_prefix, "mel-conditioned", mel) : std::string();
-    const double f0_started = now_ms();
-    auto f0 = run_f0_predictor(m_hift, mel, T_mel); f0_ms = now_ms() - f0_started;
-    const std::string f0_hash = audit ? audit_dump(opts.audit_prefix, "f0", f0) : std::string();
+    audit_dump(opts.audit_prefix, "mel-conditioned", mel);
+    auto f0 = run_f0_predictor(m_hift, mel, T_mel);
+    audit_dump(opts.audit_prefix, "f0", f0);
     int upsample = 8 * 5 * 3 * 4;
     int T_wav = T_mel * upsample;
     std::vector<float> f0_up(T_wav);
@@ -1495,15 +1408,13 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
     diagnostic::tensor(opts.audit_prefix,"f0-upsampled",f0_up);
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, m_hift.hift_linear_w, m_hift.hift_linear_b,
-        (uint32_t)(seed + 1), state, history_frames * upsample, (int64_t)opts.token_start * kSamplesPerToken);
-    const std::string source_hash = audit ? audit_dump(opts.audit_prefix, "source", src) : std::string();
-    const double stft_started = now_ms();
-    auto s_stft = run_stft(m_hift, src); stft_ms = now_ms() - stft_started;
-    const std::string stft_hash = audit ? audit_dump(opts.audit_prefix, "stft", s_stft) : std::string();
+        (uint32_t)(seed + 1), state, history_frames * upsample, (int64_t)opts.token_start * kSamplesPerToken, opts.audit_prefix);
+    audit_dump(opts.audit_prefix, "source", src);
+    auto s_stft = run_stft(m_hift, src, opts.audit_prefix);
+    audit_dump(opts.audit_prefix, "stft", s_stft);
     int T_stft = (int)(s_stft.size() / 18);
-    const double hift_started = now_ms();
-    auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft); hift_ms = now_ms() - hift_started;
-    const std::string hift_hash = audit ? audit_dump(opts.audit_prefix, "hift-wav", wav) : std::string();
+    auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft, opts.audit_prefix);
+    audit_dump(opts.audit_prefix, "hift-wav", wav);
     const int n_trim = sr / 50;
     const int fade_len = 2 * n_trim;
     const int fade_in_samples = (opts.first_piece && opts.chunk_id == 0 && (int)wav.size() >= fade_len) ? n_trim : 0;
@@ -1539,61 +1450,13 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
             ",\"emit_begin\":"+std::to_string(begin)+",\"emit_end\":"+std::to_string(end)+
             ",\"hold\":"+std::to_string(hold)+",\"emitted\":"+std::to_string(wav.size())+
             ",\"state_token_end\":"+std::to_string(state.token_end));
-        const std::string mel_cache_out_hash = audit_dump(opts.audit_prefix, "state-mel-out", state.mel);
-        const std::string source_cache_out_hash = audit_dump(opts.audit_prefix, "state-source-out", state.source);
-        const std::string phase_out_hash = audit_dump(opts.audit_prefix, "state-phase-out", state.phase);
-        const std::string pending_out_hash = audit_dump(opts.audit_prefix, "state-pending-out", state.pending_pcm);
-        const std::string emitted_hash = audit_dump(opts.audit_prefix, "pcm-emitted-f32", wav);
-        state.audit_summary =
-            "dir=" + opts.audit_prefix +
-            " output_tokens=" + std::to_string(output_tokens) +
-            " history_tokens=" + std::to_string(history_tokens) +
-            " n_total=" + std::to_string(n_total) +
-            " n_prompt=" + std::to_string(n_prompt) +
-            " padded_tokens=" + std::to_string(padded.size()) +
-            " mel_len1=" + std::to_string(mel_len1) +
-            " t_mu=" + std::to_string(T_mu) +
-            " t_mel=" + std::to_string(T_mel) +
-            " channels=80 input_dim=512 token_start=" + std::to_string(opts.token_start) +
-            " input_embed=" + input_embed_hash +
-            " encoder=" + encoder_hash +
-            " cfm0=" + cfm_initial_hash +
-            " cfm_steps_hashes=" + audit_join(cfm_step_hashes) +
-            " mel_generated=" + mel_generated_hash +
-            " mel_conditioned=" + mel_conditioned_hash +
-            " f0=" + f0_hash +
-            " source=" + source_hash +
-            " stft=" + stft_hash +
-            " hift=" + hift_hash +
-            " emitted=" + emitted_hash +
-            " mel_cache_in=" + mel_cache_in_hash +
-            " mel_cache_out=" + mel_cache_out_hash +
-            " source_cache_in=" + source_cache_in_hash +
-            " source_cache_out=" + source_cache_out_hash +
-            " phase_in=" + phase_in_hash +
-            " phase_out=" + phase_out_hash +
-            " pending_in=" + pending_in_hash +
-            " pending_out=" + pending_out_hash;
+        audit_dump(opts.audit_prefix, "state-mel-out", state.mel);
+        audit_dump(opts.audit_prefix, "state-source-out", state.source);
+        audit_dump(opts.audit_prefix, "state-phase-out", state.phase);
+        audit_dump(opts.audit_prefix, "state-pending-out", state.pending_pcm);
+        audit_dump(opts.audit_prefix, "pcm-emitted-f32", wav);
 
     }
-    const double pipeline_total = now_ms() - pipeline_t0;
-    state.encoder_ms += encoder_ms;
-    state.cfm_ms += cfm_ms;
-    state.f0_ms += f0_ms;
-    state.stft_ms += stft_ms;
-    state.hift_ms += hift_ms;
-    state.pipeline_ms += pipeline_total;
-    state.samples += (int)wav.size();
-    state.prompt_tokens = n_prompt;
-    state.speech_tokens = output_tokens - history_tokens;
-    state.history_tokens = history_tokens;
-    state.window_tokens = output_tokens;
-    state.cfm_steps_used = cfm_steps;
-    state.pending_in = pending;
-    state.emit_begin = begin;
-    state.emit_end = end;
-    state.hold = hold;
-    state.emitted = wav.size();
     *opts.pcm_out = std::move(wav);
 }
 void s3gen_preload(const std::string& path, int n_gpu_layers, bool fastconv) {
@@ -1601,20 +1464,4 @@ void s3gen_preload(const std::string& path, int n_gpu_layers, bool fastconv) {
 }
 void s3gen_unload() {
     s3gen_model_cache_release();
-}
-void s3gen_vk_overlap_counters(unsigned long long * wait_us, unsigned long long * submit_n,
-                               unsigned long long * barrier_n, int reset) {
-#ifdef GGML_USE_VULKAN
-    ggml_backend_t b = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
-        if (g_s3gen_cache_entry && g_s3gen_cache_entry->m) b = g_s3gen_cache_entry->m->backend;
-    }
-    ggml_vk_overlap_counters(b, wait_us, submit_n, barrier_n, reset);
-#else
-    if (wait_us) *wait_us = 0;
-    if (submit_n) *submit_n = 0;
-    if (barrier_n) *barrier_n = 0;
-    (void)reset;
-#endif
 }
