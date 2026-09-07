@@ -530,6 +530,7 @@ int32_t sample_next_token_ex(
         float inv_t = 1.0f / params.temp;
         for (float & s : scores) s *= inv_t;
     }
+    apply_min_p(scores.data(), n, params.min_p);
     if (params.top_k > 0 && params.top_k < n) {
         std::vector<float> tmp(scores);
         std::nth_element(tmp.begin(), tmp.begin() + params.top_k, tmp.end(), std::greater<float>());

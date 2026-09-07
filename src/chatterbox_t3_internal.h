@@ -11,11 +11,22 @@
 #include "ggml.h"
 namespace tts_cpp::chatterbox::detail {
 constexpr int CHBX_MAX_NODES = 8192;
-// Speech tokens are a small reused codebook. HuggingFace-style penalty over
-// the full unique history poisons later words that share units with earlier
-// ones; Nano then loops a pause token and a 5-in-a-row stop treats that as EOS.
-constexpr int REPEAT_PENALTY_LAST_N = 16;
+// Speech tokens are a small reused codebook. A word is typically 10-25
+// tokens. Penalizing unique IDs over a whole word (or the full history)
+// makes the next similar word come out as a different encoding of the same
+// word, or collapses generation onto a pause loop. Keep the penalty to local
+// stutter only; consecutive identical tokens still abort after ~640 ms.
+constexpr int REPEAT_PENALTY_LAST_N = 4;
 constexpr int REPEAT_STOP_CONSECUTIVE = 16;
+
+inline void apply_min_p(float * scores, int vocab, float min_p) {
+    if (min_p <= 0.0f || vocab <= 0) return;
+    float maxl = -INFINITY;
+    for (int i = 0; i < vocab; ++i) if (scores[i] != -INFINITY && scores[i] > maxl) maxl = scores[i];
+    if (maxl == -INFINITY) return;
+    const float thresh = maxl + std::log(min_p);
+    for (int i = 0; i < vocab; ++i) if (scores[i] < thresh) scores[i] = -INFINITY;
+}
 
 inline void apply_speech_repeat_penalty(float * scores, int vocab,
                                         const std::vector<int32_t> & generated,
