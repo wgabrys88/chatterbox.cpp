@@ -25,7 +25,7 @@ struct EngineOptions {
     float exaggeration = .5f;
     int cfm_steps = 0;
     bool fastconv = false;
-    std::string audit_dir;
+    std::string audit_prefix;
 };
 struct SynthesisPiece {
     std::uint32_t id = 0;

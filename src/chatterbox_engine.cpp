@@ -160,12 +160,12 @@ struct Engine::Impl {
         preload = std::thread([this] { s3gen_preload(opts.s3gen_gguf_path, opts.n_gpu_layers, opts.fastconv); });
         bake_voice();
         join(preload);
-        if (!opts.audit_dir.empty()) {
-            std::filesystem::create_directories(opts.audit_dir);
+        if (!opts.audit_prefix.empty()) {
+            // The caller supplies a flat filename prefix in an existing workspace.
             audit_tok = std::make_unique<s3tokv2_weights>();
             if (!s3tokv2_load(opts.s3gen_gguf_path, *audit_tok))
                 throw std::runtime_error("S3 audit tokenizer load failed");
-            tts_emit("audit.ready", "dir=" + opts.audit_dir);
+            tts_emit("audit.ready", "dir=" + opts.audit_prefix);
         }
     }
     ~Impl() {
@@ -264,11 +264,11 @@ struct Engine::Impl {
         if (text_tokens.empty()) throw std::runtime_error("empty T3 text tokens");
         tts_emit_piece("t3.text", std::string("session_piece=") + std::to_string(session_index)
             + " tokens=" + std::to_string(text_tokens.size()) + " token_hash=" + token_hash(text_tokens));
-        if (!opts.audit_dir.empty())
+        if (!opts.audit_prefix.empty())
             tts_emit_piece("t3.audit.text", "text_seq=" + token_csv(text_tokens));
 
         const auto audit_context = tts_get_context();
-        const std::string audit_prefix = opts.audit_dir.empty() ? "" : opts.audit_dir + "/r" +
+        const std::string audit_prefix = opts.audit_prefix.empty() ? "" : opts.audit_prefix + ".r" +
             std::to_string(audit_context.response) + "_p" + std::to_string(external_piece);
         diagnostic::tensor(audit_prefix, "t3-text", text_tokens);
         diagnostic::event(audit_prefix, "t3.begin", "\"seed\":"+std::to_string(opts.seed)+
@@ -304,12 +304,12 @@ struct Engine::Impl {
             std::vector<float> logits_c, logits_u;
             if (!eval_prompt_mtl(model, allocr, n_threads, text_tokens, opts.exaggeration, logits_c, logits_u, n_past))
                 throw std::runtime_error("MTL prompt failed");
-            if (!opts.audit_dir.empty()) logits_hashes.push_back(float_hash(logits_c) + "/" + float_hash(logits_u));
+            if (!opts.audit_prefix.empty()) logits_hashes.push_back(float_hash(logits_c) + "/" + float_hash(logits_u));
             token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
         } else {
             std::vector<float> logits;
             if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past)) throw std::runtime_error("Turbo prompt failed");
-            if (!opts.audit_dir.empty()) logits_hashes.push_back(float_hash(logits));
+            if (!opts.audit_prefix.empty()) logits_hashes.push_back(float_hash(logits));
             token = sample_next_token_ex(logits, out, sp, rng, sample_prefix());
         }
         out.push_back(token);
@@ -321,12 +321,12 @@ struct Engine::Impl {
                 std::vector<float> logits_c, logits_u;
                 if (!eval_step_mtl(model, allocr, n_threads, n_past++, speech_pos++, token, logits_c, logits_u))
                     throw std::runtime_error("MTL step failed");
-                if (!opts.audit_dir.empty()) logits_hashes.push_back(float_hash(logits_c) + "/" + float_hash(logits_u));
+                if (!opts.audit_prefix.empty()) logits_hashes.push_back(float_hash(logits_c) + "/" + float_hash(logits_u));
                 token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
             } else {
                 std::vector<float> logits;
                 if (!eval_step(model, allocr, n_threads, n_past++, token, logits)) throw std::runtime_error("Turbo step failed");
-                if (!opts.audit_dir.empty()) logits_hashes.push_back(float_hash(logits));
+                if (!opts.audit_prefix.empty()) logits_hashes.push_back(float_hash(logits));
                 token = sample_next_token_ex(logits, out, sp, rng, sample_prefix());
             }
             const int32_t selected = token;
@@ -352,7 +352,7 @@ struct Engine::Impl {
             + " kv_pos=" + std::to_string(n_past)
             + " speech_pos=" + std::to_string(speech_pos)
             + vk_overlap_fields(model.backend));
-        if (!opts.audit_dir.empty())
+        if (!opts.audit_prefix.empty())
             tts_emit_piece("t3.audit.logits", "steps=" + std::to_string(logits_hashes.size()) +
                 " hashes=" + string_csv(logits_hashes));
         diagnostic::tensor(audit_prefix, "t3-speech", tokens);
@@ -413,7 +413,7 @@ struct Engine::Impl {
             + " new_hash=" + token_hash(tokens)
             + " window_hash=" + token_hash(window)
             + " token_start=0 internal_final=1 lookahead=" + std::to_string(kSpeechLookaheadTokens)
-            + " audit=" + (opts.audit_dir.empty() ? "0" : "1"));
+            + " audit=" + (opts.audit_prefix.empty() ? "0" : "1"));
         s3gen_synthesize_opts s;
         s.s3gen_gguf_path = opts.s3gen_gguf_path;
         s.seed = opts.seed;
@@ -432,9 +432,9 @@ struct Engine::Impl {
         s.last_piece = last_piece;
         s.first_piece = (session_index <= 0);
         s.chunk_id = 0;
-        if (!opts.audit_dir.empty()) {
+        if (!opts.audit_prefix.empty()) {
             const auto ctx = tts_get_context();
-            s.audit_prefix = opts.audit_dir + "/r" + std::to_string(ctx.response) +
+            s.audit_prefix = opts.audit_prefix + ".r" + std::to_string(ctx.response) +
                 "_p" + std::to_string(external_piece);
         }
         std::vector<float> pcm;

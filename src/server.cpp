@@ -61,8 +61,8 @@ std::string wire_hash_hex(const void* data, std::size_t size) {
 }
 void audit_write(const std::string& dir, const std::string& name, const void* data, std::size_t size) {
     if (dir.empty()) return;
-    std::filesystem::create_directories(dir);
-    std::ofstream out(std::filesystem::path(dir) / name, std::ios::binary | std::ios::trunc);
+    // dir is a filename prefix, never a directory.
+    std::ofstream out(dir + "." + name, std::ios::binary | std::ios::trunc);
     if (!out) throw std::runtime_error("cannot create wire audit artifact");
     if (size) out.write(static_cast<const char*>(data), (std::streamsize)size);
     if (!out) throw std::runtime_error("cannot write wire audit artifact");
@@ -70,7 +70,7 @@ void audit_write(const std::string& dir, const std::string& name, const void* da
 
 struct wire_writer {
     SOCKET socket;
-    std::string audit_dir;
+    std::string audit_prefix;
     std::vector<std::int16_t> pcm_buffer;
 
     void frame(response_kind kind, const request_t& request, std::uint32_t chunk,
@@ -90,10 +90,10 @@ struct wire_writer {
         const auto bytes = pcm_buffer.size() * sizeof(std::int16_t);
         const std::string name = "native-r" + std::to_string(request.response) + "_p" +
             std::to_string(request.piece) + "_c" + std::to_string(chunk) + ".pcm16";
-        audit_write(audit_dir, name, pcm_buffer.data(), bytes);
+        audit_write(audit_prefix, name, pcm_buffer.data(), bytes);
         tts_emit("wire.pcm", "chunk=" + std::to_string(chunk) + " bytes=" + std::to_string(bytes) +
             " fnv64=" + wire_hash_hex(pcm_buffer.data(), bytes) +
-            (audit_dir.empty() ? "" : " file=" + name));
+            (audit_prefix.empty() ? "" : " file=" + name));
         frame(response_kind::pcm, request, chunk, pcm_buffer.data(), bytes);
     }
     void terminal(response_kind kind, const request_t& request, const std::string& message = {}) {
@@ -113,7 +113,7 @@ tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
     o.top_p = f("--top-p"); o.min_p = f("--min-p"); o.temperature = f("--temperature");
     o.repeat_penalty = f("--repeat-penalty"); o.cfg_weight = f("--cfg-weight");
     o.exaggeration = f("--exaggeration"); o.cfm_steps = i("--cfm-steps");
-    o.fastconv = i("--fastconv") != 0; o.audit_dir = s("--audit-dir");
+    o.fastconv = i("--fastconv") != 0; o.audit_prefix = s("--audit-prefix");
     return tts_cpp::chatterbox::Engine(o);
 }
 
@@ -140,8 +140,8 @@ bool receive(SOCKET socket, request_t& request) {
     return true;
 }
 
-void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts, const std::string& audit_dir) {
-    wire_writer writer{client, audit_dir};
+void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts, const std::string& audit_prefix) {
+    wire_writer writer{client, audit_prefix};
     request_t first;
     if (!receive(client, first)) return;
     if (first.kind == request_kind::close) {
@@ -173,10 +173,10 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts, const std::string& a
         tts_context_scope context(request.response, request.piece);
         const std::string name = "native-r" + std::to_string(request.response) + "_p" +
             std::to_string(request.piece) + ".request.utf8";
-        audit_write(audit_dir, name, request.text.data(), request.text.size());
+        audit_write(audit_prefix, name, request.text.data(), request.text.size());
         tts_emit("synthesis.queued", "chars=" + std::to_string(request.text.size()) +
             " fnv64=" + wire_hash_hex(request.text.data(), request.text.size()) +
-            (audit_dir.empty() ? "" : " file=" + name));
+            (audit_prefix.empty() ? "" : " file=" + name));
         pieces.push_back({request.piece, request.text});
     }
 
@@ -260,7 +260,7 @@ int main(int argc, char** argv) {
             if (client == INVALID_SOCKET) break;
             tts_set_connection(++connection);
             tts_emit("client.accepted", "ok");
-            try { serve(client, tts, args.at("--audit-dir")); }
+            try { serve(client, tts, args.at("--audit-prefix")); }
             catch (const std::exception& error) { tts_emit("serve.failed", "error=" + std::string(error.what())); }
             closesocket(client); client = INVALID_SOCKET;
             tts_emit("client.done", "ok");
