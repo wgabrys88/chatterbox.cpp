@@ -282,7 +282,8 @@ struct Engine::Impl {
         out.push_back(token);
         publish(token);
 
-        for (int i = 0; i < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++i) {
+        int steps = 0;
+        for (; steps < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++steps) {
 #ifdef TTS_CPP_MTL
             if (model.hparams.variant == CHBX_VARIANT_MTL) {
                 std::vector<float> logits_c, logits_u;
@@ -304,7 +305,17 @@ struct Engine::Impl {
             publish(token);
         }
 
-        if (token != model.hparams.stop_speech_token) throw std::runtime_error("T3 stopped without EOS");
+        if (token != model.hparams.stop_speech_token) {
+            const char * reason = (n_past + 1 > model.hparams.n_ctx) ? "context" : "max_tokens";
+            tts_jsonl(std::string("{\"event\":\"tts.failed\",\"reason\":\"") + reason +
+                "\",\"n_speech\":" + std::to_string(tokens.size()) +
+                ",\"n_text\":" + std::to_string(sp.n_text_tokens) +
+                ",\"eos_min\":" + std::to_string(eos_min_speech) +
+                ",\"steps\":" + std::to_string(steps) +
+                ",\"n_past\":" + std::to_string(n_past) +
+                ",\"n_ctx\":" + std::to_string(model.hparams.n_ctx) + "}");
+            throw std::runtime_error(std::string("T3 stopped without EOS (") + reason + ")");
+        }
 #ifdef TTS_CPP_MTL
         if (tokens.empty() && pending_mtl >= 0) tokens.push_back(pending_mtl);
 #endif
@@ -321,7 +332,7 @@ struct Engine::Impl {
     void emit_piece_ledger(std::uint32_t response, std::uint32_t piece, const std::vector<int32_t>& window, const std::vector<int32_t>& neu) {
         const auto ctx = tts_get_context();
         const std::string line =
-            std::string("{\"response\":") + std::to_string(ctx.valid ? ctx.response : response) +
+            std::string("{\"event\":\"tts.piece\",\"response\":") + std::to_string(ctx.valid ? ctx.response : response) +
             ",\"piece\":" + std::to_string(piece) +
             ",\"text\":\"" + json_escape(piece_text) + "\"" +
             ",\"text_sha\":\"" + hash_hex(hash_bytes(piece_text.data(), piece_text.size())) + "\"" +
@@ -443,7 +454,6 @@ void Engine::synthesize_pieces_streaming(const std::vector<SynthesisPiece>& piec
     for (std::size_t index = 0; index < pieces.size(); ++index) {
         const auto& piece = pieces[index];
         if (piece.text.empty()) throw std::runtime_error("empty synthesis piece");
-        if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
         auto tokens = pimpl_->generate_t3(piece.text, (int)index, piece.id);
         pimpl_->run_s3(tokens, (int)index, piece.id, index + 1 == pieces.size(),
             [&](int, const float* pcm, std::size_t n, int chunk, bool final) {
