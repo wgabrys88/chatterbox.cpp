@@ -244,6 +244,8 @@ bool compute_speech_tokens_native(
     ggml_backend_t         backend,
     bool                   verbose);
 bool validate_reference_audio(const std::string & path);
+#ifdef TTS_CPP_MTL
+void t3_stack_unregister(ggml_backend_buffer_t buf, ggml_context * ctx);
 bool load_model_gguf_mtl(
     const std::string & path,
     chatterbox_model &  model,
@@ -274,4 +276,7 @@ int32_t sample_next_token_mtl(
     const chatterbox_sampling_params & params,
     std::mt19937 &                     rng,
     int32_t                            stop_token);
+#else
+inline void t3_stack_unregister(ggml_backend_buffer_t, ggml_context *) {}
+#endif
 }

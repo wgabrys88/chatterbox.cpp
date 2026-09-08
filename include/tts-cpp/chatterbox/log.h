@@ -64,6 +64,11 @@ inline void tts_emit(const char* event, const char* extra, bool with_mono) {
 inline void tts_emit(const char* event, const char* extra = nullptr) { tts_emit(event, extra, false); }
 inline void tts_emit(const char* event, const std::string& extra) { tts_emit(event, extra.c_str(), false); }
 inline void tts_emit_piece(const char* event, const std::string& extra) { tts_emit(event, extra.c_str(), true); }
+inline void tts_jsonl(const std::string& line) {
+    std::fputs(line.c_str(), stderr);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+}
 
 struct tts_session_acc {
     std::chrono::steady_clock::time_point t0{}, t1{};

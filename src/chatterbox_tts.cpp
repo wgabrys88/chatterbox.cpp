@@ -1,4 +1,3 @@
-#include "tts-cpp/chatterbox/log.h"
 #include "s3gen_pipeline.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -191,7 +190,8 @@ static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
 #else
 #error "No Chatterbox GPU backend selected"
 #endif
-    tts_emit("s3gen.backend", std::string(" backend=") + backend_name + " device=" + desc);
+    (void)desc;
+    (void)backend_name;
     return b;
 }
 static model_ctx load_s3gen_gguf(const std::string&, int, bool);
@@ -204,7 +204,6 @@ static double                                g_s3gen_cache_last_load_ms = 0.0;
 static void s3gen_model_cache_release() {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
     if (!g_s3gen_cache_entry) return;
-    tts_emit("s3gen.unload.begin", " start");
     model_ctx * m = g_s3gen_cache_entry->m.get();
     if (m) {
         m->first_cfm.reset(); m->time_mixed.reset(); m->time_mlp.reset(); m->first_encoder.reset();
@@ -214,7 +213,6 @@ static void s3gen_model_cache_release() {
         m->tensors.clear();
     }
     g_s3gen_cache_entry.reset();
-    tts_emit("s3gen.unload.completed", " done");
 }
 static model_ctx * s3gen_model_cache_get(const std::string& path, int n_gpu_layers, bool fastconv) {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
@@ -239,8 +237,6 @@ static model_ctx * s3gen_model_cache_get(const std::string& path, int n_gpu_laye
 }
 static double s3gen_model_cache_last_load_ms() { return g_s3gen_cache_last_load_ms; }
 static model_ctx load_s3gen_gguf(const std::string& path, int n_gpu_layers, bool fastconv) {
-    tts_emit("s3gen.model.load.begin", " path=" + path);
-    const double load_started = now_ms();
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = {  false,  &tmp_ctx };
@@ -296,10 +292,7 @@ static model_ctx load_s3gen_gguf(const std::string& path, int n_gpu_layers, bool
         for (float& value : values) value = 1.0f / (value + 1e-9f);
         inverse_bytes += values.size() * sizeof(float); m.inv_alpha.emplace(name, std::move(values));
     }
-    tts_emit("s3gen.model.load.completed", std::string(" ms=") + std::to_string((int)(now_ms() - load_started + .5))
-        + " weights_bytes=" + std::to_string(m.buffer_w ? ggml_backend_buffer_get_size(m.buffer_w) : 0)
-        + " baked_tensors=" + std::to_string(baked)
-        + " baked_bytes=" + std::to_string(baked_bytes));
+    (void)baked; (void)baked_bytes; (void)inverse_bytes;
     gguf_free(g);
     ggml_free(tmp_ctx);
     return m;
@@ -1312,7 +1305,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     auto& state = *opts.state;
     state.audit_summary.clear();
     state.audit_local.clear();
-    const bool audit = !opts.audit_prefix.empty();
+    const bool audit = opts.audit_tensors && !opts.audit_prefix.empty();
     const std::string mel_cache_in_hash = audit ? audit_hash(state.mel) : std::string();
     const std::string source_cache_in_hash = audit ? audit_hash(state.source) : std::string();
     const std::string phase_in_hash = audit ? audit_hash(state.phase) : std::string();

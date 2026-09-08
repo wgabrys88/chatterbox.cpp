@@ -36,6 +36,7 @@ struct s3gen_synthesize_opts {
     int token_start = 0;
     int token_end = 0;
     std::string audit_prefix;
+    bool audit_tensors = false;
     s3gen_piece_state* state = nullptr;
 };
 void s3gen_synthesize(const std::vector<int32_t>&, const s3gen_synthesize_opts&);

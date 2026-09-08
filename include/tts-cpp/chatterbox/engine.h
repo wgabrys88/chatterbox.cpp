@@ -26,6 +26,7 @@ struct EngineOptions {
     int cfm_steps = 0;
     bool fastconv = false;
     std::string audit_dir;
+    bool audit_tensors = false;
 };
 struct SynthesisPiece {
     std::uint32_t id = 0;
