@@ -101,7 +101,7 @@ struct Engine::Impl {
     std::vector<int32_t> speech_history;
     std::string piece_text, piece_stop;
     std::vector<int32_t> piece_text_tokens, piece_speech;
-    int piece_t3_ms = 0, piece_s3_ms = 0;
+    int piece_t3_ms = 0, piece_s3_ms = 0, piece_eos_min_speech = 0;
     std::uint32_t speech_bin_offset = 0;
     static std::string json_i32(const std::vector<int32_t>& v) {
         std::string s = "[";
@@ -246,6 +246,7 @@ struct Engine::Impl {
         }
         if (text_tokens.empty()) throw std::runtime_error("empty T3 text tokens");
         sp.n_text_tokens = (int32_t)text_tokens.size();
+        const int eos_min_speech = (sp.n_text_tokens > 5) ? sp.n_text_tokens * 4 : 0;
 
         int n_past = 0, speech_pos = 1;
         int32_t token = 0, pending_mtl = -1;
@@ -312,6 +313,7 @@ struct Engine::Impl {
         piece_speech = tokens;
         piece_stop = repeat_stopped ? "repeat" : "eos";
         piece_t3_ms = (int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + .5);
+        piece_eos_min_speech = eos_min_speech;
         (void)speech_pos;
         (void)external_piece;
         return tokens;
@@ -325,6 +327,7 @@ struct Engine::Impl {
             ",\"text_sha\":\"" + hash_hex(hash_bytes(piece_text.data(), piece_text.size())) + "\"" +
             ",\"n_text_tok\":" + std::to_string(piece_text_tokens.size()) +
             ",\"n_speech_tok\":" + std::to_string(piece_speech.size()) +
+            ",\"eos_min_speech\":" + std::to_string(piece_eos_min_speech) +
             ",\"speech_hash\":\"" + token_hash(piece_speech) + "\"" +
             ",\"stop\":\"" + piece_stop + "\"" +
             ",\"t3_ms\":" + std::to_string(piece_t3_ms) +
@@ -440,6 +443,7 @@ void Engine::synthesize_pieces_streaming(const std::vector<SynthesisPiece>& piec
     for (std::size_t index = 0; index < pieces.size(); ++index) {
         const auto& piece = pieces[index];
         if (piece.text.empty()) throw std::runtime_error("empty synthesis piece");
+        if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
         auto tokens = pimpl_->generate_t3(piece.text, (int)index, piece.id);
         pimpl_->run_s3(tokens, (int)index, piece.id, index + 1 == pieces.size(),
             [&](int, const float* pcm, std::size_t n, int chunk, bool final) {
