@@ -366,6 +366,13 @@ int32_t sample_next_token_ex(
     const int n = (int)logits.size();
     
     std::vector<float> scores(logits.begin(), logits.end());
+    // Official Python T3 masks EOS while attention is not yet at S-3. Nano GPT-2
+    // has no Llama alignment heads, so hold EOS for 4 speech tokens per text token
+    // (healthy pieces are ~8x; 4x still fits under max-tokens 1000).
+    if (params.stop_speech_token >= 0 && params.stop_speech_token < n
+        && params.n_text_tokens > 5
+        && (int)generated.size() < params.n_text_tokens * 4)
+        scores[params.stop_speech_token] = -32768.f;
     if (params.temp > 0.0f && params.temp != 1.0f) {
         float inv_t = 1.0f / params.temp;
         for (float & s : scores) s *= inv_t;

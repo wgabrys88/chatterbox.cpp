@@ -227,6 +227,7 @@ struct Engine::Impl {
         sp.temp = opts.temperature;
         sp.repeat_penalty = opts.repeat_penalty;
         sp.cfg_weight = opts.cfg_weight;
+        sp.stop_speech_token = model.hparams.stop_speech_token;
 
         std::vector<int32_t> text_tokens;
 #ifdef TTS_CPP_MTL
@@ -244,6 +245,7 @@ struct Engine::Impl {
             text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
         }
         if (text_tokens.empty()) throw std::runtime_error("empty T3 text tokens");
+        sp.n_text_tokens = (int32_t)text_tokens.size();
 
         int n_past = 0, speech_pos = 1;
         int32_t token = 0, pending_mtl = -1;

@@ -189,12 +189,14 @@ struct chatterbox_model {
     std::vector<std::string> mtl_languages;
 };
 struct chatterbox_sampling_params {
-    int32_t top_k          = 1000;
-    float   top_p          = 0.95f;
-    float   temp           = 0.8f;
-    float   repeat_penalty = 1.2f;
-    float   min_p          = 0.0f;
-    float   cfg_weight     = 0.0f;
+    int32_t top_k              = 1000;
+    float   top_p              = 0.95f;
+    float   temp               = 0.8f;
+    float   repeat_penalty     = 1.2f;
+    float   min_p              = 0.0f;
+    float   cfg_weight         = 0.0f;
+    int32_t stop_speech_token  = -1;
+    int32_t n_text_tokens      = 0;
 };
 ggml_backend_t init_backend(int n_gpu_layers);
 bool load_model_gguf(
