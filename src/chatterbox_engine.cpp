@@ -70,17 +70,6 @@ int threads(int n) {
     return hw > 0 ? std::min(hw, 4) : 4;
 }
 void join(std::thread& t) { if (t.joinable()) t.join(); }
-void agent_log(const char* hid, const char* loc, const char* msg, const std::string& data) {
-    // #region agent log
-    std::ofstream f("C:/Users/px-wjt/Downloads/STT-TTS/debug-d5d316.log", std::ios::app);
-    if (!f) return;
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    f << "{\"sessionId\":\"d5d316\",\"hypothesisId\":\"" << hid
-      << "\",\"location\":\"" << loc << "\",\"message\":\"" << msg
-      << "\",\"data\":" << data << ",\"timestamp\":" << ms << "}\n";
-    // #endregion
-}
 void ledger_append(const std::string& dir, const char* name, const std::string& line) {
     if (dir.empty()) return;
     std::ofstream out(std::filesystem::path(dir) / name, std::ios::app);
@@ -109,6 +98,7 @@ struct Engine::Impl {
     std::unique_ptr<mtl_tokenizer> mtl_tok;
 #endif
     s3gen_piece_state acoustic;
+    std::vector<int32_t> speech_history;
     std::string piece_text, piece_stop;
     std::vector<int32_t> piece_text_tokens, piece_speech;
     int piece_t3_ms = 0, piece_s3_ms = 0, piece_eos_min_speech = 0;
@@ -122,7 +112,7 @@ struct Engine::Impl {
         return s + "]";
     }
     explicit Impl(const EngineOptions& o) : opts(o) {}
-    void reset_acoustics() { acoustic = {}; }
+    void reset_acoustics() { acoustic = {}; speech_history.clear(); }
     void write_meta() {
         if (opts.audit_dir.empty()) return;
         std::filesystem::create_directories(opts.audit_dir);
@@ -339,13 +329,12 @@ struct Engine::Impl {
         (void)external_piece;
         return tokens;
     }
-    void emit_piece_ledger(std::uint32_t response, std::uint32_t piece, const std::vector<int32_t>& neu) {
+    void emit_piece_ledger(std::uint32_t response, std::uint32_t piece, const std::vector<int32_t>& window, const std::vector<int32_t>& neu) {
         const auto ctx = tts_get_context();
+        const int hist = acoustic.history_tokens;
         const std::string line =
             std::string("{\"event\":\"tts.piece\",\"response\":") + std::to_string(ctx.valid ? ctx.response : response) +
             ",\"piece\":" + std::to_string(piece) +
-            ",\"text\":\"" + json_escape(piece_text) + "\"" +
-            ",\"text_sha\":\"" + hash_hex(hash_bytes(piece_text.data(), piece_text.size())) + "\"" +
             ",\"n_text_tok\":" + std::to_string(piece_text_tokens.size()) +
             ",\"n_speech_tok\":" + std::to_string(piece_speech.size()) +
             ",\"eos_min_speech\":" + std::to_string(piece_eos_min_speech) +
@@ -353,25 +342,11 @@ struct Engine::Impl {
             ",\"stop\":\"" + piece_stop + "\"" +
             ",\"t3_ms\":" + std::to_string(piece_t3_ms) +
             ",\"s3_ms\":" + std::to_string(piece_s3_ms) +
-            ",\"ms\":" + std::to_string(piece_t3_ms + piece_s3_ms) +
-            ",\"s3_history\":" + std::to_string(acoustic.history_tokens) +
+            ",\"s3_history\":" + std::to_string(hist) +
             ",\"s3_new\":" + std::to_string(neu.size()) +
             ",\"pending_in\":" + std::to_string(acoustic.pending_in) +
-            ",\"emit_begin\":" + std::to_string(acoustic.emit_begin) +
-            ",\"emit_end\":" + std::to_string(acoustic.emit_end) +
-            ",\"hold\":" + std::to_string(acoustic.hold) +
-            ",\"history_hash\":\"" + token_hash(std::vector<int32_t>()) + "\"" +
-            ",\"new_hash\":\"" + token_hash(neu) + "\"" +
             ",\"emitted_samples\":" + std::to_string(acoustic.emitted) + "}";
         tts_jsonl(line);
-        agent_log("B1", "chatterbox_engine.cpp:emit_piece_ledger", "tts.piece",
-            std::string("{\"piece\":") + std::to_string(piece) +
-            ",\"pending_in\":" + std::to_string(acoustic.pending_in) +
-            ",\"emit_begin\":" + std::to_string(acoustic.emit_begin) +
-            ",\"hold\":" + std::to_string(acoustic.hold) +
-            ",\"s3_history\":" + std::to_string(acoustic.history_tokens) +
-            ",\"n_speech_tok\":" + std::to_string(piece_speech.size()) +
-            ",\"n_text_tok\":" + std::to_string(piece_text_tokens.size()) + "}");
         if (opts.audit_dir.empty()) return;
         ledger_append(opts.audit_dir, "01-pieces.jsonl",
             "{\"piece\":" + std::to_string(piece) + ",\"response\":" + std::to_string(response) +
@@ -388,31 +363,26 @@ struct Engine::Impl {
             "{\"piece\":" + std::to_string(piece) + ",\"ids\":" + json_i32(piece_speech) + "}");
         ledger_append(opts.audit_dir, "05-s3-window.jsonl",
             "{\"piece\":" + std::to_string(piece) +
-            ",\"history_tokens\":" + std::to_string(acoustic.history_tokens) +
-            ",\"history_hash\":\"\",\"new_tokens\":" + std::to_string(neu.size()) +
+            ",\"history_tokens\":" + std::to_string(hist) +
+            ",\"history_hash\":\"" + token_hash(std::vector<int32_t>(window.begin(), window.begin() + hist)) + "\"" +
+            ",\"new_tokens\":" + std::to_string(neu.size()) +
             ",\"new_hash\":\"" + token_hash(neu) + "\"" +
             ",\"emit_begin\":" + std::to_string(acoustic.emit_begin) +
-            ",\"emit_end\":" + std::to_string(acoustic.emit_end) +
             ",\"pending_in\":" + std::to_string(acoustic.pending_in) +
             ",\"emitted\":" + std::to_string(acoustic.emitted) + "}");
-        std::string pcm = "{\"piece\":" + std::to_string(piece) + ",\"map\":[";
-        for (size_t i = 0; i < neu.size(); ++i) {
-            const int local0 = (int)i * kSamplesPerToken;
-            if (i) pcm += ',';
-            pcm += "{\"token_i\":" + std::to_string(i) + ",\"window_i\":" + std::to_string(i) +
-                   ",\"sample_start\":" + std::to_string(local0) +
-                   ",\"sample_end\":" + std::to_string(local0 + kSamplesPerToken) + "}";
-        }
-        ledger_append(opts.audit_dir, "06-pcm-map.jsonl", pcm + "]}");
     }
-    void run_s3(const std::vector<int32_t>& tokens, int session_index, std::uint32_t external_piece, const PieceCallback& cb) {
+    void run_s3(const std::vector<int32_t>& tokens, int session_index, std::uint32_t external_piece, bool last_piece, const PieceCallback& cb) {
         auto synthesis_context = tts_get_context();
         if (session_index >= 0) { synthesis_context.valid = true; synthesis_context.piece = external_piece; }
         tts_context_scope context_scope(synthesis_context);
         if (tokens.empty()) throw std::runtime_error("S3Gen speech tokens empty");
         acoustic.encoder_ms = acoustic.cfm_ms = acoustic.f0_ms = acoustic.stft_ms = acoustic.hift_ms = acoustic.pipeline_ms = 0;
         acoustic.samples = acoustic.prompt_tokens = acoustic.speech_tokens = 0;
-        acoustic.token_end = 0;
+        acoustic.token_end = (int)speech_history.size();
+        std::vector<int32_t> window;
+        window.reserve(speech_history.size() + tokens.size());
+        window.insert(window.end(), speech_history.begin(), speech_history.end());
+        window.insert(window.end(), tokens.begin(), tokens.end());
         s3gen_synthesize_opts s;
         s.s3gen_gguf_path = opts.s3gen_gguf_path;
         s.seed = opts.seed;
@@ -426,9 +396,9 @@ struct Engine::Impl {
         s.prompt_token = prompt_token;
         s.state = &acoustic;
         s.token_start = 0;
-        s.token_end = (int)tokens.size();
+        s.token_end = (int)window.size();
         s.final = true;
-        s.last_piece = true;
+        s.last_piece = last_piece;
         s.first_piece = (session_index <= 0);
         s.chunk_id = 0;
         s.audit_tensors = opts.audit_tensors;
@@ -440,19 +410,24 @@ struct Engine::Impl {
         std::vector<float> pcm;
         s.pcm_out = &pcm;
         const auto s3_started = std::chrono::steady_clock::now();
-        s3gen_synthesize(tokens, s);
+        s3gen_synthesize(window, s);
         piece_s3_ms = (int)(std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - s3_started).count() + .5);
         if (session_index >= 0) {
             const auto ctx = tts_get_context();
-            emit_piece_ledger(ctx.response, external_piece, tokens);
+            emit_piece_ledger(ctx.response, external_piece, window, tokens);
         }
         if (cb) cb(session_index, pcm.data(), pcm.size(), 0, true);
+        if ((int)window.size() > kSpeechHistoryTokens) {
+            speech_history.assign(window.end() - kSpeechHistoryTokens, window.end());
+        } else {
+            speech_history = window;
+        }
     }
     void piece_streaming(const std::string& text, int index, const PieceCallback& cb) {
         if (text.empty()) return;
         auto tokens = generate_t3(text, index, 0);
-        run_s3(tokens, index, 0, [&](int, const float* pcm, std::size_t n, int chunk, bool final) {
+        run_s3(tokens, index, 0, true, [&](int, const float* pcm, std::size_t n, int chunk, bool final) {
             if (cb) cb(0, pcm, n, chunk, final);
         });
     }
@@ -462,13 +437,15 @@ Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 void Engine::synthesize_pieces_streaming(const std::vector<SynthesisPiece>& pieces, const PieceCallback& cb) {
+    pimpl_->reset_acoustics();
     pimpl_->speech_bin_offset = 0;
     for (std::size_t index = 0; index < pieces.size(); ++index) {
         const auto& piece = pieces[index];
         if (piece.text.empty()) throw std::runtime_error("empty synthesis piece");
-        pimpl_->reset_acoustics();
+        if (pimpl_->opts.s3_reset) pimpl_->reset_acoustics();
         auto tokens = pimpl_->generate_t3(piece.text, (int)index, piece.id);
-        pimpl_->run_s3(tokens, (int)index, piece.id,
+        const bool last = pimpl_->opts.s3_reset || index + 1 == pieces.size();
+        pimpl_->run_s3(tokens, (int)index, piece.id, last,
             [&](int, const float* pcm, std::size_t n, int chunk, bool final) {
                 if (cb) cb((int)index, pcm, n, chunk, final);
             });

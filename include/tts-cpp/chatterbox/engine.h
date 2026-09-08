@@ -27,6 +27,7 @@ struct EngineOptions {
     bool fastconv = false;
     std::string audit_dir;
     bool audit_tensors = false;
+    bool s3_reset = false;
 };
 struct SynthesisPiece {
     std::uint32_t id = 0;
