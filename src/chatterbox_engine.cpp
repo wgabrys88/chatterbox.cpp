@@ -101,8 +101,16 @@ struct Engine::Impl {
     std::vector<int32_t> speech_history;
     std::string piece_text, piece_stop;
     std::vector<int32_t> piece_text_tokens, piece_speech;
-    int piece_ms = 0;
+    int piece_t3_ms = 0, piece_s3_ms = 0;
     std::uint32_t speech_bin_offset = 0;
+    static std::string json_i32(const std::vector<int32_t>& v) {
+        std::string s = "[";
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (i) s += ',';
+            s += std::to_string(v[i]);
+        }
+        return s + "]";
+    }
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void reset_acoustics() { acoustic = {}; speech_history.clear(); }
     void write_meta() {
@@ -301,7 +309,7 @@ struct Engine::Impl {
         piece_text_tokens = std::move(text_tokens);
         piece_speech = tokens;
         piece_stop = repeat_stopped ? "repeat" : "eos";
-        piece_ms = (int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + .5);
+        piece_t3_ms = (int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + .5);
         (void)speech_pos;
         (void)external_piece;
         return tokens;
@@ -317,7 +325,9 @@ struct Engine::Impl {
             ",\"n_speech_tok\":" + std::to_string(piece_speech.size()) +
             ",\"speech_hash\":\"" + token_hash(piece_speech) + "\"" +
             ",\"stop\":\"" + piece_stop + "\"" +
-            ",\"ms\":" + std::to_string(piece_ms) +
+            ",\"t3_ms\":" + std::to_string(piece_t3_ms) +
+            ",\"s3_ms\":" + std::to_string(piece_s3_ms) +
+            ",\"ms\":" + std::to_string(piece_t3_ms + piece_s3_ms) +
             ",\"s3_history\":" + std::to_string(acoustic.history_tokens) +
             ",\"s3_new\":" + std::to_string(neu.size()) +
             ",\"emitted_samples\":" + std::to_string(acoustic.emitted) + "}";
@@ -326,26 +336,16 @@ struct Engine::Impl {
         ledger_append(opts.audit_dir, "01-pieces.jsonl",
             "{\"piece\":" + std::to_string(piece) + ",\"response\":" + std::to_string(response) +
             ",\"text\":\"" + json_escape(piece_text) + "\",\"chars\":" + std::to_string(piece_text.size()) + "}");
-        {
-            std::string ids = "{\"piece\":" + std::to_string(piece) + ",\"ids\":[";
-            for (size_t i = 0; i < piece_text_tokens.size(); ++i) {
-                if (i) ids += ',';
-                ids += std::to_string(piece_text_tokens[i]);
-            }
-            ids += "]}";
-            ledger_append(opts.audit_dir, "02-text-tokens.jsonl", ids);
-        }
+        ledger_append(opts.audit_dir, "02-text-tokens.jsonl",
+            "{\"piece\":" + std::to_string(piece) + ",\"ids\":" + json_i32(piece_text_tokens) + "}");
         const std::uint32_t before = speech_bin_offset;
         ledger_bin_append(opts.audit_dir, "03-speech-tokens.bin", piece_speech);
         speech_bin_offset += 1 + (std::uint32_t)piece_speech.size();
         ledger_append(opts.audit_dir, "03-index.jsonl",
             "{\"piece\":" + std::to_string(piece) + ",\"n\":" + std::to_string(piece_speech.size()) +
             ",\"u32_offset\":" + std::to_string(before) + "}");
-        for (size_t i = 0; i < piece_speech.size(); ++i) {
-            ledger_append(opts.audit_dir, "04-sample.jsonl",
-                "{\"piece\":" + std::to_string(piece) + ",\"i\":" + std::to_string(i) +
-                ",\"id\":" + std::to_string(piece_speech[i]) + "}");
-        }
+        ledger_append(opts.audit_dir, "04-sample.jsonl",
+            "{\"piece\":" + std::to_string(piece) + ",\"ids\":" + json_i32(piece_speech) + "}");
         ledger_append(opts.audit_dir, "05-s3-window.jsonl",
             "{\"piece\":" + std::to_string(piece) +
             ",\"history_tokens\":" + std::to_string(acoustic.history_tokens) +
@@ -356,16 +356,16 @@ struct Engine::Impl {
             ",\"emit_end\":" + std::to_string(acoustic.emit_end) +
             ",\"pending_in\":" + std::to_string(acoustic.pending_in) +
             ",\"emitted\":" + std::to_string(acoustic.emitted) + "}");
+        std::string pcm = "{\"piece\":" + std::to_string(piece) + ",\"map\":[";
         for (size_t i = 0; i < neu.size(); ++i) {
             const int window_i = acoustic.history_tokens + (int)i;
-            const int raw0 = window_i * kSamplesPerToken;
-            const int local0 = raw0 - (int)acoustic.emit_begin;
-            ledger_append(opts.audit_dir, "06-pcm-map.jsonl",
-                "{\"piece\":" + std::to_string(piece) + ",\"token_i\":" + std::to_string(i) +
-                ",\"window_i\":" + std::to_string(window_i) +
-                ",\"sample_start\":" + std::to_string(local0) +
-                ",\"sample_end\":" + std::to_string(local0 + kSamplesPerToken) + "}");
+            const int local0 = window_i * kSamplesPerToken - (int)acoustic.emit_begin;
+            if (i) pcm += ',';
+            pcm += "{\"token_i\":" + std::to_string(i) + ",\"window_i\":" + std::to_string(window_i) +
+                   ",\"sample_start\":" + std::to_string(local0) +
+                   ",\"sample_end\":" + std::to_string(local0 + kSamplesPerToken) + "}";
         }
+        ledger_append(opts.audit_dir, "06-pcm-map.jsonl", pcm + "]}");
     }
     void run_s3(const std::vector<int32_t>& tokens, int session_index, std::uint32_t external_piece, bool last_piece, const PieceCallback& cb) {
         auto synthesis_context = tts_get_context();
@@ -405,7 +405,10 @@ struct Engine::Impl {
         }
         std::vector<float> pcm;
         s.pcm_out = &pcm;
+        const auto s3_started = std::chrono::steady_clock::now();
         s3gen_synthesize(window, s);
+        piece_s3_ms = (int)(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - s3_started).count() + .5);
         if (cb) cb(session_index, pcm.data(), pcm.size(), 0, true);
         if (session_index >= 0) {
             const auto ctx = tts_get_context();
