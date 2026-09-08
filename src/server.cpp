@@ -99,7 +99,6 @@ tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
     o.repeat_penalty = f("--repeat-penalty"); o.cfg_weight = f("--cfg-weight");
     o.exaggeration = f("--exaggeration"); o.cfm_steps = i("--cfm-steps");
     o.fastconv = i("--fastconv") != 0; o.audit_dir = s("--audit-dir");
-    o.s3_reset = args.count("--s3-reset") ? i("--s3-reset") != 0 : false;
     if (const char* tensors = std::getenv("TTS_AUDIT_TENSORS"))
         o.audit_tensors = tensors[0] == '1' && tensors[1] == 0;
     return tts_cpp::chatterbox::Engine(o);

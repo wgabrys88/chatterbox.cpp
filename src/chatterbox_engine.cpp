@@ -101,7 +101,7 @@ struct Engine::Impl {
     std::vector<int32_t> speech_history;
     std::string piece_text, piece_stop;
     std::vector<int32_t> piece_text_tokens, piece_speech;
-    int piece_t3_ms = 0, piece_s3_ms = 0, piece_eos_min_speech = 0;
+    int piece_t3_ms = 0, piece_s3_ms = 0;
     std::uint32_t speech_bin_offset = 0;
     static std::string json_i32(const std::vector<int32_t>& v) {
         std::string s = "[";
@@ -227,7 +227,6 @@ struct Engine::Impl {
         sp.temp = opts.temperature;
         sp.repeat_penalty = opts.repeat_penalty;
         sp.cfg_weight = opts.cfg_weight;
-        sp.stop_speech_token = model.hparams.stop_speech_token;
 
         std::vector<int32_t> text_tokens;
 #ifdef TTS_CPP_MTL
@@ -245,8 +244,6 @@ struct Engine::Impl {
             text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
         }
         if (text_tokens.empty()) throw std::runtime_error("empty T3 text tokens");
-        sp.n_text_tokens = (int32_t)text_tokens.size();
-        const int eos_min_speech = (sp.n_text_tokens > 5) ? sp.n_text_tokens * 4 : 0;
 
         int n_past = 0, speech_pos = 1;
         int32_t token = 0, pending_mtl = -1;
@@ -282,8 +279,7 @@ struct Engine::Impl {
         out.push_back(token);
         publish(token);
 
-        int steps = 0;
-        for (; steps < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++steps) {
+        for (int i = 0; i < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++i) {
 #ifdef TTS_CPP_MTL
             if (model.hparams.variant == CHBX_VARIANT_MTL) {
                 std::vector<float> logits_c, logits_u;
@@ -305,17 +301,7 @@ struct Engine::Impl {
             publish(token);
         }
 
-        if (token != model.hparams.stop_speech_token) {
-            const char * reason = (n_past + 1 > model.hparams.n_ctx) ? "context" : "max_tokens";
-            tts_jsonl(std::string("{\"event\":\"tts.failed\",\"reason\":\"") + reason +
-                "\",\"n_speech\":" + std::to_string(tokens.size()) +
-                ",\"n_text\":" + std::to_string(sp.n_text_tokens) +
-                ",\"eos_min\":" + std::to_string(eos_min_speech) +
-                ",\"steps\":" + std::to_string(steps) +
-                ",\"n_past\":" + std::to_string(n_past) +
-                ",\"n_ctx\":" + std::to_string(model.hparams.n_ctx) + "}");
-            throw std::runtime_error(std::string("T3 stopped without EOS (") + reason + ")");
-        }
+        if (token != model.hparams.stop_speech_token) throw std::runtime_error("T3 stopped without EOS");
 #ifdef TTS_CPP_MTL
         if (tokens.empty() && pending_mtl >= 0) tokens.push_back(pending_mtl);
 #endif
@@ -324,27 +310,26 @@ struct Engine::Impl {
         piece_speech = tokens;
         piece_stop = repeat_stopped ? "repeat" : "eos";
         piece_t3_ms = (int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + .5);
-        piece_eos_min_speech = eos_min_speech;
         (void)speech_pos;
         (void)external_piece;
         return tokens;
     }
     void emit_piece_ledger(std::uint32_t response, std::uint32_t piece, const std::vector<int32_t>& window, const std::vector<int32_t>& neu) {
         const auto ctx = tts_get_context();
-        const int hist = acoustic.history_tokens;
         const std::string line =
-            std::string("{\"event\":\"tts.piece\",\"response\":") + std::to_string(ctx.valid ? ctx.response : response) +
+            std::string("{\"response\":") + std::to_string(ctx.valid ? ctx.response : response) +
             ",\"piece\":" + std::to_string(piece) +
+            ",\"text\":\"" + json_escape(piece_text) + "\"" +
+            ",\"text_sha\":\"" + hash_hex(hash_bytes(piece_text.data(), piece_text.size())) + "\"" +
             ",\"n_text_tok\":" + std::to_string(piece_text_tokens.size()) +
             ",\"n_speech_tok\":" + std::to_string(piece_speech.size()) +
-            ",\"eos_min_speech\":" + std::to_string(piece_eos_min_speech) +
             ",\"speech_hash\":\"" + token_hash(piece_speech) + "\"" +
             ",\"stop\":\"" + piece_stop + "\"" +
             ",\"t3_ms\":" + std::to_string(piece_t3_ms) +
             ",\"s3_ms\":" + std::to_string(piece_s3_ms) +
-            ",\"s3_history\":" + std::to_string(hist) +
+            ",\"ms\":" + std::to_string(piece_t3_ms + piece_s3_ms) +
+            ",\"s3_history\":" + std::to_string(acoustic.history_tokens) +
             ",\"s3_new\":" + std::to_string(neu.size()) +
-            ",\"pending_in\":" + std::to_string(acoustic.pending_in) +
             ",\"emitted_samples\":" + std::to_string(acoustic.emitted) + "}";
         tts_jsonl(line);
         if (opts.audit_dir.empty()) return;
@@ -363,13 +348,24 @@ struct Engine::Impl {
             "{\"piece\":" + std::to_string(piece) + ",\"ids\":" + json_i32(piece_speech) + "}");
         ledger_append(opts.audit_dir, "05-s3-window.jsonl",
             "{\"piece\":" + std::to_string(piece) +
-            ",\"history_tokens\":" + std::to_string(hist) +
-            ",\"history_hash\":\"" + token_hash(std::vector<int32_t>(window.begin(), window.begin() + hist)) + "\"" +
+            ",\"history_tokens\":" + std::to_string(acoustic.history_tokens) +
+            ",\"history_hash\":\"" + token_hash(std::vector<int32_t>(window.begin(), window.begin() + acoustic.history_tokens)) + "\"" +
             ",\"new_tokens\":" + std::to_string(neu.size()) +
             ",\"new_hash\":\"" + token_hash(neu) + "\"" +
             ",\"emit_begin\":" + std::to_string(acoustic.emit_begin) +
+            ",\"emit_end\":" + std::to_string(acoustic.emit_end) +
             ",\"pending_in\":" + std::to_string(acoustic.pending_in) +
             ",\"emitted\":" + std::to_string(acoustic.emitted) + "}");
+        std::string pcm = "{\"piece\":" + std::to_string(piece) + ",\"map\":[";
+        for (size_t i = 0; i < neu.size(); ++i) {
+            const int window_i = acoustic.history_tokens + (int)i;
+            const int local0 = window_i * kSamplesPerToken - (int)acoustic.emit_begin;
+            if (i) pcm += ',';
+            pcm += "{\"token_i\":" + std::to_string(i) + ",\"window_i\":" + std::to_string(window_i) +
+                   ",\"sample_start\":" + std::to_string(local0) +
+                   ",\"sample_end\":" + std::to_string(local0 + kSamplesPerToken) + "}";
+        }
+        ledger_append(opts.audit_dir, "06-pcm-map.jsonl", pcm + "]}");
     }
     void run_s3(const std::vector<int32_t>& tokens, int session_index, std::uint32_t external_piece, bool last_piece, const PieceCallback& cb) {
         auto synthesis_context = tts_get_context();
@@ -413,11 +409,11 @@ struct Engine::Impl {
         s3gen_synthesize(window, s);
         piece_s3_ms = (int)(std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - s3_started).count() + .5);
+        if (cb) cb(session_index, pcm.data(), pcm.size(), 0, true);
         if (session_index >= 0) {
             const auto ctx = tts_get_context();
             emit_piece_ledger(ctx.response, external_piece, window, tokens);
         }
-        if (cb) cb(session_index, pcm.data(), pcm.size(), 0, true);
         if ((int)window.size() > kSpeechHistoryTokens) {
             speech_history.assign(window.end() - kSpeechHistoryTokens, window.end());
         } else {
@@ -442,10 +438,8 @@ void Engine::synthesize_pieces_streaming(const std::vector<SynthesisPiece>& piec
     for (std::size_t index = 0; index < pieces.size(); ++index) {
         const auto& piece = pieces[index];
         if (piece.text.empty()) throw std::runtime_error("empty synthesis piece");
-        if (pimpl_->opts.s3_reset) pimpl_->reset_acoustics();
         auto tokens = pimpl_->generate_t3(piece.text, (int)index, piece.id);
-        const bool last = pimpl_->opts.s3_reset || index + 1 == pieces.size();
-        pimpl_->run_s3(tokens, (int)index, piece.id, last,
+        pimpl_->run_s3(tokens, (int)index, piece.id, index + 1 == pieces.size(),
             [&](int, const float* pcm, std::size_t n, int chunk, bool final) {
                 if (cb) cb((int)index, pcm, n, chunk, final);
             });
