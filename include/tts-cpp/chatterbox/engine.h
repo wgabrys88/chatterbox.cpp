@@ -21,12 +21,14 @@ struct EngineOptions {
     float min_p = .05f;
     float temperature = .8f;
     float repeat_penalty = 1.2f;
+    int repeat_stop_consecutive = 16;
     float cfg_weight = .5f;
     float exaggeration = .5f;
     int cfm_steps = 0;
     bool fastconv = false;
     std::string audit_dir;
     bool audit_tensors = false;
+    bool forensics = false;
 };
 struct SynthesisPiece {
     std::uint32_t id = 0;

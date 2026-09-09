@@ -216,11 +216,20 @@ bool eval_step(
     int                      n_past,
     int32_t                  token,
     std::vector<float> &     logits_out);
+struct t3_sample_decision {
+    int32_t chosen_id = 0;
+    int candidates = 0;
+    int32_t top5_ids[5] = {};
+    float top5_logprobs[5] = {};
+    int32_t repeat_last4[4] = {};
+};
+
 int32_t sample_next_token_ex(
     const std::vector<float> &          logits,
     const std::vector<int32_t> &        generated,
     const chatterbox_sampling_params &  params,
-    std::mt19937 &                      rng);
+    std::mt19937 &                      rng,
+    t3_sample_decision *                decision = nullptr);
 void chatterbox_log_cb(ggml_log_level level, const char * text, void * ud);
 extern int g_log_verbose;
 bool compute_prompt_feat_native(

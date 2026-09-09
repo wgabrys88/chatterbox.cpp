@@ -97,9 +97,12 @@ tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
     o.n_gpu_layers = i("--n-gpu-layers"); o.n_threads = i("--threads"); o.seed = i("--seed");
     o.n_predict = i("--max-tokens"); o.n_ctx = i("--context"); o.top_k = i("--top-k");
     o.top_p = f("--top-p"); o.min_p = f("--min-p"); o.temperature = f("--temperature");
-    o.repeat_penalty = f("--repeat-penalty"); o.cfg_weight = f("--cfg-weight");
+    o.repeat_penalty = f("--repeat-penalty");
+    if (args.count("--repeat-stop")) o.repeat_stop_consecutive = i("--repeat-stop");
+    o.cfg_weight = f("--cfg-weight");
     o.exaggeration = f("--exaggeration"); o.cfm_steps = i("--cfm-steps");
     o.fastconv = i("--fastconv") != 0; o.audit_dir = s("--audit-dir");
+    if (args.count("--forensics")) o.forensics = i("--forensics") != 0;
     if (const char* tensors = std::getenv("TTS_AUDIT_TENSORS"))
         o.audit_tensors = tensors[0] == '1' && tensors[1] == 0;
     return tts_cpp::chatterbox::Engine(o);
@@ -134,7 +137,8 @@ void emit_server_config(const args_t& args) {
         + ",\"top_k\":" + s("--top-k")
         + ",\"repeat_penalty\":" + s("--repeat-penalty")
         + ",\"repeat_last_n\":" + std::to_string(tts_cpp::chatterbox::detail::REPEAT_PENALTY_LAST_N)
-        + ",\"repeat_stop_consecutive\":" + std::to_string(tts_cpp::chatterbox::detail::REPEAT_STOP_CONSECUTIVE)
+        + ",\"repeat_stop_consecutive\":" + (args.count("--repeat-stop") ? s("--repeat-stop")
+            : std::to_string(tts_cpp::chatterbox::detail::REPEAT_STOP_CONSECUTIVE))
         + ",\"max_tokens\":" + s("--max-tokens")
         + ",\"context\":" + s("--context")
         + ",\"cfm_steps\":" + s("--cfm-steps")

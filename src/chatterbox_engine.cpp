@@ -111,6 +111,53 @@ struct Engine::Impl {
         }
         return s + "]";
     }
+    static std::string json_f(float value) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.6g", value);
+        return buf;
+    }
+    bool should_log_steps() const { return !opts.audit_dir.empty() || opts.forensics; }
+    std::string forensic_head() const {
+        const auto ctx = tts_get_context();
+        return std::string("{\"run_id\":\"") + json_escape(tts_run_identity()) + "\""
+            + ",\"response\":" + std::to_string(ctx.response)
+            + ",\"piece\":" + std::to_string(ctx.piece);
+    }
+    void emit_forensic(const std::string& event, const std::string& body, const char* ledger = nullptr) {
+        if (!should_log_steps()) return;
+        const std::string json = std::string("{\"event\":\"") + event + "\"," + forensic_head() + body + "}";
+        tts_jsonl(json);
+        if (ledger && !opts.audit_dir.empty()) ledger_append(opts.audit_dir, ledger, json);
+    }
+    void emit_t3_text_tokens(const std::vector<int32_t>& ids) {
+        emit_forensic("t3.text_tokens", ",\"ids\":" + json_i32(ids));
+    }
+    void emit_t3_step(int step, int32_t chosen, const t3_sample_decision& decision, int n_past, int speech_pos) {
+        std::string body = ",\"step\":" + std::to_string(step)
+            + ",\"chosen\":" + std::to_string(chosen)
+            + ",\"candidates\":" + std::to_string(decision.candidates)
+            + ",\"top5\":[";
+        for (int i = 0; i < 5; ++i) {
+            if (i) body += ',';
+            body += "{\"id\":" + std::to_string(decision.top5_ids[i])
+                + ",\"lp\":" + json_f(decision.top5_logprobs[i]) + "}";
+        }
+        body += "],\"repeat_last4\":[";
+        for (int i = 0; i < 4; ++i) {
+            if (i) body += ',';
+            body += std::to_string(decision.repeat_last4[i]);
+        }
+        body += "],\"n_past\":" + std::to_string(n_past)
+            + ",\"speech_pos\":" + std::to_string(speech_pos);
+        emit_forensic("t3.step", body, "04-t3-step.jsonl");
+    }
+    void emit_t3_repeat_abort(int step, int32_t token, int count) {
+        emit_forensic("t3.repeat_abort",
+            ",\"step\":" + std::to_string(step)
+            + ",\"consecutive_id\":" + std::to_string(token)
+            + ",\"count\":" + std::to_string(count),
+            "04-t3-step.jsonl");
+    }
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void reset_acoustics() { acoustic = {}; speech_history.clear(); }
     void write_meta() {
@@ -123,7 +170,7 @@ struct Engine::Impl {
             << ",\"min_p\":" << opts.min_p
             << ",\"repeat_penalty\":" << opts.repeat_penalty
             << ",\"repeat_last_n\":" << REPEAT_PENALTY_LAST_N
-            << ",\"repeat_stop\":" << REPEAT_STOP_CONSECUTIVE
+            << ",\"repeat_stop\":" << opts.repeat_stop_consecutive
             << ",\"cfm_steps\":" << opts.cfm_steps
             << ",\"n_ctx\":" << opts.n_ctx
             << ",\"max_tokens\":" << opts.n_predict
@@ -131,6 +178,11 @@ struct Engine::Impl {
             << ",\"top_k\":" << opts.top_k
             << ",\"top_p\":" << opts.top_p
             << ",\"audit_tensors\":" << (opts.audit_tensors ? "true" : "false")
+            << ",\"forensics\":" << (opts.forensics ? "true" : "false")
+            << ",\"ledgers\":{"
+            << "\"speech_ids\":\"04-speech-ids.jsonl\""
+            << ",\"t3_step\":\"04-t3-step.jsonl\""
+            << "}"
             << "}\n";
     }
     void init() {
@@ -244,6 +296,7 @@ struct Engine::Impl {
             text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
         }
         if (text_tokens.empty()) throw std::runtime_error("empty T3 text tokens");
+        emit_t3_text_tokens(text_tokens);
 
         int n_past = 0, speech_pos = 1;
         int32_t token = 0, pending_mtl = -1;
@@ -274,12 +327,14 @@ struct Engine::Impl {
         {
             std::vector<float> logits;
             if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past)) throw std::runtime_error("Turbo prompt failed");
-            token = sample_next_token_ex(logits, out, sp, rng);
+            t3_sample_decision decision{};
+            token = sample_next_token_ex(logits, out, sp, rng, should_log_steps() ? &decision : nullptr);
+            if (should_log_steps()) emit_t3_step(0, token, decision, n_past, speech_pos);
         }
         out.push_back(token);
         publish(token);
 
-        for (int i = 0; i < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++i) {
+        for (int step = 1; step < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++step) {
 #ifdef TTS_CPP_MTL
             if (model.hparams.variant == CHBX_VARIANT_MTL) {
                 std::vector<float> logits_c, logits_u;
@@ -291,9 +346,13 @@ struct Engine::Impl {
             {
                 std::vector<float> logits;
                 if (!eval_step(model, allocr, n_threads, n_past++, token, logits)) throw std::runtime_error("Turbo step failed");
-                token = sample_next_token_ex(logits, out, sp, rng);
+                t3_sample_decision decision{};
+                token = sample_next_token_ex(logits, out, sp, rng, should_log_steps() ? &decision : nullptr);
+                if (should_log_steps()) emit_t3_step(step, token, decision, n_past, speech_pos);
             }
-            if (consecutive_repeat(out, token, REPEAT_STOP_CONSECUTIVE)) {
+            if (opts.repeat_stop_consecutive >= 2
+                && consecutive_repeat(out, token, opts.repeat_stop_consecutive)) {
+                if (should_log_steps()) emit_t3_repeat_abort(step, token, opts.repeat_stop_consecutive);
                 repeat_stopped = true;
                 token = model.hparams.stop_speech_token;
             }
@@ -344,7 +403,7 @@ struct Engine::Impl {
         ledger_append(opts.audit_dir, "03-index.jsonl",
             "{\"piece\":" + std::to_string(piece) + ",\"n\":" + std::to_string(piece_speech.size()) +
             ",\"u32_offset\":" + std::to_string(before) + "}");
-        ledger_append(opts.audit_dir, "04-sample.jsonl",
+        ledger_append(opts.audit_dir, "04-speech-ids.jsonl",
             "{\"piece\":" + std::to_string(piece) + ",\"ids\":" + json_i32(piece_speech) + "}");
         ledger_append(opts.audit_dir, "05-s3-window.jsonl",
             "{\"piece\":" + std::to_string(piece) +

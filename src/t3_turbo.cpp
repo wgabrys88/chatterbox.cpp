@@ -358,11 +358,47 @@ bool eval_step(
     ggml_backend_tensor_get(logits, logits_out.data(), 0, (size_t)model.hparams.n_speech_vocab*sizeof(float));
     return true;
 }
+static void fill_sample_decision(t3_sample_decision * decision,
+                                 const std::vector<float> & scores,
+                                 const std::vector<int32_t> & generated) {
+    if (!decision) return;
+    const int n = (int)scores.size();
+    decision->candidates = 0;
+    struct IS { int idx; float s; };
+    std::vector<IS> ranked;
+    ranked.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        if (scores[i] != -INFINITY) {
+            decision->candidates++;
+            ranked.push_back({i, scores[i]});
+        }
+    }
+    const int top_n = std::min(5, (int)ranked.size());
+    if (top_n > 0) {
+        std::partial_sort(ranked.begin(), ranked.begin() + top_n, ranked.end(),
+            [](const IS& a, const IS& b) { return a.s > b.s; });
+    }
+    for (int i = 0; i < 5; ++i) {
+        if (i < top_n) {
+            decision->top5_ids[i] = ranked[i].idx;
+            decision->top5_logprobs[i] = ranked[i].s;
+        } else {
+            decision->top5_ids[i] = 0;
+            decision->top5_logprobs[i] = -INFINITY;
+        }
+    }
+    const int m = std::min(4, (int)generated.size());
+    for (int i = 0; i < 4; ++i) {
+        decision->repeat_last4[i] = i < m ? generated[generated.size() - (size_t)m + i] : 0;
+    }
+}
+
 int32_t sample_next_token_ex(
     const std::vector<float> & logits,
     const std::vector<int32_t> & generated,
     const chatterbox_sampling_params & params,
-    std::mt19937 & rng) {
+    std::mt19937 & rng,
+    t3_sample_decision * decision) {
     const int n = (int)logits.size();
     
     std::vector<float> scores(logits.begin(), logits.end());
@@ -402,6 +438,7 @@ int32_t sample_next_token_ex(
         for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
     apply_speech_repeat_penalty(scores.data(), n, generated, params.repeat_penalty);
+    fill_sample_decision(decision, scores, generated);
     float mx = -INFINITY;
     for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
     std::vector<float> probs(n);
@@ -410,13 +447,20 @@ int32_t sample_next_token_ex(
         probs[i] = (scores[i] == -INFINITY) ? 0.0f : std::exp(scores[i] - mx);
         psum += probs[i];
     }
-    if (psum == 0.0f) return 0;
-    for (float & p : probs) p /= psum;
-    if (params.temp <= 0.0f) {
-        return (int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end()));
+    if (psum == 0.0f) {
+        if (decision) decision->chosen_id = 0;
+        return 0;
     }
-    std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    return dist(rng);
+    for (float & p : probs) p /= psum;
+    int32_t chosen = 0;
+    if (params.temp <= 0.0f) {
+        chosen = (int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end()));
+    } else {
+        std::discrete_distribution<int> dist(probs.begin(), probs.end());
+        chosen = (int32_t)dist(rng);
+    }
+    if (decision) decision->chosen_id = chosen;
+    return chosen;
 }
 
 }
