@@ -112,6 +112,7 @@ struct Engine::Impl {
         return s + "]";
     }
     static std::string json_f(float value) {
+        if (!std::isfinite(value)) return "null";
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%.6g", value);
         return buf;
@@ -119,7 +120,7 @@ struct Engine::Impl {
     bool should_log_steps() const { return !opts.audit_dir.empty() || opts.forensics; }
     std::string forensic_head() const {
         const auto ctx = tts_get_context();
-        return std::string("{\"run_id\":\"") + json_escape(tts_run_identity()) + "\""
+        return std::string("\"run_id\":\"") + json_escape(tts_run_identity()) + "\""
             + ",\"response\":" + std::to_string(ctx.response)
             + ",\"piece\":" + std::to_string(ctx.piece);
     }
