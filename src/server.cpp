@@ -12,6 +12,7 @@
 #include <ws2tcpip.h>
 #include "tts-cpp/chatterbox/engine.h"
 #include "tts-cpp/chatterbox/log.h"
+#include "chatterbox_t3_internal.h"
 
 using args_t = std::unordered_map<std::string, std::string>;
 
@@ -104,6 +105,62 @@ tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
     return tts_cpp::chatterbox::Engine(o);
 }
 
+std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') { out += '\\'; out += (char)c; }
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else if (c < 0x20) {
+            char b[8];
+            std::snprintf(b, sizeof(b), "\\u%04x", c);
+            out += b;
+        } else out += (char)c;
+    }
+    return out;
+}
+
+void emit_server_config(const args_t& args) {
+    auto s = [&](const char* k) -> const std::string& { return args.at(k); };
+    const std::string json =
+        std::string("{\"event\":\"server.config\"")
+        + ",\"family\":\"" + json_escape(s("--family")) + "\""
+        + ",\"seed\":" + s("--seed")
+        + ",\"temperature\":" + s("--temperature")
+        + ",\"min_p\":" + s("--min-p")
+        + ",\"top_p\":" + s("--top-p")
+        + ",\"top_k\":" + s("--top-k")
+        + ",\"repeat_penalty\":" + s("--repeat-penalty")
+        + ",\"repeat_last_n\":" + std::to_string(tts_cpp::chatterbox::detail::REPEAT_PENALTY_LAST_N)
+        + ",\"repeat_stop_consecutive\":" + std::to_string(tts_cpp::chatterbox::detail::REPEAT_STOP_CONSECUTIVE)
+        + ",\"max_tokens\":" + s("--max-tokens")
+        + ",\"context\":" + s("--context")
+        + ",\"cfm_steps\":" + s("--cfm-steps")
+        + ",\"cfg_weight\":" + s("--cfg-weight")
+        + ",\"exaggeration\":" + s("--exaggeration")
+        + "}";
+    tts_jsonl(json);
+}
+
+void emit_synthesis_begin(const std::vector<request_t>& requests) {
+    std::size_t total_chars = 0;
+    for (const auto& request : requests) total_chars += request.text.size();
+    std::string json =
+        std::string("{\"event\":\"synthesis.begin\"")
+        + ",\"response\":" + std::to_string(requests[0].response)
+        + ",\"pieces\":" + std::to_string(requests.size())
+        + ",\"total_chars\":" + std::to_string(total_chars)
+        + ",\"piece_chars\":[";
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        if (i) json += ',';
+        json += std::to_string(requests[i].text.size());
+    }
+    json += "]}";
+    tts_jsonl(json);
+}
+
 bool receive(SOCKET socket, request_t& request) {
     std::uint32_t header[7];
     if (!recv_all(socket, header, sizeof(header))) return false;
@@ -155,6 +212,8 @@ void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts, const std::string& a
         pieces.push_back({request.piece, request.text});
     }
 
+    emit_synthesis_begin(requests);
+
     std::vector<bool> done(requests.size(), false);
     tts_context_scope synthesis_context(requests[0].response, 0);
     try {
@@ -200,6 +259,7 @@ int main(int argc, char** argv) {
         tts_emit("server.start", "port=" + args.at("--port"));
         auto tts = make_engine(args);
         tts.warm_up();
+        emit_server_config(args);
 
         WSADATA wsa{};
         if (WSAStartup(MAKEWORD(2, 2), &wsa)) throw std::runtime_error("WSAStartup failed");
