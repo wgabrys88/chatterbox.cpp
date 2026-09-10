@@ -1,7 +1,6 @@
 #include "tts-cpp/chatterbox/engine.h"
 #include "tts-cpp/chatterbox/v3.h"
 #include <algorithm>
-#include <cstdio>
 #include <fstream>
 #include <memory>
 #include <random>
@@ -61,11 +60,7 @@ struct Engine::Impl {
         const int32_t stop = model.hparams.stop_speech_token;
         const int32_t sos = model.hparams.start_speech_token;
         std::vector<float> logits;
-        std::string dump_dir = opts.t3_gguf_path;
-        auto slash = dump_dir.find_last_of("\\/");
-        if (slash == std::string::npos) throw std::runtime_error("dump path");
-        dump_dir = dump_dir.substr(0, slash);
-        eval_prompt(model, allocr, text_tokens, logits, n_past, dump_dir);
+        eval_prompt(model, allocr, text_tokens, logits, n_past);
         std::vector<int32_t> generated;
         generated.push_back(sos);
         std::vector<int32_t> predicted;
@@ -74,23 +69,16 @@ struct Engine::Impl {
             int32_t token = sample_next_token_ex(logits, generated, rng);
             predicted.push_back(token);
             generated.push_back(token);
-            if (token == stop) {
-                if (!cfg_dump_step(i)) {
-                    char label[64];
-                    std::snprintf(label, sizeof(label), "gen_step=%d last n_past=%d", i, n_past);
-                    dump_last_cfg_meta(dump_dir, label, i);
-                }
-                break;
-            }
-            eval_step(model, allocr, n_past++, token, i + 1, logits, dump_dir, i);
+            if (token == stop) break;
+            eval_step(model, allocr, n_past++, token, i + 1, logits);
         }
         if (predicted.empty() || predicted.back() != stop) throw std::runtime_error("T3 stopped without EOS");
         auto dropped = drop_invalid_tokens(predicted, sos, stop);
         {
             std::string p = opts.t3_gguf_path;
-            auto slash2 = p.find_last_of("\\/");
-            if (slash2 == std::string::npos) throw std::runtime_error("dump path");
-            std::ofstream f(p.substr(0, slash2) + "/v3_t3_dump.txt");
+            auto slash = p.find_last_of("\\/");
+            if (slash == std::string::npos) throw std::runtime_error("dump path");
+            std::ofstream f(p.substr(0, slash) + "/v3_t3_dump.txt");
             if (!f) throw std::runtime_error("dump");
             f << "bpe";
             for (int32_t id : ids) f << " " << id;

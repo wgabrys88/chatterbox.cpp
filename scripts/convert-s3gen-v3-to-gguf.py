@@ -4,7 +4,7 @@ from pathlib import Path
 import gguf, numpy as np, torch
 from safetensors.torch import load_file
 from quant_policy import QUANT_TYPE, should_quantize
-QUANT = "f16"
+QUANT = "q4_0"
 TEXT_VOCAB_SIZE = 2454
 def as_numpy(tensor, *, dtype=None):
     if dtype is not None: tensor = tensor.to(dtype)
@@ -27,9 +27,8 @@ def must_f32(name):
 def add(writer, name, arr):
     if arr.dtype.kind in "iu" or np.issubdtype(arr.dtype, np.integer):
         writer.add_tensor(name, arr); return
-    if must_f32(name) or QUANT in ("f16", "f32"):
-        dt = np.float32 if (must_f32(name) or QUANT == "f32") else np.float16
-        writer.add_tensor(name, np.ascontiguousarray(arr.astype(dt))); return
+    if must_f32(name):
+        writer.add_tensor(name, np.ascontiguousarray(arr.astype(np.float32))); return
     qtype = QUANT_TYPE[QUANT]
     if not should_quantize(name, arr.shape, qtype):
         writer.add_tensor(name, np.ascontiguousarray(arr.astype(np.float16)) if arr.ndim == 3 else arr)

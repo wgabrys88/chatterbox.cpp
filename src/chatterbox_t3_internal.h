@@ -87,13 +87,9 @@ struct chatterbox_model {
     std::vector<std::string> tok_tokens, tok_merges;
     std::vector<int> tok_types;
 };
-inline bool cfg_dump_step(int gen_step) {
-    return gen_step == 0 || gen_step == 10 || gen_step == 40 || gen_step == 50;
-}
 ggml_backend_t init_backend();
 void load_model_gguf(const std::string & path, chatterbox_model & model);
-void eval_prompt(const chatterbox_model &, ggml_gallocr_t, const std::vector<int32_t> &, std::vector<float> &, int &, const std::string & dump_dir);
-void eval_step(const chatterbox_model &, ggml_gallocr_t, int, int32_t, int, std::vector<float> &, const std::string & dump_dir, int gen_step);
-void dump_last_cfg_meta(const std::string & dump_dir, const char * label, int gen_step);
+void eval_prompt(const chatterbox_model &, ggml_gallocr_t, const std::vector<int32_t> &, std::vector<float> &, int &);
+void eval_step(const chatterbox_model &, ggml_gallocr_t, int, int32_t, int, std::vector<float> &);
 int32_t sample_next_token_ex(const std::vector<float> &, const std::vector<int32_t> &, std::mt19937 &);
 }

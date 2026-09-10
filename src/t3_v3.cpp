@@ -3,14 +3,11 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "ggml-vulkan.h"
-#include <fstream>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <map>
-#include <numeric>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -289,8 +286,6 @@ static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_te
         ggml_get_rows(ctx, model.speech_emb, model.builtin_cond_prompt_tokens),
         ggml_get_rows(ctx, model.speech_pos_emb, cond_pos));
     ggml_tensor * perc = run_perceiver(ctx, model, h);
-    ggml_set_name(perc, "perceiver_out");
-    ggml_set_output(perc);
     ggml_tensor * emo = ggml_mul_mat(ctx, model.emotion_adv_fc_w, model.builtin_emotion_adv);
     ggml_tensor * cond = ggml_concat(ctx, spkr, perc, 1);
     cond = ggml_concat(ctx, cond, emo, 1);
@@ -309,8 +304,6 @@ static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_te
     ggml_tensor * inp = ggml_concat(ctx, cond, text, 1);
     inp = ggml_concat(ctx, inp, bos, 1);
     inp = ggml_concat(ctx, inp, bos, 1);
-    ggml_set_name(inp, "t3_inp");
-    ggml_set_output(inp);
     build_transformer_core(ctx, gf, model, inp, 0, N);
     ggml_free(ctx);
     return gf;
@@ -333,143 +326,17 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
     ggml_free(ctx);
     return gf;
 }
-static thread_local std::vector<float> g_last_cond, g_last_uncond;
-static void fetch_cond_uncond(ggml_tensor * logits, int N, std::vector<float> & cond, std::vector<float> & uncond) {
-    const int vocab = (int)logits->ne[0];
-    cond.resize((size_t)vocab);
-    uncond.resize((size_t)vocab);
-    ggml_backend_tensor_get(logits, cond.data(), (size_t)(N - 1) * logits->nb[1], cond.size() * sizeof(float));
-    ggml_backend_tensor_get(logits, uncond.data(), logits->nb[2] + (size_t)(N - 1) * logits->nb[1], uncond.size() * sizeof(float));
-}
 static void cfg_last_logits(ggml_tensor * logits, int N, int vocab, std::vector<float> & out) {
-    std::vector<float> cond, uncond;
-    fetch_cond_uncond(logits, N, cond, uncond);
-    g_last_cond = cond;
-    g_last_uncond = uncond;
+    std::vector<float> cond((size_t)vocab), uncond((size_t)vocab);
+    ggml_backend_tensor_get(logits, cond.data(), (size_t)(N - 1) * logits->nb[1], (size_t)vocab * sizeof(float));
+    ggml_backend_tensor_get(logits, uncond.data(), logits->nb[2] + (size_t)(N - 1) * logits->nb[1], (size_t)vocab * sizeof(float));
     out.resize((size_t)vocab);
     for (int i = 0; i < vocab; ++i)
         out[i] = cond[i] + CFG_WEIGHT * (cond[i] - uncond[i]);
 }
-static void dump_cfg_logits_meta(ggml_tensor * logits, int N, std::ofstream & f, const char * label) {
-    f << "=== " << label << " ===\n";
-    f << "logits_ne " << logits->ne[0] << " " << logits->ne[1] << " " << logits->ne[2] << " " << logits->ne[3] << "\n";
-    f << "logits_nb " << logits->nb[0] << " " << logits->nb[1] << " " << logits->nb[2] << " " << logits->nb[3] << "\n";
-    std::vector<float> cond, uncond;
-    fetch_cond_uncond(logits, N, cond, uncond);
-    g_last_cond = cond;
-    g_last_uncond = uncond;
-    int arg_c = (int)(std::max_element(cond.begin(), cond.end()) - cond.begin());
-    int arg_u = (int)(std::max_element(uncond.begin(), uncond.end()) - uncond.begin());
-    float cfg_v = cond[arg_c] + CFG_WEIGHT * (cond[arg_c] - uncond[arg_c]);
-    f << "cfg_step N=" << N << " argmax_cond=" << arg_c << " argmax_uncond=" << arg_u
-      << " cond_max=" << cond[arg_c] << " uncond_max=" << uncond[arg_u] << " cfg_at_cond=" << cfg_v << "\n";
-}
-static void dump_cfg_vectors_meta(const std::vector<float> & cond, const std::vector<float> & uncond,
-                                  std::ofstream & f, const char * label, int N) {
-    f << "=== " << label << " ===\n";
-    int arg_c = (int)(std::max_element(cond.begin(), cond.end()) - cond.begin());
-    int arg_u = (int)(std::max_element(uncond.begin(), uncond.end()) - uncond.begin());
-    float cfg_v = cond[arg_c] + CFG_WEIGHT * (cond[arg_c] - uncond[arg_c]);
-    f << "cfg_step N=" << N << " argmax_cond=" << arg_c << " argmax_uncond=" << arg_u
-      << " cond_max=" << cond[arg_c] << " uncond_max=" << uncond[arg_u] << " cfg_at_cond=" << cfg_v << "\n";
-}
-static void dump_logits_top10(const std::vector<float> & cond, const std::vector<float> & uncond,
-                              std::ofstream & f, const char * label) {
-    const int vocab = (int)cond.size();
-    std::vector<float> cfg((size_t)vocab);
-    for (int i = 0; i < vocab; ++i)
-        cfg[i] = cond[i] + CFG_WEIGHT * (cond[i] - uncond[i]);
-    auto write_top = [&](const char * tag, const std::vector<float> & v) {
-        std::vector<int> idx((size_t)vocab);
-        std::iota(idx.begin(), idx.end(), 0);
-        const int k = std::min(10, vocab);
-        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
-            [&](int a, int b) { return v[a] > v[b]; });
-        f << "top10_" << tag << " " << label << ":";
-        for (int j = 0; j < k; ++j)
-            f << " " << idx[j] << "=" << v[idx[j]];
-        f << "\n";
-    };
-    write_top("cond", cond);
-    write_top("uncond", uncond);
-    write_top("cfg", cfg);
-}
-static void dump_logits_top10(ggml_tensor * logits, int N, std::ofstream & f, const char * label) {
-    std::vector<float> cond, uncond;
-    fetch_cond_uncond(logits, N, cond, uncond);
-    dump_logits_top10(cond, uncond, f, label);
-}
-static void dump_kv_spotcheck(const chatterbox_model & model, int layer, int pos_lo, int pos_hi, std::ofstream & f) {
-    const auto & hp = model.hparams;
-    const int HD = hp.n_embd / hp.n_head;
-    const int n_ctx = hp.n_ctx;
-    const size_t kv_pos_stride = (size_t)HD * sizeof(float);
-    const size_t kv_head_stride = (size_t)HD * n_ctx * sizeof(float);
-    const size_t kv_batch_stride = (size_t)HD * n_ctx * hp.n_head * sizeof(float);
-    const size_t kv_layer_elems = (size_t)HD * n_ctx * hp.n_head * CFG_BATCH;
-    const size_t layer_off = (size_t)layer * kv_layer_elems * sizeof(float);
-    const int n_show = std::min(4, HD);
-    f << "=== kv_spotcheck layer=" << layer << " pos=" << pos_lo << ".." << pos_hi << " head=0 show=" << n_show << " ===\n";
-    std::vector<float> buf((size_t)HD);
-    for (int pos = pos_lo; pos <= pos_hi; ++pos) {
-        for (int batch = 0; batch < CFG_BATCH; ++batch) {
-            const size_t off = layer_off + (size_t)pos * kv_pos_stride + (size_t)batch * kv_batch_stride;
-            ggml_backend_tensor_get(model.memory_k, buf.data(), off, (size_t)HD * sizeof(float));
-            f << "K pos=" << pos << " batch=" << batch << ":";
-            for (int j = 0; j < n_show; ++j) f << " " << buf[j];
-            f << "\n";
-            ggml_backend_tensor_get(model.memory_v, buf.data(), off, (size_t)HD * sizeof(float));
-            f << "V pos=" << pos << " batch=" << batch << ":";
-            for (int j = 0; j < n_show; ++j) f << " " << buf[j];
-            f << "\n";
-        }
-    }
-}
-static void dump_kv_batch_diff(const chatterbox_model & model, int layer, int pos, std::ofstream & f) {
-    const auto & hp = model.hparams;
-    const int HD = hp.n_embd / hp.n_head;
-    const size_t kv_pos_stride = (size_t)HD * sizeof(float);
-    const size_t kv_head_stride = (size_t)HD * hp.n_ctx * sizeof(float);
-    const size_t kv_batch_stride = (size_t)HD * hp.n_ctx * hp.n_head * sizeof(float);
-    const size_t kv_layer_elems = (size_t)HD * hp.n_ctx * hp.n_head * CFG_BATCH;
-    const size_t layer_off = (size_t)layer * kv_layer_elems * sizeof(float);
-    std::vector<float> a((size_t)HD), b((size_t)HD);
-    float max_k = 0, max_v = 0;
-    for (int head = 0; head < hp.n_head; ++head) {
-        const size_t off0 = layer_off + (size_t)pos * kv_pos_stride + (size_t)head * kv_head_stride;
-        const size_t off1 = off0 + kv_batch_stride;
-        ggml_backend_tensor_get(model.memory_k, a.data(), off0, (size_t)HD * sizeof(float));
-        ggml_backend_tensor_get(model.memory_k, b.data(), off1, (size_t)HD * sizeof(float));
-        for (int j = 0; j < HD; ++j) max_k = std::max(max_k, std::fabs(a[j] - b[j]));
-        ggml_backend_tensor_get(model.memory_v, a.data(), off0, (size_t)HD * sizeof(float));
-        ggml_backend_tensor_get(model.memory_v, b.data(), off1, (size_t)HD * sizeof(float));
-        for (int j = 0; j < HD; ++j) max_v = std::max(max_v, std::fabs(a[j] - b[j]));
-    }
-    f << "kv_batch_diff layer=" << layer << " pos=" << pos << " max_abs_K=" << max_k << " max_abs_V=" << max_v << "\n";
-}
-static void dump_named_spot(ggml_cgraph * gf, const char * name, int pos, int batch, int n_show, std::ofstream & f) {
-    ggml_tensor * t = ggml_graph_get_tensor(gf, name);
-    if (!t) throw std::runtime_error(std::string("dump missing ") + name);
-    const int n_embd = (int)t->ne[0];
-    n_show = std::min(n_show, n_embd);
-    std::vector<float> buf((size_t)n_show);
-    const size_t off = (size_t)batch * t->nb[2] + (size_t)pos * t->nb[1];
-    ggml_backend_tensor_get(t, buf.data(), off, (size_t)n_show * sizeof(float));
-    f << name << " pos=" << pos << " batch=" << batch << " ne=" << t->ne[0] << "," << t->ne[1] << "," << t->ne[2] << "," << t->ne[3] << ":";
-    for (int j = 0; j < n_show; ++j) f << " " << buf[j];
-    f << "\n";
-}
-void dump_last_cfg_meta(const std::string & dump_dir, const char * label, int gen_step) {
-    if (g_last_cond.empty() || g_last_uncond.empty()) return;
-    std::ofstream df(dump_dir + "/v3_t3_dump_cfg.txt", std::ios::app);
-    if (!df) throw std::runtime_error("cfg dump");
-    (void)gen_step;
-    dump_cfg_vectors_meta(g_last_cond, g_last_uncond, df, label, 1);
-}
 void eval_prompt(
     const chatterbox_model & model, ggml_gallocr_t allocr,
-    const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len,
-    const std::string & dump_dir) {
+    const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
     const int cond_len = 1 + model.hparams.perceiver_len + 1;
     prompt_len = cond_len + (int)text_tokens.size() + 2;
     if (prompt_len > model.hparams.n_ctx) throw std::runtime_error("T3 prompt exceeds context");
@@ -503,35 +370,11 @@ void eval_prompt(
         ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
     }
     if (ggml_backend_graph_compute(model.backend, gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("T3 prompt failed");
-    {
-        std::ofstream df(dump_dir + "/v3_t3_dump_cfg.txt", std::ios::trunc);
-        if (!df) throw std::runtime_error("cfg dump");
-        dump_cfg_logits_meta(ggml_graph_get_tensor(gf, "logits"), prompt_len, df, "prompt");
-        dump_logits_top10(ggml_graph_get_tensor(gf, "logits"), prompt_len, df, "prompt");
-        dump_named_spot(gf, "perceiver_out", 0, 0, 8, df);
-        dump_named_spot(gf, "t3_inp", 0, 0, 8, df);
-        dump_named_spot(gf, "t3_inp", 0, 1, 8, df);
-        const int text0 = 1 + model.hparams.perceiver_len + 1;
-        const int text1 = text0 + (int)text_tokens.size() - 1;
-        dump_named_spot(gf, "t3_inp", text0, 0, 8, df);
-        dump_named_spot(gf, "t3_inp", text0, 1, 8, df);
-        dump_named_spot(gf, "t3_inp", text1, 0, 8, df);
-        dump_named_spot(gf, "t3_inp", text1, 1, 8, df);
-        dump_named_spot(gf, "t3_inp", prompt_len - 1, 0, 8, df);
-        dump_named_spot(gf, "t3_inp", prompt_len - 1, 1, 8, df);
-        dump_kv_batch_diff(model, 0, 0, df);
-        dump_kv_batch_diff(model, 0, text0, df);
-        dump_kv_batch_diff(model, 0, text1, df);
-        dump_kv_batch_diff(model, 0, prompt_len - 2, df);
-        dump_kv_batch_diff(model, 0, prompt_len - 1, df);
-        dump_kv_spotcheck(model, 0, text0, text0, df);
-    }
     cfg_last_logits(ggml_graph_get_tensor(gf, "logits"), prompt_len, model.hparams.n_speech_vocab, logits_out);
 }
 void eval_step(
     const chatterbox_model & model, ggml_gallocr_t allocr,
-    int n_past, int32_t token, int speech_pos, std::vector<float> & logits_out,
-    const std::string & dump_dir, int gen_step) {
+    int n_past, int32_t token, int speech_pos, std::vector<float> & logits_out) {
     ggml_cgraph * gf = build_step_graph(model, n_past);
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
@@ -541,25 +384,7 @@ void eval_step(
     int32_t position = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), &position, 0, sizeof(position));
     if (ggml_backend_graph_compute(model.backend, gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("T3 step failed");
-    ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
-    if (!dump_dir.empty()) {
-        const bool dump_cfg = cfg_dump_step(gen_step);
-        const bool dump_kv = (gen_step == 2);
-        if (dump_cfg || dump_kv || gen_step == 0) {
-            std::ofstream df(dump_dir + "/v3_t3_dump_cfg.txt", std::ios::app);
-            if (!df) throw std::runtime_error("cfg dump");
-            if (dump_cfg) {
-                char label[64];
-                std::snprintf(label, sizeof(label), "gen_step=%d n_past=%d", gen_step, n_past);
-                dump_cfg_logits_meta(logits, 1, df, label);
-            }
-            if (gen_step == 0)
-                dump_logits_top10(logits, 1, df, "gen_step0");
-            if (dump_kv)
-                dump_kv_spotcheck(model, 0, 55, 58, df);
-        }
-    }
-    cfg_last_logits(logits, 1, model.hparams.n_speech_vocab, logits_out);
+    cfg_last_logits(ggml_graph_get_tensor(gf, "logits"), 1, model.hparams.n_speech_vocab, logits_out);
 }
 int32_t sample_next_token_ex(
     const std::vector<float> & logits,
