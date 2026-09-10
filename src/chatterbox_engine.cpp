@@ -76,14 +76,6 @@ void ledger_append(const std::string& dir, const char* name, const std::string& 
     if (!out) throw std::runtime_error(std::string("cannot append ledger ") + name);
     out << line << '\n';
 }
-void ledger_bin_append(const std::string& dir, const char* name, const std::vector<int32_t>& tokens) {
-    if (dir.empty()) return;
-    std::ofstream out(std::filesystem::path(dir) / name, std::ios::binary | std::ios::app);
-    if (!out) throw std::runtime_error(std::string("cannot append ledger ") + name);
-    const std::uint32_t n = (std::uint32_t)tokens.size();
-    out.write(reinterpret_cast<const char*>(&n), sizeof(n));
-    if (n) out.write(reinterpret_cast<const char*>(tokens.data()), n * sizeof(int32_t));
-}
 }
 struct Engine::Impl {
     EngineOptions opts;
@@ -102,7 +94,6 @@ struct Engine::Impl {
     std::string piece_text, piece_stop;
     std::vector<int32_t> piece_text_tokens, piece_speech;
     int piece_t3_ms = 0, piece_s3_ms = 0;
-    std::uint32_t speech_bin_offset = 0;
     static std::string json_i32(const std::vector<int32_t>& v) {
         std::string s = "[";
         for (size_t i = 0; i < v.size(); ++i) {
@@ -111,55 +102,12 @@ struct Engine::Impl {
         }
         return s + "]";
     }
-    static std::string json_f(float value) {
-        if (!std::isfinite(value)) return "null";
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%.6g", value);
-        return buf;
-    }
-    bool should_log_steps() const { return !opts.audit_dir.empty() || opts.forensics; }
-    std::string forensic_head() const {
-        const auto ctx = tts_get_context();
-        return std::string("\"run_id\":\"") + json_escape(tts_run_identity()) + "\""
-            + ",\"response\":" + std::to_string(ctx.response)
-            + ",\"piece\":" + std::to_string(ctx.piece);
-    }
-    void emit_forensic(const std::string& event, const std::string& body, const char* ledger = nullptr) {
-        if (!should_log_steps()) return;
-        const std::string json = std::string("{\"event\":\"") + event + "\"," + forensic_head() + body + "}";
-        tts_jsonl(json);
-        if (ledger && !opts.audit_dir.empty()) ledger_append(opts.audit_dir, ledger, json);
-    }
     void emit_t3_text_tokens(const std::vector<int32_t>& ids) {
-        emit_forensic("t3.text_tokens", ",\"ids\":" + json_i32(ids));
-    }
-    void emit_t3_step(int step, int32_t chosen, const t3_sample_decision& decision, int n_past, int speech_pos,
-                      int text_cursor = -1) {
-        std::string body = ",\"step\":" + std::to_string(step)
-            + ",\"chosen\":" + std::to_string(chosen)
-            + ",\"candidates\":" + std::to_string(decision.candidates)
-            + ",\"top5\":[";
-        for (int i = 0; i < 5; ++i) {
-            if (i) body += ',';
-            body += "{\"id\":" + std::to_string(decision.top5_ids[i])
-                + ",\"lp\":" + json_f(decision.top5_logprobs[i]) + "}";
-        }
-        body += "],\"repeat_last4\":[";
-        for (int i = 0; i < 4; ++i) {
-            if (i) body += ',';
-            body += std::to_string(decision.repeat_last4[i]);
-        }
-        body += "],\"n_past\":" + std::to_string(n_past)
-            + ",\"speech_pos\":" + std::to_string(speech_pos);
-        if (text_cursor >= 0) body += ",\"text_cursor\":" + std::to_string(text_cursor);
-        emit_forensic("t3.step", body, "04-t3-step.jsonl");
-    }
-    void emit_t3_repeat_abort(int step, int32_t token, int count) {
-        emit_forensic("t3.repeat_abort",
-            ",\"step\":" + std::to_string(step)
-            + ",\"consecutive_id\":" + std::to_string(token)
-            + ",\"count\":" + std::to_string(count),
-            "04-t3-step.jsonl");
+        if (opts.audit_dir.empty()) return;
+        const auto ctx = tts_get_context();
+        tts_jsonl(std::string("{\"event\":\"t3.text_tokens\",\"run_id\":\"") + json_escape(tts_run_identity()) +
+            "\",\"response\":" + std::to_string(ctx.response) + ",\"piece\":" + std::to_string(ctx.piece) +
+            ",\"ids\":" + json_i32(ids) + "}");
     }
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void reset_acoustics() { acoustic = {}; speech_history.clear(); }
@@ -180,13 +128,6 @@ struct Engine::Impl {
             << ",\"temperature\":" << opts.temperature
             << ",\"top_k\":" << opts.top_k
             << ",\"top_p\":" << opts.top_p
-            << ",\"audit_tensors\":" << (opts.audit_tensors ? "true" : "false")
-            << ",\"forensics\":" << (opts.forensics ? "true" : "false")
-            << ",\"text_aligned_decode\":" << (opts.text_aligned_decode ? "true" : "false")
-            << ",\"ledgers\":{"
-            << "\"speech_ids\":\"04-speech-ids.jsonl\""
-            << ",\"t3_step\":\"04-t3-step.jsonl\""
-            << "}"
             << "}\n";
     }
     void init() {
@@ -305,20 +246,17 @@ struct Engine::Impl {
         int n_past = 0, speech_pos = 1;
         int32_t token = 0, pending_mtl = -1;
         bool repeat_stopped = false;
-        t3_text_align_state align{};
-        const bool text_aligned = opts.text_aligned_decode
-            && model.hparams.variant == CHBX_VARIANT_TURBO;
-        if (text_aligned) t3_text_align_layout(align, model.hparams.cond_prompt_len, (int)text_tokens.size());
-        const t3_text_align_state * align_ptr = text_aligned ? &align : nullptr;
         std::vector<int32_t> out, tokens;
         out.reserve((size_t)opts.n_predict + 1);
         tokens.reserve((size_t)opts.n_predict);
+        const int32_t stop = model.hparams.stop_speech_token;
         auto hold_eos = [&](std::vector<float> & logits) {
-            t3_mask_stop(logits, model.hparams.stop_speech_token,
-                t3_should_hold_eos(align_ptr, (int)text_tokens.size(), (int)out.size()));
+            if ((int)out.size() < (int)text_tokens.size() * 4
+                && stop >= 0 && stop < (int)logits.size())
+                logits[(size_t)stop] = -INFINITY;
         };
         auto publish = [&](int32_t value) {
-            if (value < 0 || value >= model.hparams.start_speech_token || value == model.hparams.stop_speech_token) return;
+            if (value < 0 || value >= model.hparams.start_speech_token || value == stop) return;
 #ifdef TTS_CPP_MTL
             if (model.hparams.variant == CHBX_VARIANT_MTL) {
                 if (pending_mtl >= 0) tokens.push_back(pending_mtl);
@@ -334,57 +272,44 @@ struct Engine::Impl {
             std::vector<float> logits_c, logits_u;
             if (!eval_prompt_mtl(model, allocr, n_threads, text_tokens, opts.exaggeration, logits_c, logits_u, n_past))
                 throw std::runtime_error("MTL prompt failed");
-            token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
+            token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, stop);
         } else
 #endif
         {
             std::vector<float> logits;
-            if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past, align_ptr))
+            if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past))
                 throw std::runtime_error("Turbo prompt failed");
             hold_eos(logits);
-            t3_sample_decision decision{};
-            token = sample_next_token_ex(logits, out, sp, rng, should_log_steps() ? &decision : nullptr);
-            if (should_log_steps()) emit_t3_step(0, token, decision, n_past, speech_pos, text_aligned ? align.text_cursor : -1);
+            token = sample_next_token_ex(logits, out, sp, rng);
         }
         out.push_back(token);
         publish(token);
-        if (text_aligned) t3_text_align_advance(align, token);
 
-        for (int step = 1; step < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++step) {
+        for (int step = 1; step < opts.n_predict && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
 #ifdef TTS_CPP_MTL
             if (model.hparams.variant == CHBX_VARIANT_MTL) {
                 std::vector<float> logits_c, logits_u;
                 if (!eval_step_mtl(model, allocr, n_threads, n_past++, speech_pos++, token, logits_c, logits_u))
                     throw std::runtime_error("MTL step failed");
-                token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, model.hparams.stop_speech_token);
+                token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, stop);
             } else
 #endif
             {
-                if (text_aligned && align.text_cursor < align.n_text - 1
-                    && step + (align.n_text - align.text_cursor - 1) * T3_ALIGN_MIN_SPEECH > opts.n_predict - 16)
-                    align.text_cursor++;
                 std::vector<float> logits;
-                if (!eval_step(model, allocr, n_threads, n_past++, token, logits, align_ptr))
+                if (!eval_step(model, allocr, n_threads, n_past++, token, logits))
                     throw std::runtime_error("Turbo step failed");
                 hold_eos(logits);
-                t3_sample_decision decision{};
-                token = sample_next_token_ex(logits, out, sp, rng, should_log_steps() ? &decision : nullptr);
-                if (should_log_steps()) emit_t3_step(step, token, decision, n_past, speech_pos,
-                    text_aligned ? align.text_cursor : -1);
+                token = sample_next_token_ex(logits, out, sp, rng);
             }
-            if (opts.repeat_stop_consecutive >= 2
-                && consecutive_repeat(out, token, opts.repeat_stop_consecutive)
-                && !t3_should_hold_eos(align_ptr, (int)text_tokens.size(), (int)out.size())) {
-                if (should_log_steps()) emit_t3_repeat_abort(step, token, opts.repeat_stop_consecutive);
+            if (opts.repeat_stop_consecutive >= 2 && consecutive_repeat(out, token, opts.repeat_stop_consecutive)) {
                 repeat_stopped = true;
-                token = model.hparams.stop_speech_token;
+                token = stop;
             }
             out.push_back(token);
             publish(token);
-            if (text_aligned) t3_text_align_advance(align, token);
         }
 
-        if (token != model.hparams.stop_speech_token) throw std::runtime_error("T3 stopped without EOS");
+        if (token != stop) throw std::runtime_error("T3 stopped without EOS");
 #ifdef TTS_CPP_MTL
         if (tokens.empty() && pending_mtl >= 0) tokens.push_back(pending_mtl);
 #endif
@@ -397,10 +322,9 @@ struct Engine::Impl {
         (void)external_piece;
         return tokens;
     }
-    void emit_piece_ledger(std::uint32_t response, std::uint32_t piece, const std::vector<int32_t>& window, const std::vector<int32_t>& neu) {
+    void emit_piece_ledger(std::uint32_t response, std::uint32_t piece, const std::vector<int32_t>& neu) {
         const auto ctx = tts_get_context();
-        const std::string line =
-            std::string("{\"response\":") + std::to_string(ctx.valid ? ctx.response : response) +
+        tts_jsonl(std::string("{\"response\":") + std::to_string(ctx.valid ? ctx.response : response) +
             ",\"piece\":" + std::to_string(piece) +
             ",\"text\":\"" + json_escape(piece_text) + "\"" +
             ",\"text_sha\":\"" + hash_hex(hash_bytes(piece_text.data(), piece_text.size())) + "\"" +
@@ -413,42 +337,15 @@ struct Engine::Impl {
             ",\"ms\":" + std::to_string(piece_t3_ms + piece_s3_ms) +
             ",\"s3_history\":" + std::to_string(acoustic.history_tokens) +
             ",\"s3_new\":" + std::to_string(neu.size()) +
-            ",\"emitted_samples\":" + std::to_string(acoustic.emitted) + "}";
-        tts_jsonl(line);
+            ",\"emitted_samples\":" + std::to_string(acoustic.emitted) + "}");
         if (opts.audit_dir.empty()) return;
         ledger_append(opts.audit_dir, "01-pieces.jsonl",
             "{\"piece\":" + std::to_string(piece) + ",\"response\":" + std::to_string(response) +
             ",\"text\":\"" + json_escape(piece_text) + "\",\"chars\":" + std::to_string(piece_text.size()) + "}");
         ledger_append(opts.audit_dir, "02-text-tokens.jsonl",
             "{\"piece\":" + std::to_string(piece) + ",\"ids\":" + json_i32(piece_text_tokens) + "}");
-        const std::uint32_t before = speech_bin_offset;
-        ledger_bin_append(opts.audit_dir, "03-speech-tokens.bin", piece_speech);
-        speech_bin_offset += 1 + (std::uint32_t)piece_speech.size();
-        ledger_append(opts.audit_dir, "03-index.jsonl",
-            "{\"piece\":" + std::to_string(piece) + ",\"n\":" + std::to_string(piece_speech.size()) +
-            ",\"u32_offset\":" + std::to_string(before) + "}");
         ledger_append(opts.audit_dir, "04-speech-ids.jsonl",
             "{\"piece\":" + std::to_string(piece) + ",\"ids\":" + json_i32(piece_speech) + "}");
-        ledger_append(opts.audit_dir, "05-s3-window.jsonl",
-            "{\"piece\":" + std::to_string(piece) +
-            ",\"history_tokens\":" + std::to_string(acoustic.history_tokens) +
-            ",\"history_hash\":\"" + token_hash(std::vector<int32_t>(window.begin(), window.begin() + acoustic.history_tokens)) + "\"" +
-            ",\"new_tokens\":" + std::to_string(neu.size()) +
-            ",\"new_hash\":\"" + token_hash(neu) + "\"" +
-            ",\"emit_begin\":" + std::to_string(acoustic.emit_begin) +
-            ",\"emit_end\":" + std::to_string(acoustic.emit_end) +
-            ",\"pending_in\":" + std::to_string(acoustic.pending_in) +
-            ",\"emitted\":" + std::to_string(acoustic.emitted) + "}");
-        std::string pcm = "{\"piece\":" + std::to_string(piece) + ",\"map\":[";
-        for (size_t i = 0; i < neu.size(); ++i) {
-            const int window_i = acoustic.history_tokens + (int)i;
-            const int local0 = window_i * kSamplesPerToken - (int)acoustic.emit_begin;
-            if (i) pcm += ',';
-            pcm += "{\"token_i\":" + std::to_string(i) + ",\"window_i\":" + std::to_string(window_i) +
-                   ",\"sample_start\":" + std::to_string(local0) +
-                   ",\"sample_end\":" + std::to_string(local0 + kSamplesPerToken) + "}";
-        }
-        ledger_append(opts.audit_dir, "06-pcm-map.jsonl", pcm + "]}");
     }
     void run_s3(const std::vector<int32_t>& tokens, int session_index, std::uint32_t external_piece, bool last_piece, const PieceCallback& cb) {
         auto synthesis_context = tts_get_context();
@@ -480,12 +377,6 @@ struct Engine::Impl {
         s.last_piece = last_piece;
         s.first_piece = (session_index <= 0);
         s.chunk_id = 0;
-        s.audit_tensors = opts.audit_tensors;
-        if (opts.audit_tensors && !opts.audit_dir.empty()) {
-            const auto ctx = tts_get_context();
-            s.audit_prefix = opts.audit_dir + "/r" + std::to_string(ctx.response) +
-                "_p" + std::to_string(external_piece);
-        }
         std::vector<float> pcm;
         s.pcm_out = &pcm;
         const auto s3_started = std::chrono::steady_clock::now();
@@ -495,20 +386,13 @@ struct Engine::Impl {
         if (cb) cb(session_index, pcm.data(), pcm.size(), 0, true);
         if (session_index >= 0) {
             const auto ctx = tts_get_context();
-            emit_piece_ledger(ctx.response, external_piece, window, tokens);
+            emit_piece_ledger(ctx.response, external_piece, tokens);
         }
         if ((int)window.size() > kSpeechHistoryTokens) {
             speech_history.assign(window.end() - kSpeechHistoryTokens, window.end());
         } else {
             speech_history = window;
         }
-    }
-    void piece_streaming(const std::string& text, int index, const PieceCallback& cb) {
-        if (text.empty()) return;
-        auto tokens = generate_t3(text, index, 0);
-        run_s3(tokens, index, 0, true, [&](int, const float* pcm, std::size_t n, int chunk, bool final) {
-            if (cb) cb(0, pcm, n, chunk, final);
-        });
     }
 };
 Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(); }
@@ -517,7 +401,6 @@ Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 void Engine::synthesize_pieces_streaming(const std::vector<SynthesisPiece>& pieces, const PieceCallback& cb) {
     pimpl_->reset_acoustics();
-    pimpl_->speech_bin_offset = 0;
     for (std::size_t index = 0; index < pieces.size(); ++index) {
         const auto& piece = pieces[index];
         if (piece.text.empty()) throw std::runtime_error("empty synthesis piece");
@@ -531,7 +414,8 @@ void Engine::synthesize_pieces_streaming(const std::vector<SynthesisPiece>& piec
 void Engine::warm_up() {
     pimpl_->reset_acoustics();
     std::size_t samples = 0;
-    pimpl_->piece_streaming("Warm up.", -1, [&](int, const float*, std::size_t n, int, bool) { samples += n; });
+    auto tokens = pimpl_->generate_t3("Warm up.", -1, 0);
+    pimpl_->run_s3(tokens, -1, 0, true, [&](int, const float*, std::size_t n, int, bool) { samples += n; });
     if (!samples) throw std::runtime_error("warm-up produced no PCM");
     if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
     pimpl_->reset_acoustics();

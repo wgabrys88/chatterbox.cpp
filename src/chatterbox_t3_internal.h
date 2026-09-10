@@ -11,53 +11,8 @@
 #include "ggml.h"
 namespace tts_cpp::chatterbox::detail {
 constexpr int CHBX_MAX_NODES = 8192;
-// Speech tokens are a small reused codebook. A word is typically 10-25
-// tokens. Penalizing unique IDs over a whole word (or the full history)
-// makes the next similar word come out as a different encoding of the same
-// word, or collapses generation onto a pause loop. Keep the penalty to local
-// stutter only; consecutive identical tokens still abort after ~640 ms.
 constexpr int REPEAT_PENALTY_LAST_N = 4;
 constexpr int REPEAT_STOP_CONSECUTIVE = 16;
-constexpr int T3_SILENCE_TOKEN = 4299;
-constexpr int T3_ALIGN_MIN_SPEECH = 8;
-constexpr int T3_ALIGN_MAX_SPEECH = 48;
-
-struct t3_text_align_state {
-    int text_start = 0;
-    int n_text = 0;
-    int bos_pos = 0;
-    int text_cursor = 0;
-    int speech_since = 0;
-};
-
-inline void t3_text_align_layout(t3_text_align_state & st, int cond_prompt_len, int n_text) {
-    st.text_start = 1 + cond_prompt_len;
-    st.n_text = n_text;
-    st.bos_pos = st.text_start + n_text;
-    st.text_cursor = 0;
-    st.speech_since = 0;
-}
-
-inline void t3_text_align_advance(t3_text_align_state & st, int32_t token) {
-    st.speech_since++;
-    if (st.text_cursor >= st.n_text - 1) return;
-    const bool force = st.speech_since >= T3_ALIGN_MAX_SPEECH;
-    const bool on_pause = token == T3_SILENCE_TOKEN && st.speech_since >= 4;
-    const bool min_met = st.speech_since >= T3_ALIGN_MIN_SPEECH;
-    if (force || min_met || on_pause) {
-        st.text_cursor++;
-        st.speech_since = 0;
-    }
-}
-
-inline bool t3_should_hold_eos(const t3_text_align_state * align, int n_text, int n_gen) {
-    if (align) return align->text_cursor < align->n_text - 1;
-    return n_text > 5 && n_gen < n_text * 4;
-}
-
-inline void t3_mask_stop(std::vector<float> & logits, int32_t stop, bool hold) {
-    if (hold && stop >= 0 && stop < (int)logits.size()) logits[(size_t)stop] = -INFINITY;
-}
 
 inline void apply_min_p(float * scores, int vocab, float min_p) {
     if (min_p <= 0.0f || vocab <= 0) return;
@@ -248,30 +203,19 @@ bool eval_prompt(
     int                          n_threads,
     const std::vector<int32_t> & text_tokens,
     std::vector<float> &         logits_out,
-    int &                        prompt_len,
-    const t3_text_align_state *  align = nullptr);
+    int &                        prompt_len);
 bool eval_step(
     const chatterbox_model & model,
     ggml_gallocr_t           allocr,
     int                      n_threads,
     int                      n_past,
     int32_t                  token,
-    std::vector<float> &     logits_out,
-    const t3_text_align_state * align = nullptr);
-struct t3_sample_decision {
-    int32_t chosen_id = 0;
-    int candidates = 0;
-    int32_t top5_ids[5] = {};
-    float top5_logprobs[5] = {};
-    int32_t repeat_last4[4] = {};
-};
-
+    std::vector<float> &     logits_out);
 int32_t sample_next_token_ex(
     const std::vector<float> &          logits,
     const std::vector<int32_t> &        generated,
     const chatterbox_sampling_params &  params,
-    std::mt19937 &                      rng,
-    t3_sample_decision *                decision = nullptr);
+    std::mt19937 &                      rng);
 void chatterbox_log_cb(ggml_log_level level, const char * text, void * ud);
 extern int g_log_verbose;
 bool compute_prompt_feat_native(

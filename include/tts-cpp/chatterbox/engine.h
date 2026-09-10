@@ -27,9 +27,6 @@ struct EngineOptions {
     int cfm_steps = 0;
     bool fastconv = false;
     std::string audit_dir;
-    bool audit_tensors = false;
-    bool forensics = false;
-    bool text_aligned_decode = true;
 };
 struct SynthesisPiece {
     std::uint32_t id = 0;

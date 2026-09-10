@@ -15,7 +15,6 @@ struct s3gen_piece_state {
     int samples = 0, prompt_tokens = 0, speech_tokens = 0;
     int history_tokens = 0, window_tokens = 0, cfm_steps_used = 0;
     std::size_t pending_in = 0, emit_begin = 0, emit_end = 0, hold = 0, emitted = 0;
-    std::string audit_summary, audit_local;
 };
 struct s3gen_synthesize_opts {
     std::string s3gen_gguf_path;
@@ -35,12 +34,8 @@ struct s3gen_synthesize_opts {
     int chunk_id = 0;
     int token_start = 0;
     int token_end = 0;
-    std::string audit_prefix;
-    bool audit_tensors = false;
     s3gen_piece_state* state = nullptr;
 };
 void s3gen_synthesize(const std::vector<int32_t>&, const s3gen_synthesize_opts&);
 void s3gen_preload(const std::string&, int, bool);
 void s3gen_unload();
-void s3gen_vk_overlap_counters(unsigned long long * wait_us, unsigned long long * submit_n,
-                               unsigned long long * barrier_n, int reset);

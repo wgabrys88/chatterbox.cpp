@@ -179,26 +179,6 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
     ggml_free(tmp_ctx);
     return true;
 }
-static void fill_text_align_mask(std::vector<ggml_fp16_t> & mask, int L, int N, int n_past,
-                                 const t3_text_align_state * align) {
-    const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
-    const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
-    mask.assign((size_t) L * N, zero_h);
-    const int text_end = align->text_start + align->n_text - 1;
-    const int visible_end = align->text_start + align->text_cursor;
-    for (int q = 0; q < N; ++q) {
-        const int abs_q = n_past + q;
-        for (int k = 0; k < L; ++k) {
-            if (k > abs_q) {
-                mask[(size_t) q * L + k] = ninf_h;
-                continue;
-            }
-            if (abs_q >= align->bos_pos && k > visible_end && k <= text_end)
-                mask[(size_t) q * L + k] = ninf_h;
-        }
-    }
-}
-
 static ggml_tensor * build_transformer_core(
     ggml_context * ctx, ggml_cgraph * gf,
     const chatterbox_model & model,
@@ -323,8 +303,8 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
 }
 bool eval_prompt(
     const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
-    const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len,
-    const t3_text_align_state * align) {
+    const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
+    (void)n_threads;
     prompt_len = 1 + model.hparams.cond_prompt_len + (int)text_tokens.size() + 1;
     if (prompt_len > model.hparams.n_ctx) {
         fprintf(stderr, "%s: prompt %d exceeds context %d\n", __func__, prompt_len, model.hparams.n_ctx);
@@ -343,21 +323,13 @@ bool eval_prompt(
         const int N = prompt_len;
         ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "kq_mask");
         if (kq_mask) {
-            if (align) {
-                std::vector<ggml_fp16_t> mask;
-                fill_text_align_mask(mask, N, N, 0, align);
-                ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
-            } else {
-                const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
-                const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
-                std::vector<ggml_fp16_t> mask((size_t)N * N, zero_h);
-                for (int q = 0; q < N; ++q) {
-                    for (int k = 0; k < N; ++k) {
-                        if (k > q) mask[(size_t)q * N + k] = ninf_h;
-                    }
-                }
-                ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
-            }
+            const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
+            std::vector<ggml_fp16_t> mask((size_t)N * N, zero_h);
+            for (int q = 0; q < N; ++q)
+                for (int k = 0; k < N; ++k)
+                    if (k > q) mask[(size_t)q * N + k] = ninf_h;
+            ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
         }
     }
     const auto status = ggml_backend_graph_compute(model.backend, gf);
@@ -371,23 +343,14 @@ bool eval_prompt(
 }
 bool eval_step(
     const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
-    int n_past, int32_t token, std::vector<float> & logits_out,
-    const t3_text_align_state * align) {
-    const bool masked = align != nullptr;
-    ggml_cgraph * gf = build_step_graph(model, n_past, masked);
+    int n_past, int32_t token, std::vector<float> & logits_out) {
+    (void)n_threads;
+    ggml_cgraph * gf = build_step_graph(model, n_past, false);
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
     int32_t position = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), &position, 0, sizeof(position));
-    if (masked) {
-        ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "kq_mask");
-        if (kq_mask) {
-            std::vector<ggml_fp16_t> mask;
-            fill_text_align_mask(mask, n_past + 1, 1, n_past, align);
-            ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
-        }
-    }
     const auto status = ggml_backend_graph_compute(model.backend, gf);
     if (status != GGML_STATUS_SUCCESS) return false;
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
@@ -395,47 +358,11 @@ bool eval_step(
     ggml_backend_tensor_get(logits, logits_out.data(), 0, (size_t)model.hparams.n_speech_vocab*sizeof(float));
     return true;
 }
-static void fill_sample_decision(t3_sample_decision * decision,
-                                 const std::vector<float> & scores,
-                                 const std::vector<int32_t> & generated) {
-    if (!decision) return;
-    const int n = (int)scores.size();
-    decision->candidates = 0;
-    struct IS { int idx; float s; };
-    std::vector<IS> ranked;
-    ranked.reserve(n);
-    for (int i = 0; i < n; ++i) {
-        if (scores[i] != -INFINITY) {
-            decision->candidates++;
-            ranked.push_back({i, scores[i]});
-        }
-    }
-    const int top_n = std::min(5, (int)ranked.size());
-    if (top_n > 0) {
-        std::partial_sort(ranked.begin(), ranked.begin() + top_n, ranked.end(),
-            [](const IS& a, const IS& b) { return a.s > b.s; });
-    }
-    for (int i = 0; i < 5; ++i) {
-        if (i < top_n) {
-            decision->top5_ids[i] = ranked[i].idx;
-            decision->top5_logprobs[i] = ranked[i].s;
-        } else {
-            decision->top5_ids[i] = 0;
-            decision->top5_logprobs[i] = -INFINITY;
-        }
-    }
-    const int m = std::min(4, (int)generated.size());
-    for (int i = 0; i < 4; ++i) {
-        decision->repeat_last4[i] = i < m ? generated[generated.size() - (size_t)m + i] : 0;
-    }
-}
-
 int32_t sample_next_token_ex(
     const std::vector<float> & logits,
     const std::vector<int32_t> & generated,
     const chatterbox_sampling_params & params,
-    std::mt19937 & rng,
-    t3_sample_decision * decision) {
+    std::mt19937 & rng) {
     const int n = (int)logits.size();
     
     std::vector<float> scores(logits.begin(), logits.end());
@@ -475,7 +402,6 @@ int32_t sample_next_token_ex(
         for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
     apply_speech_repeat_penalty(scores.data(), n, generated, params.repeat_penalty);
-    fill_sample_decision(decision, scores, generated);
     float mx = -INFINITY;
     for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
     std::vector<float> probs(n);
@@ -484,20 +410,12 @@ int32_t sample_next_token_ex(
         probs[i] = (scores[i] == -INFINITY) ? 0.0f : std::exp(scores[i] - mx);
         psum += probs[i];
     }
-    if (psum == 0.0f) {
-        if (decision) decision->chosen_id = 0;
-        return 0;
-    }
+    if (psum == 0.0f) return 0;
     for (float & p : probs) p /= psum;
-    int32_t chosen = 0;
-    if (params.temp <= 0.0f) {
-        chosen = (int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end()));
-    } else {
-        std::discrete_distribution<int> dist(probs.begin(), probs.end());
-        chosen = (int32_t)dist(rng);
-    }
-    if (decision) decision->chosen_id = chosen;
-    return chosen;
+    if (params.temp <= 0.0f)
+        return (int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end()));
+    std::discrete_distribution<int> dist(probs.begin(), probs.end());
+    return (int32_t)dist(rng);
 }
 
 }

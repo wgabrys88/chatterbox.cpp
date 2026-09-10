@@ -1,9 +1,6 @@
 #include <algorithm>
-#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
-#include <filesystem>
-#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -45,18 +42,9 @@ void send_all(SOCKET socket, const void* src, std::size_t size) {
     if (!io_all(socket, const_cast<char*>(static_cast<const char*>(src)), size, true))
         throw std::runtime_error("TTS send failed");
 }
-void audit_write(const std::string& dir, const std::string& name, const void* data, std::size_t size) {
-    if (dir.empty()) return;
-    std::filesystem::create_directories(dir);
-    std::ofstream out(std::filesystem::path(dir) / name, std::ios::binary | std::ios::trunc);
-    if (!out) throw std::runtime_error("cannot create wire audit artifact");
-    if (size) out.write(static_cast<const char*>(data), (std::streamsize)size);
-    if (!out) throw std::runtime_error("cannot write wire audit artifact");
-}
 
 struct wire_writer {
     SOCKET socket;
-    std::string audit_dir;
     std::vector<std::int16_t> pcm_buffer;
 
     void frame(response_kind kind, const request_t& request, std::uint32_t chunk,
@@ -73,14 +61,7 @@ struct wire_writer {
         pcm_buffer.resize(count);
         for (std::size_t i = 0; i < count; ++i)
             pcm_buffer[i] = static_cast<std::int16_t>(std::clamp(samples[i], -1.0f, 1.0f) * 32767.0f);
-        const auto bytes = pcm_buffer.size() * sizeof(std::int16_t);
-        const char* tensors = std::getenv("TTS_AUDIT_TENSORS");
-        if (tensors && tensors[0] == '1' && tensors[1] == 0) {
-            const std::string name = "native-r" + std::to_string(request.response) + "_p" +
-                std::to_string(request.piece) + "_c" + std::to_string(chunk) + ".pcm16";
-            audit_write(audit_dir, name, pcm_buffer.data(), bytes);
-        }
-        frame(response_kind::pcm, request, chunk, pcm_buffer.data(), bytes);
+        frame(response_kind::pcm, request, chunk, pcm_buffer.data(), pcm_buffer.size() * sizeof(std::int16_t));
     }
     void terminal(response_kind kind, const request_t& request, const std::string& message = {}) {
         frame(kind, request, 0, message.data(), message.size());
@@ -102,10 +83,6 @@ tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
     o.cfg_weight = f("--cfg-weight");
     o.exaggeration = f("--exaggeration"); o.cfm_steps = i("--cfm-steps");
     o.fastconv = i("--fastconv") != 0; o.audit_dir = s("--audit-dir");
-    if (args.count("--forensics")) o.forensics = i("--forensics") != 0;
-    if (args.count("--text-aligned")) o.text_aligned_decode = i("--text-aligned") != 0;
-    if (const char* tensors = std::getenv("TTS_AUDIT_TENSORS"))
-        o.audit_tensors = tensors[0] == '1' && tensors[1] == 0;
     return tts_cpp::chatterbox::Engine(o);
 }
 
@@ -145,7 +122,6 @@ void emit_server_config(const args_t& args) {
         + ",\"cfm_steps\":" + s("--cfm-steps")
         + ",\"cfg_weight\":" + s("--cfg-weight")
         + ",\"exaggeration\":" + s("--exaggeration")
-        + ",\"text_aligned_decode\":" + (args.count("--text-aligned") ? s("--text-aligned") : "1")
         + "}";
     tts_jsonl(json);
 }
@@ -190,8 +166,8 @@ bool receive(SOCKET socket, request_t& request) {
     return true;
 }
 
-void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts, const std::string& audit_dir) {
-    wire_writer writer{client, audit_dir};
+void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
+    wire_writer writer{client};
     request_t first;
     if (!receive(client, first)) return;
     if (first.kind == request_kind::close) {
@@ -290,7 +266,7 @@ int main(int argc, char** argv) {
             client = accept(listener, nullptr, nullptr);
             if (client == INVALID_SOCKET) break;
             tts_set_connection(++connection);
-            try { serve(client, tts, args.at("--audit-dir")); }
+            try { serve(client, tts); }
             catch (const std::exception& error) { tts_emit("serve.failed", "error=" + std::string(error.what())); }
             closesocket(client); client = INVALID_SOCKET;
         }
