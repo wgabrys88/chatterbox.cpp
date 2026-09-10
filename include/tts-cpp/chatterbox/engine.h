@@ -4,7 +4,7 @@
 #include <vector>
 namespace tts_cpp::chatterbox {
 struct EngineOptions {
-    std::string t3_gguf_path, s3gen_gguf_path, reference_audio;
+    std::string t3_gguf_path, s3gen_gguf_path;
 };
 class Engine {
 public:

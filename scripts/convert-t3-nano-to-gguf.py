@@ -97,6 +97,7 @@ def main():
         gguf_name, dtype, transpose = mapped
         add(writer, gguf_name, as_numpy(tensor, dtype=dtype, transpose=transpose))
     builtin_tokens = conds["t3"]["cond_prompt_speech_tokens"].reshape(-1).to(torch.int32)
+    writer.add_uint32("chatterbox.cond_prompt_max", int(builtin_tokens.numel()))
     writer.add_uint32("chatterbox.cond_prompt_length", int(builtin_tokens.numel()))
     writer.add_tensor("chatterbox/builtin/speaker_emb", as_numpy(conds["t3"]["speaker_emb"].reshape(1, SPEAKER_EMBED_SIZE), dtype=torch.float32))
     writer.add_tensor("chatterbox/builtin/cond_prompt_speech_tokens", as_numpy(builtin_tokens))

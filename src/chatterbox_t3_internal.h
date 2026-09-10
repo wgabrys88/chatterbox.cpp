@@ -56,9 +56,9 @@ struct chatterbox_model {
     ggml_tensor * builtin_speaker_emb = nullptr, * builtin_cond_prompt_tokens = nullptr;
     std::vector<gpt2_layer> layers;
     ggml_tensor * memory_k = nullptr, * memory_v = nullptr;
-    ggml_context * ctx_w = nullptr, * ctx_kv = nullptr, * ctx_override = nullptr;
+    ggml_context * ctx_w = nullptr, * ctx_kv = nullptr;
     ggml_backend_t backend = nullptr;
-    ggml_backend_buffer_t buffer_w = nullptr, buffer_kv = nullptr, buffer_override = nullptr;
+    ggml_backend_buffer_t buffer_w = nullptr, buffer_kv = nullptr;
     std::map<std::string, ggml_tensor *> tensors;
     std::vector<std::string> tok_tokens, tok_merges;
 };
@@ -67,7 +67,4 @@ void load_model_gguf(const std::string & path, chatterbox_model & model);
 void eval_prompt(const chatterbox_model &, ggml_gallocr_t, const std::vector<int32_t> &, std::vector<float> &, int &);
 void eval_step(const chatterbox_model &, ggml_gallocr_t, int, int32_t, std::vector<float> &);
 int32_t sample_next_token_ex(const std::vector<float> &, const std::vector<int32_t> &, std::mt19937 &);
-void compute_prompt_feat_native(const std::string &, const std::string &, std::vector<float> &, int &, ggml_backend_t);
-void compute_embedding_native(const std::string &, const std::string &, std::vector<float> &, ggml_backend_t);
-void compute_speech_tokens_native(const std::string &, const std::string &, int, std::vector<int32_t> &, std::vector<int32_t> &, ggml_backend_t);
 }

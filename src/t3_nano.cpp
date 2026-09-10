@@ -81,6 +81,7 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
         model.cond_spkr_b      = require_tensor(model, "chatterbox/cond_spkr/b");
         model.builtin_speaker_emb        = require_tensor(model, "chatterbox/builtin/speaker_emb");
         model.builtin_cond_prompt_tokens = require_tensor(model, "chatterbox/builtin/cond_prompt_speech_tokens");
+        hp.cond_prompt_len = (int32_t) ggml_nelements(model.builtin_cond_prompt_tokens);
         model.layers.resize(hp.n_layer);
         for (int i = 0; i < hp.n_layer; ++i) {
             auto & l = model.layers[i];

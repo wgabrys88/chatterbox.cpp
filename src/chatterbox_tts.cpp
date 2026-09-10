@@ -68,6 +68,9 @@ struct model_ctx {
     ggml_backend_buffer_t buffer_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
     std::vector<float> input_embedding, spk_affine_w, spk_affine_b, hift_linear_w;
+    std::vector<float> prompt_feat, embedding;
+    std::vector<int32_t> prompt_token;
+    int prompt_rows = 0;
     std::map<std::string, std::vector<float>> inv_alpha;
     float hift_linear_b = 0.0f;
     std::unique_ptr<encoder_cache> first_encoder;
@@ -150,6 +153,18 @@ static model_ctx load_s3gen_gguf(const std::string& path, ggml_backend_t backend
     cache_f32("flow/spk_embed_affine/b", m.spk_affine_b);
     cache_f32("hift/m_source/l_linear/weight", m.hift_linear_w);
     std::vector<float> hift_bias; cache_f32("hift/m_source/l_linear/bias", hift_bias); m.hift_linear_b = hift_bias.at(0);
+    cache_f32("s3gen/builtin/prompt_feat", m.prompt_feat);
+    cache_f32("s3gen/builtin/embedding", m.embedding);
+    {
+        auto it = m.tensors.find("s3gen/builtin/prompt_token");
+        if (it == m.tensors.end()) throw std::runtime_error("tensor not found: s3gen/builtin/prompt_token");
+        m.prompt_token.resize((size_t)ggml_nelements(it->second));
+        s3_tensor_get(it->second, m.prompt_token.data(), 0, ggml_nbytes(it->second));
+    }
+    if (m.prompt_feat.size() % 80) throw std::runtime_error("prompt_feat");
+    m.prompt_rows = (int)(m.prompt_feat.size() / 80);
+    if (m.prompt_rows <= 0 || m.prompt_token.empty() || m.embedding.size() != 192)
+        throw std::runtime_error("baked voice tensors");
     size_t inverse_bytes = 0;
     for (const auto& [name, tensor] : m.tensors) {
         if (name.rfind("hift/", 0) || name.size() < 6 || name.compare(name.size() - 6, 6, "/alpha") || tensor->type != GGML_TYPE_F32) continue;
@@ -982,7 +997,8 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     ggml_free(ctx);
     return wav;
 }
-std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_synthesize_opts& opts) {
+std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
+    if (!g_s3gen_cache_entry) throw std::runtime_error("S3Gen not loaded");
     const int output_tokens = (int)speech_tokens.size();
     constexpr int sr = 24000;
     constexpr int pre_lookahead_len = 3;
@@ -990,13 +1006,13 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens, c
     std::vector<int32_t> padded;
     for (int32_t token : speech_tokens) if (token >= 0 && token < 6561) padded.push_back(token);
     padded.insert(padded.end(), pre_lookahead_len, tts_cpp::chatterbox::SILENCE_TOKEN);
-    model_ctx& m = *s3gen_model_cache_get(opts.s3gen_gguf_path, nullptr);
+    model_ctx& m = *g_s3gen_cache_entry->m;
     const int D = 512;
     const int MEL = 80;
-    int n_prompt = (int)opts.prompt_token.size();
+    int n_prompt = (int)m.prompt_token.size();
     int n_total = n_prompt + (int)padded.size();
     std::vector<int32_t> flow_tokens(n_total);
-    std::memcpy(flow_tokens.data(), opts.prompt_token.data(), n_prompt * sizeof(int32_t));
+    std::memcpy(flow_tokens.data(), m.prompt_token.data(), n_prompt * sizeof(int32_t));
     std::memcpy(flow_tokens.data() + n_prompt, padded.data(), padded.size() * sizeof(int32_t));
     const std::vector<float>& emb_w_data = m.input_embedding;
     std::vector<float> input_embed(n_total * D), mu_T;
@@ -1009,7 +1025,7 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens, c
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mu; ++t)
             mu[m2 * T_mu + t] = mu_T[t * MEL + m2];
-    const float * emb_raw = opts.embedding.data();
+    const float * emb_raw = m.embedding.data();
     float norm = 0.0f;
     for (int i = 0; i < 192; ++i) norm += emb_raw[i] * emb_raw[i];
     norm = std::sqrt(norm + 1e-12f);
@@ -1023,9 +1039,9 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens, c
         for (int i = 0; i < 192; ++i) acc += saw_data[o * 192 + i] * emb_norm[i];
         spks[o] = acc;
     }
-    int mel_len1 = opts.prompt_rows;
+    int mel_len1 = m.prompt_rows;
     std::vector<float> cond(T_mu * MEL, 0.0f);
-    const float * pf_raw = opts.prompt_feat.data();
+    const float * pf_raw = m.prompt_feat.data();
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < mel_len1; ++t)
             cond[m2 * T_mu + t] = pf_raw[t * MEL + m2];

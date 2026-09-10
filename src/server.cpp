@@ -6,10 +6,10 @@
 #include <vector>
 
 int main(int, char** argv) {
-    tts_cpp::chatterbox::Engine tts({argv[1], argv[2], argv[3]});
-    auto pcm = tts.synthesize(argv[5]);
+    tts_cpp::chatterbox::Engine tts({argv[1], argv[2]});
+    auto pcm = tts.synthesize(argv[4]);
     const uint32_t data = (uint32_t)(pcm.size() * 2), riff = 36 + data, sr = 24000;
-    std::ofstream f(argv[4], std::ios::binary);
+    std::ofstream f(argv[3], std::ios::binary);
     auto w16 = [&](uint16_t v) { f.write((char*)&v, 2); };
     auto w32 = [&](uint32_t v) { f.write((char*)&v, 4); };
     f.write("RIFF", 4); w32(riff); f.write("WAVEfmt ", 8);

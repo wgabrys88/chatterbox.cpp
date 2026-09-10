@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include "chatterbox_t3_internal.h"
+#include "bake_native.h"
 #include "voice_features.h"
 #include "campplus.h"
 #include "s3tokenizer.h"
