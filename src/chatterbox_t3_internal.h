@@ -50,6 +50,15 @@ inline void t3_text_align_advance(t3_text_align_state & st, int32_t token) {
     }
 }
 
+inline bool t3_should_hold_eos(const t3_text_align_state * align, int n_text, int n_gen) {
+    if (align) return align->text_cursor < align->n_text - 1;
+    return n_text > 5 && n_gen < n_text * 4;
+}
+
+inline void t3_mask_stop(std::vector<float> & logits, int32_t stop, bool hold) {
+    if (hold && stop >= 0 && stop < (int)logits.size()) logits[(size_t)stop] = -INFINITY;
+}
+
 inline void apply_min_p(float * scores, int vocab, float min_p) {
     if (min_p <= 0.0f || vocab <= 0) return;
     float maxl = -INFINITY;
