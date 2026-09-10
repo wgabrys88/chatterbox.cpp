@@ -225,8 +225,8 @@ def main():
                 mean = grp["running_mean"].float()
                 var  = grp["running_var"].float()
                 denom = torch.sqrt(var + BN_EPS)
-                gamma = grp["weight"].float()
-                beta  = grp["bias"].float()
+                gamma = grp["weight"].float() if "weight" in grp else torch.ones_like(mean)
+                beta  = grp["bias"].float() if "bias" in grp else torch.zeros_like(mean)
                 scale = gamma / denom
                 shift = beta - mean * scale
                 add_tensor_maybe_q(writer, gguf_base + "/s",

@@ -245,7 +245,7 @@ static void conv1d(const float * x, int C_in, int T_in,
         ggml_reshape_2d(gctx, im2, im2->ne[0], im2->ne[2] * im2->ne[1]),
         ggml_reshape_2d(gctx, tw, tw->ne[0] * tw->ne[1], tw->ne[2]));
     r = ggml_reshape_3d(gctx, r, im2->ne[1], tw->ne[2], im2->ne[2]);
-    if (tb) r = ggml_add(gctx, r, tb);
+    if (tb) r = ggml_add(gctx, r, ggml_reshape_2d(gctx, tb, 1, C_out));
     ggml_build_forward_expand(gf, r);
     vk_compute(r, gf, g_vk, y, (size_t)C_out * T_out * sizeof(float));
     ggml_free(gctx);
