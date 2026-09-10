@@ -66,17 +66,15 @@ def load_tokenizer_assets(ckpt_dir: Path):
     merges_path = ckpt_dir / "merges.txt"
     added_path  = ckpt_dir / "added_tokens.json"
     vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
-    added = {}
-    if added_path.exists():
-        added = json.loads(added_path.read_text(encoding="utf-8"))
+    added = json.loads(added_path.read_text(encoding="utf-8"))
     id_to_tok = {int(idx): tok for tok, idx in vocab.items()}
     for tok, idx in added.items():
         id_to_tok[int(idx)] = tok
-    max_id = max(id_to_tok) if id_to_tok else -1
+    max_id = max(id_to_tok)
     tokens = []
     types  = []
     for i in range(max_id + 1):
-        tok = id_to_tok.get(i, "")
+        tok = id_to_tok[i]
         tokens.append(tok)
         types.append(int(gguf.TokenType.USER_DEFINED) if tok in added else int(gguf.TokenType.NORMAL))
     merges = []
@@ -162,7 +160,6 @@ def main() -> None:
     writer.add_uint32("chatterbox.stop_speech_token", STOP_SPEECH_TOKEN)
     writer.add_uint32("chatterbox.speaker_embed_size", SPEAKER_EMBED_SIZE)
     writer.add_float32("chatterbox.layer_norm_eps", LAYER_NORM_EPS)
-    writer.add_string("chatterbox.variant", "t3_turbo")
     writer.add_string("chatterbox.reference_repo", NANO_REPO)
     tok_tokens, tok_types, tok_merges = load_tokenizer_assets(ckpt_dir)
     writer.add_tokenizer_model("gpt2")
@@ -193,40 +190,35 @@ def main() -> None:
     writer.add_uint32("chatterbox.cond_prompt_length", int(builtin_tokens.numel()))
     writer.add_tensor("chatterbox/builtin/speaker_emb", as_numpy(builtin_speaker, dtype=torch.float32))
     writer.add_tensor("chatterbox/builtin/cond_prompt_speech_tokens", as_numpy(builtin_tokens))
-    ve_path = ckpt_dir / "ve.safetensors"
-    if ve_path.exists():
-        ve_state = load_file(ve_path)
-        VE_HIDDEN = 256
-        VE_INPUT  = 40
-        writer.add_uint32("voice_encoder.n_mels",        VE_INPUT)
-        writer.add_uint32("voice_encoder.hidden_size",   VE_HIDDEN)
-        writer.add_uint32("voice_encoder.num_layers",    3)
-        writer.add_uint32("voice_encoder.embedding_size", VE_HIDDEN)
-        writer.add_uint32("voice_encoder.partial_frames", 160)
-        writer.add_uint32("voice_encoder.sample_rate",   16000)
-        writer.add_uint32("voice_encoder.n_fft",         400)
-        writer.add_uint32("voice_encoder.hop_size",      160)
-        writer.add_uint32("voice_encoder.win_size",      400)
-        writer.add_float32("voice_encoder.overlap",      0.5)
-        writer.add_float32("voice_encoder.rate",         1.3)
-        writer.add_float32("voice_encoder.min_coverage", 0.8)
-        for k, t in ve_state.items():
-            if k.startswith("similarity_"):
-                continue
-            writer.add_tensor(
-                f"voice_encoder/{k.replace('.', '/')}",
-                as_numpy(t, dtype=torch.float32),
-            )
-        import librosa
-        import numpy as np
-        ve_mel_fb = librosa.filters.mel(
-            sr=16000, n_fft=400, n_mels=40, fmin=0, fmax=8000,
-        ).astype(np.float32)
-        writer.add_tensor("voice_encoder/mel_fb",
-                          np.ascontiguousarray(ve_mel_fb))
-        print(f"Embedded VoiceEncoder: 14 tensors, mel_fb {ve_mel_fb.shape}")
-    else:
-        print(f"warning: no ve.safetensors at {ve_path}, skipping VoiceEncoder weights")
+    ve_state = load_file(ckpt_dir / "ve.safetensors")
+    VE_HIDDEN = 256
+    VE_INPUT  = 40
+    writer.add_uint32("voice_encoder.n_mels",        VE_INPUT)
+    writer.add_uint32("voice_encoder.hidden_size",   VE_HIDDEN)
+    writer.add_uint32("voice_encoder.num_layers",    3)
+    writer.add_uint32("voice_encoder.embedding_size", VE_HIDDEN)
+    writer.add_uint32("voice_encoder.partial_frames", 160)
+    writer.add_uint32("voice_encoder.sample_rate",   16000)
+    writer.add_uint32("voice_encoder.n_fft",         400)
+    writer.add_uint32("voice_encoder.hop_size",      160)
+    writer.add_uint32("voice_encoder.win_size",      400)
+    writer.add_float32("voice_encoder.overlap",      0.5)
+    writer.add_float32("voice_encoder.rate",         1.3)
+    writer.add_float32("voice_encoder.min_coverage", 0.8)
+    for k, t in ve_state.items():
+        if k.startswith("similarity_"):
+            continue
+        writer.add_tensor(
+            f"voice_encoder/{k.replace('.', '/')}",
+            as_numpy(t, dtype=torch.float32),
+        )
+    import librosa
+    ve_mel_fb = librosa.filters.mel(
+        sr=16000, n_fft=400, n_mels=40, fmin=0, fmax=8000,
+    ).astype(np.float32)
+    writer.add_tensor("voice_encoder/mel_fb",
+                      np.ascontiguousarray(ve_mel_fb))
+    print(f"Embedded VoiceEncoder: 14 tensors, mel_fb {ve_mel_fb.shape}")
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()

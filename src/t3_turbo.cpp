@@ -53,7 +53,8 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
         hp.n_embd  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_EMBD));
         hp.n_head  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_HEAD));
         hp.n_layer = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_LAYER));
-        if (requested_ctx > 0) hp.n_ctx = std::min(hp.n_ctx, requested_ctx);
+        if (requested_ctx <= 0) throw std::runtime_error("context required");
+        hp.n_ctx = requested_ctx;
         model.backend = init_backend(n_gpu_layers);
         const int64_t num_tensors = gguf_get_n_tensors(gguf_ctx);
         ggml_init_params params = { ggml_tensor_overhead() * (size_t) num_tensors, nullptr, true };
@@ -135,7 +136,7 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
 static ggml_tensor * build_transformer_core(
     ggml_context * ctx, ggml_cgraph * gf,
     const chatterbox_model & model,
-    ggml_tensor * inpL, int n_past, int N, bool use_attn_mask = false) {
+    ggml_tensor * inpL, int n_past, int N) {
     const auto & hp = model.hparams;
     const int n_embd = hp.n_embd, n_head = hp.n_head, n_layer = hp.n_layer, n_ctx = hp.n_ctx;
     const int HD = n_embd / n_head;
@@ -144,7 +145,7 @@ static ggml_tensor * build_transformer_core(
     const size_t kv_head_stride  = (size_t) HD * n_ctx * sizeof(float);
     const size_t kv_pos_stride   = (size_t) HD * sizeof(float);
     ggml_tensor * kq_mask = nullptr;
-    if (use_attn_mask || N > 1) {
+    if (N > 1) {
         kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, L, N);
         ggml_set_name(kq_mask, "kq_mask");
         ggml_set_input(kq_mask);
@@ -237,7 +238,7 @@ static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_te
     ggml_free(ctx);
     return gf;
 }
-static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past, bool masked_attn) {
+static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past) {
     static size_t buf_size = ggml_tensor_overhead()*CHBX_MAX_NODES + ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
     thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
@@ -250,7 +251,7 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
     ggml_tensor * inp = ggml_add(ctx,
         ggml_get_rows(ctx, model.speech_emb, speech_token),
         ggml_get_rows(ctx, model.wpe, position));
-    build_transformer_core(ctx, gf, model, inp, n_past, 1, masked_attn);
+    build_transformer_core(ctx, gf, model, inp, n_past, 1);
     ggml_free(ctx);
     return gf;
 }
@@ -275,15 +276,14 @@ bool eval_prompt(
     {
         const int N = prompt_len;
         ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "kq_mask");
-        if (kq_mask) {
-            const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
-            const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
-            std::vector<ggml_fp16_t> mask((size_t)N * N, zero_h);
-            for (int q = 0; q < N; ++q)
-                for (int k = 0; k < N; ++k)
-                    if (k > q) mask[(size_t)q * N + k] = ninf_h;
-            ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
-        }
+        if (!kq_mask) return false;
+        const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
+        std::vector<ggml_fp16_t> mask((size_t)N * N, zero_h);
+        for (int q = 0; q < N; ++q)
+            for (int k = 0; k < N; ++k)
+                if (k > q) mask[(size_t)q * N + k] = ninf_h;
+        ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
     }
     const auto status = ggml_backend_graph_compute(model.backend, gf);
     if (status != GGML_STATUS_SUCCESS) return false;
@@ -298,7 +298,7 @@ bool eval_step(
     const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
     int n_past, int32_t token, std::vector<float> & logits_out) {
     (void)n_threads;
-    ggml_cgraph * gf = build_step_graph(model, n_past, false);
+    ggml_cgraph * gf = build_step_graph(model, n_past);
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
@@ -338,8 +338,9 @@ int32_t sample_next_token_ex(
         std::vector<IS> sorted;
         sorted.reserve(n);
         for (int i = 0; i < n; ++i) if (scores[i] != -INFINITY) sorted.push_back({i, scores[i]});
+        if (sorted.empty()) throw std::runtime_error("top_p emptied the speech vocab");
         std::sort(sorted.begin(), sorted.end(), [](const IS& a, const IS& b){ return a.s > b.s; });
-        float mx = sorted.empty() ? 0.0f : sorted[0].s;
+        float mx = sorted[0].s;
         std::vector<float> probs(sorted.size());
         float psum = 0;
         for (size_t i = 0; i < sorted.size(); ++i) { probs[i] = std::exp(sorted[i].s - mx); psum += probs[i]; }
@@ -351,7 +352,7 @@ int32_t sample_next_token_ex(
             keep_set.insert(sorted[i].idx);
             if (cum >= params.top_p) break;
         }
-        if (keep_set.empty() && !sorted.empty()) keep_set.insert(sorted[0].idx);
+        if (keep_set.empty()) throw std::runtime_error("top_p emptied the speech vocab");
         for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
     apply_speech_repeat_penalty(scores.data(), n, generated, params.repeat_penalty);
@@ -363,10 +364,8 @@ int32_t sample_next_token_ex(
         probs[i] = (scores[i] == -INFINITY) ? 0.0f : std::exp(scores[i] - mx);
         psum += probs[i];
     }
-    if (psum == 0.0f) return 0;
+    if (psum == 0.0f) throw std::runtime_error("sampler produced empty distribution");
     for (float & p : probs) p /= psum;
-    if (params.temp <= 0.0f)
-        return (int32_t)std::distance(probs.begin(), std::max_element(probs.begin(), probs.end()));
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
     return (int32_t)dist(rng);
 }

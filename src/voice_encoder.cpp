@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <vector>
 static bool copy_tensor_f32(ggml_context * ctx, const char * name,
                             std::vector<float> & out)
@@ -35,24 +37,32 @@ bool voice_encoder_load(const std::string & t3_gguf_path,
         return ok;
     };
     if (gguf_find_key(g, "voice_encoder.hidden_size") < 0) {
+        fprintf(stderr, "voice_encoder_load: missing GGUF key voice_encoder.hidden_size\n");
         return cleanup(false);
     }
-    auto get_u32 = [&](const char * k, uint32_t fallback) -> uint32_t {
+    auto get_u32 = [&](const char * k) -> uint32_t {
         int64_t id = gguf_find_key(g, k);
-        return id < 0 ? fallback : gguf_get_val_u32(g, id);
+        if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
+        return gguf_get_val_u32(g, id);
     };
-    auto get_f32 = [&](const char * k, float fallback) -> float {
+    auto get_f32 = [&](const char * k) -> float {
         int64_t id = gguf_find_key(g, k);
-        return id < 0 ? fallback : gguf_get_val_f32(g, id);
+        if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
+        return gguf_get_val_f32(g, id);
     };
-    out.n_layers       = (int)get_u32("voice_encoder.num_layers",    3);
-    out.n_mels         = (int)get_u32("voice_encoder.n_mels",       40);
-    out.hidden         = (int)get_u32("voice_encoder.hidden_size",  256);
-    out.embedding      = (int)get_u32("voice_encoder.embedding_size", out.hidden);
-    out.partial_frames = (int)get_u32("voice_encoder.partial_frames", 160);
-    out.overlap        = get_f32("voice_encoder.overlap",            0.5f);
-    out.rate           = get_f32("voice_encoder.rate",               1.3f);
-    out.min_coverage   = get_f32("voice_encoder.min_coverage",       0.8f);
+    try {
+        out.n_layers       = (int)get_u32("voice_encoder.num_layers");
+        out.n_mels         = (int)get_u32("voice_encoder.n_mels");
+        out.hidden         = (int)get_u32("voice_encoder.hidden_size");
+        out.embedding      = (int)get_u32("voice_encoder.embedding_size");
+        out.partial_frames = (int)get_u32("voice_encoder.partial_frames");
+        out.overlap        = get_f32("voice_encoder.overlap");
+        out.rate           = get_f32("voice_encoder.rate");
+        out.min_coverage   = get_f32("voice_encoder.min_coverage");
+    } catch (const std::exception & e) {
+        fprintf(stderr, "voice_encoder_load: %s\n", e.what());
+        return cleanup(false);
+    }
     auto load_or_fail = [&](const char * name, std::vector<float> & dst) {
         if (copy_tensor_f32(tmp_ctx, name, dst)) return true;
         fprintf(stderr, "voice_encoder_load: missing expected tensor '%s' in %s\n",
@@ -82,16 +92,13 @@ bool voice_encoder_load(const std::string & t3_gguf_path,
 }
 static void compute_partials(int n_frames, int partial, float rate,
                              int sample_rate_hz,
-                             float overlap, float min_coverage,
+                             float min_coverage,
                              int & n_wins, int & step, int & target_n)
 {
-    if (rate > 0.0f) {
-        step = (int)std::lround(((double)sample_rate_hz / (double)rate) / (double)partial);
-    } else {
-        step = (int)std::lround((double)partial * (1.0 - overlap));
-    }
-    if (step <= 0) step = 1;
-    if (step > partial) step = partial;
+    if (rate <= 0.0f) throw std::runtime_error("voice encoder rate must be positive");
+    step = (int)std::lround(((double)sample_rate_hz / (double)rate) / (double)partial);
+    if (step <= 0) throw std::runtime_error("voice encoder window step is not positive");
+    if (step > partial) throw std::runtime_error("voice encoder window step exceeds partial frames");
     int a = std::max(n_frames - partial + step, 0);
     int nw = a / step;
     int remainder = a - nw * step;
@@ -296,19 +303,12 @@ bool voice_encoder_embed(const std::vector<float> & wav_16k,
     const int T_mel = (int)(mel.size() / w.n_mels);
     int n_wins, step, target_n;
     compute_partials(T_mel, w.partial_frames, w.rate, w.partial_frames,
-                     w.overlap, w.min_coverage, n_wins, step, target_n);
+                     w.min_coverage, n_wins, step, target_n);
     if (target_n > T_mel) mel.resize((size_t) target_n * w.n_mels, 0.0f);
     else if (target_n < T_mel) mel.resize((size_t) target_n * w.n_mels);
     ve_graph G;
     G.backend = backend;
-    if (!G.backend) {
-        G.backend = ggml_backend_cpu_init();
-        if (!G.backend) {
-            fprintf(stderr, "voice_encoder_embed: ggml_backend_cpu_init failed\n");
-            return false;
-        }
-        G.owns_backend = true;
-    }
+    if (!G.backend) throw std::runtime_error("VoiceEncoder backend required");
     if (!ve_graph_init_weights(G, w)) {
         ve_graph_free(G);
         return false;

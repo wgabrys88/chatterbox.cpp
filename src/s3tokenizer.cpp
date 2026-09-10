@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 #ifndef M_PI
@@ -28,33 +29,37 @@ bool s3tokv2_load(const std::string & path, s3tokv2_weights & w)
     gguf_init_params gp = {  false,  &tmp };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) { fprintf(stderr, "s3tokv2_load: cannot open %s\n", path.c_str()); return false; }
-    if (gguf_find_key(g, "s3tokv2.n_audio_state") < 0) {
+    auto u32 = [&](const char * k) {
+        int64_t id = gguf_find_key(g, k);
+        if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
+        return gguf_get_val_u32(g, id);
+    };
+    auto f32 = [&](const char * k) {
+        int64_t id = gguf_find_key(g, k);
+        if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
+        return gguf_get_val_f32(g, id);
+    };
+    try {
+        w.n_mels       = (int)u32("s3tokv2.n_mels");
+        w.n_state      = (int)u32("s3tokv2.n_audio_state");
+        w.n_head       = (int)u32("s3tokv2.n_audio_head");
+        w.n_layer      = (int)u32("s3tokv2.n_audio_layer");
+        w.head_dim     = (int)u32("s3tokv2.head_dim");
+        w.mlp_ratio    = (int)u32("s3tokv2.mlp_ratio");
+        w.fsmn_kernel  = (int)u32("s3tokv2.fsmn_kernel");
+        w.fsq_levels   = (int)u32("s3tokv2.fsq_levels");
+        w.fsq_dim      = (int)u32("s3tokv2.fsq_dim");
+        w.codebook_size= (int)u32("s3tokv2.codebook_size");
+        w.conv_stride  = (int)u32("s3tokv2.conv_stride");
+        w.n_fft        = (int)u32("s3tokv2.n_fft");
+        w.hop          = (int)u32("s3tokv2.hop");
+        w.sample_rate  = (int)u32("s3tokv2.sample_rate");
+        w.rope_theta   = f32("s3tokv2.rope_theta");
+        w.rope_max_pos = (int)u32("s3tokv2.rope_max_pos");
+    } catch (const std::exception & e) {
+        fprintf(stderr, "s3tokv2_load: %s\n", e.what());
         gguf_free(g); if (tmp) ggml_free(tmp); return false;
     }
-    auto u32 = [&](const char * k, uint32_t fb) {
-        int64_t id = gguf_find_key(g, k);
-        return id < 0 ? fb : gguf_get_val_u32(g, id);
-    };
-    auto f32 = [&](const char * k, float fb) {
-        int64_t id = gguf_find_key(g, k);
-        return id < 0 ? fb : gguf_get_val_f32(g, id);
-    };
-    w.n_mels       = (int)u32("s3tokv2.n_mels",        128);
-    w.n_state      = (int)u32("s3tokv2.n_audio_state", 1280);
-    w.n_head       = (int)u32("s3tokv2.n_audio_head",  20);
-    w.n_layer      = (int)u32("s3tokv2.n_audio_layer", 6);
-    w.head_dim     = (int)u32("s3tokv2.head_dim",      64);
-    w.mlp_ratio    = (int)u32("s3tokv2.mlp_ratio",     4);
-    w.fsmn_kernel  = (int)u32("s3tokv2.fsmn_kernel",   31);
-    w.fsq_levels   = (int)u32("s3tokv2.fsq_levels",    3);
-    w.fsq_dim      = (int)u32("s3tokv2.fsq_dim",       8);
-    w.codebook_size= (int)u32("s3tokv2.codebook_size", 6561);
-    w.conv_stride  = (int)u32("s3tokv2.conv_stride",   2);
-    w.n_fft        = (int)u32("s3tokv2.n_fft",         400);
-    w.hop          = (int)u32("s3tokv2.hop",           160);
-    w.sample_rate  = (int)u32("s3tokv2.sample_rate",   16000);
-    w.rope_theta   = f32("s3tokv2.rope_theta",         10000.0f);
-    w.rope_max_pos = (int)u32("s3tokv2.rope_max_pos",  2048);
     bool ok = true;
     ok &= copy_f32(tmp, "s3tokv2/mel_fb",              w.mel_fb);
     ok &= copy_f32(tmp, "s3tokv2/encoder/conv1/weight", w.conv1_w);
@@ -260,14 +265,12 @@ static ggml_tensor * add_weight_f32_3d(ggml_context * ctx, int64_t a, int64_t b,
 static bool build_encoder_ctx(encoder_ctx & ec, const s3tokv2_weights & w,
                                ggml_backend_t backend)
 {
-    if (backend) {
-        ec.backend      = backend;
-        ec.owns_backend = false;
-    } else {
-        ec.backend      = ggml_backend_cpu_init();
-        ec.owns_backend = true;
-        if (!ec.backend) { fprintf(stderr, "s3tokv2: ggml_backend_cpu_init failed\n"); return false; }
+    if (!backend) {
+        fprintf(stderr, "s3tokv2: backend required\n");
+        return false;
     }
+    ec.backend = backend;
+    ec.owns_backend = false;
     const int n_tensors = 4 + 16 * w.n_layer + 8;
     ggml_init_params ip = {
          (size_t)n_tensors * ggml_tensor_overhead(),

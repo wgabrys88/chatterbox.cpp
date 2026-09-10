@@ -23,15 +23,8 @@ bool validate_reference_audio(const std::string & path) {
     if (secs <= 5.0) {
         fprintf(stderr,
             "error: --reference-audio is only %.2f s; Chatterbox requires strictly more "
-            "than 5 s of clean mono speech.  Shorter references produce undersized "
-            "conditioning tensors and the model falls back on the built-in voice.\n"
-            "  Recommended length: 10–15 s.\n", secs);
+            "than 5 s of clean mono speech.\n", secs);
         return false;
-    }
-    if (secs < 10.0) {
-        fprintf(stderr,
-            "warning: --reference-audio is %.2f s; 10–15 s is recommended for best "
-            "voice similarity.\n", secs);
     }
     return true;
 }

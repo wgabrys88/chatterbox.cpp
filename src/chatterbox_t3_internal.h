@@ -106,7 +106,7 @@ struct chatterbox_model {
 struct chatterbox_sampling_params {
     int32_t top_k          = 1000;
     float   top_p          = 0.95f;
-    float   temp           = 0.8f;
+    float   temp           = 0.5f;
     float   repeat_penalty = 1.2f;
     float   min_p          = 0.0f;
 };

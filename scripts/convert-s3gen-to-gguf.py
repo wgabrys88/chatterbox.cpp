@@ -128,9 +128,6 @@ def main():
     writer.add_name("Chatterbox Nano S3Gen")
     writer.add_description("S3Gen meanflow + mel2wav (HiFT) for ggml port.")
     writer.add_string("s3gen.quantization", args.quant)
-    writer.add_bool("s3gen.meanflow", True)
-    writer.add_uint32("s3gen.n_timesteps", 2)
-    writer.add_float32("s3gen.cfg_rate", 0.0)
     qstats: Optional[dict[str, int]] = {"n_quant": 0} if args.quant not in ("f16", "f32") else None
     writer.add_uint32("s3gen.speech_vocab_size", 6561)
     writer.add_uint32("s3gen.input_size", 512)
@@ -200,132 +197,122 @@ def main():
     add_tensor_maybe_q(writer, "s3gen/mel_fb/24k_80", np.ascontiguousarray(mel_fb_24k_80), args.quant, stats=qstats)
     speaker_keys = [k for k in state if k.startswith("speaker_encoder.")]
     if not speaker_keys:
-        print(f"warning: no speaker_encoder.* tensors found in {ckpt_path}")
-    else:
-        BN_EPS = 1e-5
-        bn_groups: dict[str, dict[str, torch.Tensor]] = {}
-        for k in speaker_keys:
-            parts = k.rsplit(".", 1)
-            if len(parts) == 2 and parts[1] in ("weight", "bias", "running_mean",
-                                                "running_var", "num_batches_tracked"):
-                bn_groups.setdefault(parts[0], {})[parts[1]] = state[k]
-        bn_prefixes = {p for p, t in bn_groups.items()
-                       if "running_mean" in t and "running_var" in t}
-        n_bn = 0
-        n_conv = 0
-        for k in speaker_keys:
-            parts = k.rsplit(".", 1)
-            prefix, last = (parts[0], parts[1]) if len(parts) == 2 else (k, "")
-            if last == "num_batches_tracked":
+        raise SystemExit(f"missing speaker_encoder.* in {ckpt_path}")
+    BN_EPS = 1e-5
+    bn_groups: dict[str, dict[str, torch.Tensor]] = {}
+    for k in speaker_keys:
+        parts = k.rsplit(".", 1)
+        if len(parts) == 2 and parts[1] in ("weight", "bias", "running_mean",
+                                            "running_var", "num_batches_tracked"):
+            bn_groups.setdefault(parts[0], {})[parts[1]] = state[k]
+    bn_prefixes = {p for p, t in bn_groups.items()
+                   if "running_mean" in t and "running_var" in t}
+    n_bn = 0
+    n_conv = 0
+    for k in speaker_keys:
+        parts = k.rsplit(".", 1)
+        prefix, last = (parts[0], parts[1]) if len(parts) == 2 else (k, "")
+        if last == "num_batches_tracked":
+            continue
+        gguf_base = "campplus/" + prefix.removeprefix("speaker_encoder.").replace(".", "/")
+        if prefix in bn_prefixes:
+            if last in ("weight", "bias"):
                 continue
-            gguf_base = "campplus/" + prefix.removeprefix("speaker_encoder.").replace(".", "/")
-            if prefix in bn_prefixes:
-                if last in ("weight", "bias"):
-                    continue
-                if last == "running_var":
-                    continue
-                if last == "running_mean":
-                    grp = bn_groups[prefix]
-                    mean = grp["running_mean"].float()
-                    var  = grp["running_var"].float()
-                    denom = torch.sqrt(var + BN_EPS)
-                    if "weight" in grp and "bias" in grp:
-                        gamma = grp["weight"].float()
-                        beta  = grp["bias"].float()
-                        scale = gamma / denom
-                        shift = beta - mean * scale
-                    else:
-                        scale = 1.0 / denom
-                        shift = -mean * scale
-                    add_tensor_maybe_q(writer, gguf_base + "/s",
-                                       np.ascontiguousarray(scale.numpy().astype(np.float32)),
-                                       args.quant, stats=qstats)
-                    add_tensor_maybe_q(writer, gguf_base + "/b",
-                                       np.ascontiguousarray(shift.numpy().astype(np.float32)),
-                                       args.quant, stats=qstats)
-                    n_bn += 1
+            if last == "running_var":
                 continue
-            gguf_name = "campplus/" + k.removeprefix("speaker_encoder.").replace(".", "/")
-            add_tensor_maybe_q(writer, gguf_name, as_numpy(state[k], dtype=torch.float32), args.quant, stats=qstats)
-            n_conv += 1
-        writer.add_uint32("campplus.feat_dim",         80)
-        writer.add_uint32("campplus.embedding_size",   192)
-        writer.add_uint32("campplus.growth_rate",      32)
-        writer.add_uint32("campplus.bn_size",          4)
-        writer.add_uint32("campplus.init_channels",    128)
-        writer.add_uint32("campplus.block1_layers",    12)
-        writer.add_uint32("campplus.block2_layers",    24)
-        writer.add_uint32("campplus.block3_layers",    16)
-        writer.add_uint32("campplus.block1_dilation",  1)
-        writer.add_uint32("campplus.block2_dilation",  2)
-        writer.add_uint32("campplus.block3_dilation",  2)
-        writer.add_uint32("campplus.kernel_size",      3)
-        writer.add_uint32("campplus.seg_pool_len",     100)
-        writer.add_uint32("campplus.sample_rate",      16000)
-        SR = 16000
-        NFFT = 512
-        N_MELS = 80
-        LOW = 20.0
-        HIGH = 8000.0
-        mel_low  = 1127.0 * np.log(1.0 + LOW  / 700.0)
-        mel_high = 1127.0 * np.log(1.0 + HIGH / 700.0)
-        mel_delta = (mel_high - mel_low) / (N_MELS + 1)
-        bin_freq  = np.arange(NFFT // 2 + 1, dtype=np.float64) * SR / NFFT
-        bin_mel   = 1127.0 * np.log(1.0 + bin_freq / 700.0)
-        kaldi_fb  = np.zeros((N_MELS, NFFT // 2 + 1), dtype=np.float32)
-        for m in range(N_MELS):
-            mel_center = mel_low + (m + 1) * mel_delta
-            mel_lo = mel_center - mel_delta
-            mel_hi = mel_center + mel_delta
-            for k, mb in enumerate(bin_mel):
-                if mb < mel_lo or mb > mel_hi:
-                    continue
-                if mb <= mel_center:
-                    kaldi_fb[m, k] = (mb - mel_lo) / (mel_center - mel_lo)
-                else:
-                    kaldi_fb[m, k] = (mel_hi - mb) / (mel_hi - mel_center)
-        add_tensor_maybe_q(writer, "campplus/mel_fb_kaldi_80", np.ascontiguousarray(kaldi_fb), args.quant, stats=qstats)
-        print(f"Embedded CAMPPlus: {n_conv} conv/linear tensors + {n_bn} fused BNs "
-              f"+ kaldi mel filterbank {kaldi_fb.shape}")
+            if last == "running_mean":
+                grp = bn_groups[prefix]
+                mean = grp["running_mean"].float()
+                var  = grp["running_var"].float()
+                denom = torch.sqrt(var + BN_EPS)
+                gamma = grp["weight"].float()
+                beta  = grp["bias"].float()
+                scale = gamma / denom
+                shift = beta - mean * scale
+                add_tensor_maybe_q(writer, gguf_base + "/s",
+                                   np.ascontiguousarray(scale.numpy().astype(np.float32)),
+                                   args.quant, stats=qstats)
+                add_tensor_maybe_q(writer, gguf_base + "/b",
+                                   np.ascontiguousarray(shift.numpy().astype(np.float32)),
+                                   args.quant, stats=qstats)
+                n_bn += 1
+            continue
+        gguf_name = "campplus/" + k.removeprefix("speaker_encoder.").replace(".", "/")
+        add_tensor_maybe_q(writer, gguf_name, as_numpy(state[k], dtype=torch.float32), args.quant, stats=qstats)
+        n_conv += 1
+    writer.add_uint32("campplus.feat_dim",         80)
+    writer.add_uint32("campplus.embedding_size",   192)
+    writer.add_uint32("campplus.growth_rate",      32)
+    writer.add_uint32("campplus.bn_size",          4)
+    writer.add_uint32("campplus.init_channels",    128)
+    writer.add_uint32("campplus.block1_layers",    12)
+    writer.add_uint32("campplus.block2_layers",    24)
+    writer.add_uint32("campplus.block3_layers",    16)
+    writer.add_uint32("campplus.block1_dilation",  1)
+    writer.add_uint32("campplus.block2_dilation",  2)
+    writer.add_uint32("campplus.block3_dilation",  2)
+    writer.add_uint32("campplus.kernel_size",      3)
+    writer.add_uint32("campplus.seg_pool_len",     100)
+    writer.add_uint32("campplus.sample_rate",      16000)
+    SR = 16000
+    NFFT = 512
+    N_MELS = 80
+    LOW = 20.0
+    HIGH = 8000.0
+    mel_low  = 1127.0 * np.log(1.0 + LOW  / 700.0)
+    mel_high = 1127.0 * np.log(1.0 + HIGH / 700.0)
+    mel_delta = (mel_high - mel_low) / (N_MELS + 1)
+    bin_freq  = np.arange(NFFT // 2 + 1, dtype=np.float64) * SR / NFFT
+    bin_mel   = 1127.0 * np.log(1.0 + bin_freq / 700.0)
+    kaldi_fb  = np.zeros((N_MELS, NFFT // 2 + 1), dtype=np.float32)
+    for m in range(N_MELS):
+        mel_center = mel_low + (m + 1) * mel_delta
+        mel_lo = mel_center - mel_delta
+        mel_hi = mel_center + mel_delta
+        for k, mb in enumerate(bin_mel):
+            if mb < mel_lo or mb > mel_hi:
+                continue
+            if mb <= mel_center:
+                kaldi_fb[m, k] = (mb - mel_lo) / (mel_center - mel_lo)
+            else:
+                kaldi_fb[m, k] = (mel_hi - mb) / (mel_hi - mel_center)
+    add_tensor_maybe_q(writer, "campplus/mel_fb_kaldi_80", np.ascontiguousarray(kaldi_fb), args.quant, stats=qstats)
+    print(f"Embedded CAMPPlus: {n_conv} conv/linear tensors + {n_bn} fused BNs "
+          f"+ kaldi mel filterbank {kaldi_fb.shape}")
     tok_keys = [k for k in state if k.startswith("tokenizer.")]
     if not tok_keys:
-        print(f"warning: no tokenizer.* tensors found in {ckpt_path}")
-    else:
-        n_tok = 0
-        for k in tok_keys:
-            rest = k[len("tokenizer."):]
-            if rest in ("window",):
-                continue
-            if rest == "_mel_filters":
-                gguf_name = "s3tokv2/mel_fb"
-            else:
-                gguf_name = "s3tokv2/" + rest.replace(".", "/")
-            add_tensor_maybe_q(writer, gguf_name, as_numpy(state[k], dtype=torch.float32), args.quant, stats=qstats)
-            n_tok += 1
-        if "tokenizer._mel_filters" not in state:
-            fb = librosa.filters.mel(
-                sr=16000, n_fft=400, n_mels=128, fmin=0, fmax=8000,
-            ).astype(np.float32)
-            add_tensor_maybe_q(writer, "s3tokv2/mel_fb", np.ascontiguousarray(fb), args.quant, stats=qstats)
-            n_tok += 1
-            print(f"Synthesized s3tokv2/mel_fb {fb.shape} (checkpoint has no tokenizer._mel_filters)")
-        writer.add_uint32("s3tokv2.n_mels",        128)
-        writer.add_uint32("s3tokv2.n_audio_state", 1280)
-        writer.add_uint32("s3tokv2.n_audio_head",  20)
-        writer.add_uint32("s3tokv2.n_audio_layer", 6)
-        writer.add_uint32("s3tokv2.head_dim",      64)
-        writer.add_uint32("s3tokv2.mlp_ratio",     4)
-        writer.add_uint32("s3tokv2.fsmn_kernel",   31)
-        writer.add_uint32("s3tokv2.fsq_levels",    3)
-        writer.add_uint32("s3tokv2.fsq_dim",       8)
-        writer.add_uint32("s3tokv2.codebook_size", 3 ** 8)
-        writer.add_uint32("s3tokv2.conv_stride",   2)
-        writer.add_uint32("s3tokv2.n_fft",         400)
-        writer.add_uint32("s3tokv2.hop",           160)
-        writer.add_uint32("s3tokv2.sample_rate",   16000)
-        writer.add_float32("s3tokv2.rope_theta",   10000.0)
-        writer.add_uint32("s3tokv2.rope_max_pos",  2048)
-        print(f"Embedded S3TokenizerV2: {n_tok} tensors")
+        raise SystemExit(f"missing tokenizer.* in {ckpt_path}")
+    n_tok = 0
+    for k in tok_keys:
+        rest = k[len("tokenizer."):]
+        if rest in ("window", "_mel_filters"):
+            continue
+        gguf_name = "s3tokv2/" + rest.replace(".", "/")
+        add_tensor_maybe_q(writer, gguf_name, as_numpy(state[k], dtype=torch.float32), args.quant, stats=qstats)
+        n_tok += 1
+    fb = librosa.filters.mel(
+        sr=16000, n_fft=400, n_mels=128, fmin=0, fmax=8000,
+    ).astype(np.float32)
+    add_tensor_maybe_q(writer, "s3tokv2/mel_fb", np.ascontiguousarray(fb), args.quant, stats=qstats)
+    n_tok += 1
+    print(f"s3tokv2/mel_fb {fb.shape}")
+    writer.add_uint32("s3tokv2.n_mels",        128)
+    writer.add_uint32("s3tokv2.n_audio_state", 1280)
+    writer.add_uint32("s3tokv2.n_audio_head",  20)
+    writer.add_uint32("s3tokv2.n_audio_layer", 6)
+    writer.add_uint32("s3tokv2.head_dim",      64)
+    writer.add_uint32("s3tokv2.mlp_ratio",     4)
+    writer.add_uint32("s3tokv2.fsmn_kernel",   31)
+    writer.add_uint32("s3tokv2.fsq_levels",    3)
+    writer.add_uint32("s3tokv2.fsq_dim",       8)
+    writer.add_uint32("s3tokv2.codebook_size", 3 ** 8)
+    writer.add_uint32("s3tokv2.conv_stride",   2)
+    writer.add_uint32("s3tokv2.n_fft",         400)
+    writer.add_uint32("s3tokv2.hop",           160)
+    writer.add_uint32("s3tokv2.sample_rate",   16000)
+    writer.add_float32("s3tokv2.rope_theta",   10000.0)
+    writer.add_uint32("s3tokv2.rope_max_pos",  2048)
+    print(f"Embedded S3TokenizerV2: {n_tok} tensors")
     n_flow = sum(1 for k in state if k.startswith("flow.")) - sum(1 for k in state if k.startswith("flow.decoder.estimator."))
     n_cfm  = len(decoder_keys)
     n_hift = len(mel2wav_keys)

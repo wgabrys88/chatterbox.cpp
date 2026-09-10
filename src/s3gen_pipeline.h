@@ -26,7 +26,7 @@ struct s3gen_synthesize_opts {
     int seed = 42;
     int n_threads = 4;
     int n_gpu_layers = 99;
-    int cfm_steps = 2;
+    int cfm_steps = 1;
     bool fastconv = true;
     bool final = true;
     bool last_piece = true;

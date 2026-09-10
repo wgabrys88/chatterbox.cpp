@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #ifdef _OPENMP
@@ -126,28 +127,33 @@ bool campplus_load(const std::string & path, campplus_weights & w)
     gguf_init_params gp = {  false,  &tmp };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) { fprintf(stderr, "campplus_load: cannot open %s\n", path.c_str()); return false; }
-    if (gguf_find_key(g, "campplus.embedding_size") < 0) {
+    auto u32 = [&](const char * k) {
+        int64_t id = gguf_find_key(g, k);
+        if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
+        return gguf_get_val_u32(g, id);
+    };
+    int init_channels = 0, growth_rate = 0, bn_size = 0, bn_channels = 0;
+    int b1_layers = 0, b2_layers = 0, b3_layers = 0, b1_dil = 0, b2_dil = 0, b3_dil = 0, k_size = 0;
+    try {
+        w.feat_dim       = (int)u32("campplus.feat_dim");
+        w.embedding_size = (int)u32("campplus.embedding_size");
+        w.seg_pool_len   = (int)u32("campplus.seg_pool_len");
+        w.sample_rate    = (int)u32("campplus.sample_rate");
+        init_channels = (int)u32("campplus.init_channels");
+        growth_rate   = (int)u32("campplus.growth_rate");
+        bn_size       = (int)u32("campplus.bn_size");
+        bn_channels   = bn_size * growth_rate;
+        b1_layers     = (int)u32("campplus.block1_layers");
+        b2_layers     = (int)u32("campplus.block2_layers");
+        b3_layers     = (int)u32("campplus.block3_layers");
+        b1_dil        = (int)u32("campplus.block1_dilation");
+        b2_dil        = (int)u32("campplus.block2_dilation");
+        b3_dil        = (int)u32("campplus.block3_dilation");
+        k_size        = (int)u32("campplus.kernel_size");
+    } catch (const std::exception & e) {
+        fprintf(stderr, "campplus_load: %s\n", e.what());
         gguf_free(g); if (tmp) ggml_free(tmp); return false;
     }
-    auto u32 = [&](const char * k, uint32_t fb) {
-        int64_t id = gguf_find_key(g, k);
-        return id < 0 ? fb : gguf_get_val_u32(g, id);
-    };
-    w.feat_dim       = (int)u32("campplus.feat_dim",       80);
-    w.embedding_size = (int)u32("campplus.embedding_size", 192);
-    w.seg_pool_len   = (int)u32("campplus.seg_pool_len",   100);
-    w.sample_rate    = (int)u32("campplus.sample_rate",    16000);
-    const int init_channels = (int)u32("campplus.init_channels", 128);
-    const int growth_rate   = (int)u32("campplus.growth_rate",   32);
-    const int bn_size       = (int)u32("campplus.bn_size",       4);
-    const int bn_channels   = bn_size * growth_rate;
-    const int b1_layers     = (int)u32("campplus.block1_layers", 12);
-    const int b2_layers     = (int)u32("campplus.block2_layers", 24);
-    const int b3_layers     = (int)u32("campplus.block3_layers", 16);
-    const int b1_dil        = (int)u32("campplus.block1_dilation", 1);
-    const int b2_dil        = (int)u32("campplus.block2_dilation", 2);
-    const int b3_dil        = (int)u32("campplus.block3_dilation", 2);
-    const int k_size        = (int)u32("campplus.kernel_size",   3);
     bool ok = true;
     ok &= load_conv2d(tmp, "campplus/head/conv1/weight", 3, 3, 1, 32, 1, 1, 1, 1, w.head.conv1);
     ok &= load_bn    (tmp, "campplus/head/bn1", w.head.bn1);

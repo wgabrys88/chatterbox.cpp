@@ -165,19 +165,15 @@ struct Engine::Impl {
         std::vector<int32_t> cond;
         if (!compute_speech_tokens_native(opts.reference_audio, opts.s3gen_gguf_path, model.hparams.cond_prompt_len,
                 prompt_token, cond, n_threads, model.backend, false)) throw std::runtime_error("S3Tokenizer failed");
-        if ((int64_t)cond.size() == ggml_nelements(model.builtin_cond_prompt_tokens)) {
-            ggml_backend_tensor_set(model.builtin_cond_prompt_tokens, cond.data(), 0, ggml_nbytes(model.builtin_cond_prompt_tokens));
-        } else {
-            ggml_init_params p = {ggml_tensor_overhead() * 2, nullptr, true};
-            model.ctx_override = ggml_init(p);
-            if (!model.ctx_override) throw std::runtime_error("conditioning context failed");
-            auto* t = ggml_new_tensor_1d(model.ctx_override, GGML_TYPE_I32, (int64_t)cond.size());
-            model.buffer_override = ggml_backend_alloc_ctx_tensors(model.ctx_override, model.backend);
-            if (!model.buffer_override) throw std::runtime_error("conditioning buffer failed");
-            ggml_backend_tensor_set(t, cond.data(), 0, cond.size() * sizeof(int32_t));
-            model.builtin_cond_prompt_tokens = t;
-            model.hparams.cond_prompt_len = (int32_t)cond.size();
-        }
+        ggml_init_params p = {ggml_tensor_overhead() * 2, nullptr, true};
+        model.ctx_override = ggml_init(p);
+        if (!model.ctx_override) throw std::runtime_error("conditioning context failed");
+        auto* t = ggml_new_tensor_1d(model.ctx_override, GGML_TYPE_I32, (int64_t)cond.size());
+        model.buffer_override = ggml_backend_alloc_ctx_tensors(model.ctx_override, model.backend);
+        if (!model.buffer_override) throw std::runtime_error("conditioning buffer failed");
+        ggml_backend_tensor_set(t, cond.data(), 0, cond.size() * sizeof(int32_t));
+        model.builtin_cond_prompt_tokens = t;
+        model.hparams.cond_prompt_len = (int32_t)cond.size();
         if (!compute_prompt_feat_native(opts.reference_audio, opts.s3gen_gguf_path, prompt_feat, prompt_rows, false)) throw std::runtime_error("prompt feature failed");
         if (!compute_embedding_native(opts.reference_audio, opts.s3gen_gguf_path, embedding, false)) throw std::runtime_error("CAMPPlus failed");
         if (prompt_token.empty() || prompt_feat.empty() || embedding.empty()) throw std::runtime_error("voice conditioning empty");
