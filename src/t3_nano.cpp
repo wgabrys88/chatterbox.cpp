@@ -34,7 +34,7 @@ ggml_backend_t init_backend() {
     if (!b) throw std::runtime_error("Vulkan backend init failed");
     return b;
 }
-bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx) {
+bool load_model_gguf(const std::string & path, chatterbox_model & model) {
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gguf_params = {  false,  &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
@@ -48,13 +48,10 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
         hp.speaker_embed_size = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_SPEAKER_EMBED));
         hp.cond_prompt_len    = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_COND_PROMPT_LEN));
         hp.eps                = gguf_get_val_f32(gguf_ctx, require_key(gguf_ctx, KEY_LAYER_NORM_EPS));
-        hp.n_ctx   = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_CTX));
         hp.n_embd  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_EMBD));
         hp.n_head  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_HEAD));
         hp.n_layer = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_LAYER));
-        if (requested_ctx <= 0) throw std::runtime_error("context required");
         if (!model.backend) throw std::runtime_error("Vulkan backend required");
-        hp.n_ctx = requested_ctx;
         const int64_t num_tensors = gguf_get_n_tensors(gguf_ctx);
         ggml_init_params params = { ggml_tensor_overhead() * (size_t) num_tensors, nullptr, true };
         model.ctx_w = ggml_init(params);
@@ -72,6 +69,9 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
             ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
         }
         model.wpe              = require_tensor(model, "model/wpe");
+        if (model.wpe->ne[0] != hp.n_embd) throw std::runtime_error("wpe n_embd mismatch");
+        hp.n_ctx = (int32_t) model.wpe->ne[1];
+        if (hp.n_ctx <= 0) throw std::runtime_error("wpe context is empty");
         model.ln_f_g           = require_tensor(model, "model/ln_f/g");
         model.ln_f_b           = require_tensor(model, "model/ln_f/b");
         model.text_emb         = require_tensor(model, "chatterbox/text_emb");

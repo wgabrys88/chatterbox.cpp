@@ -87,7 +87,6 @@ void emit_server_config() {
         + ",\"repeat_last_n\":" + std::to_string(REPEAT_LAST_N)
         + ",\"repeat_stop_consecutive\":" + std::to_string(REPEAT_STOP)
         + ",\"max_tokens\":" + std::to_string(N_PREDICT)
-        + ",\"context\":" + std::to_string(N_CTX)
         + ",\"cfm_steps\":" + std::to_string(CFM_STEPS)
         + "}");
 }

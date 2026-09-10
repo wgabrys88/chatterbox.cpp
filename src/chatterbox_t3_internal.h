@@ -35,7 +35,6 @@ constexpr const char * KEY_STOP_SPEECH       = "chatterbox.stop_speech_token";
 constexpr const char * KEY_SPEAKER_EMBED     = "chatterbox.speaker_embed_size";
 constexpr const char * KEY_LAYER_NORM_EPS    = "chatterbox.layer_norm_eps";
 constexpr const char * KEY_COND_PROMPT_LEN   = "chatterbox.cond_prompt_length";
-constexpr const char * KEY_N_CTX             = "chatterbox.n_ctx";
 constexpr const char * KEY_N_EMBD            = "chatterbox.n_embd";
 constexpr const char * KEY_N_HEAD            = "chatterbox.n_head";
 constexpr const char * KEY_N_LAYER           = "chatterbox.n_layer";
@@ -102,8 +101,7 @@ struct chatterbox_sampling_params {
 ggml_backend_t init_backend();
 bool load_model_gguf(
     const std::string & path,
-    chatterbox_model &  model,
-    int                 requested_ctx);
+    chatterbox_model &  model);
 bool eval_prompt(
     const chatterbox_model &     model,
     ggml_gallocr_t               allocr,

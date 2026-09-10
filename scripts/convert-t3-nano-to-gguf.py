@@ -13,7 +13,6 @@ SPEECH_VOCAB_SIZE = 6563
 START_SPEECH_TOKEN = 6561
 STOP_SPEECH_TOKEN = 6562
 SPEAKER_EMBED_SIZE = 256
-N_CTX = 8196
 LAYER_NORM_EPS = 1e-5
 LAYER_RE = re.compile(r"^tfmr\.h\.(\d+)\.(.+)$")
 QUANT_CHOICES = ["f16", "q8_0", "q5_0", "q4_0"]
@@ -132,6 +131,7 @@ def main() -> None:
     conds = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)
     layer_ids = {int(m.group(1)) for name in state if (m := LAYER_RE.match(name))}
     n_embd = int(state["tfmr.ln_f.weight"].shape[0])
+    n_ctx = int(state["tfmr.wpe.weight"].shape[0])
     n_layer = max(layer_ids) + 1
     if n_embd % 64:
         raise SystemExit(f"n_embd {n_embd} is not divisible by head dim 64")
@@ -139,12 +139,12 @@ def main() -> None:
     writer = gguf.GGUFWriter(str(args.out), "chatterbox")
     writer.add_name("Chatterbox Nano T3")
     writer.add_description("Chatterbox Nano text-to-speech token generator for ggml.")
-    writer.add_context_length(N_CTX)
+    writer.add_context_length(n_ctx)
     writer.add_embedding_length(n_embd)
     writer.add_block_count(n_layer)
     writer.add_head_count(n_head)
     writer.add_vocab_size(TEXT_VOCAB_SIZE)
-    writer.add_uint32("chatterbox.n_ctx", N_CTX)
+    writer.add_uint32("chatterbox.n_ctx", n_ctx)
     writer.add_uint32("chatterbox.n_embd", n_embd)
     writer.add_uint32("chatterbox.n_head", n_head)
     writer.add_uint32("chatterbox.n_layer", n_layer)

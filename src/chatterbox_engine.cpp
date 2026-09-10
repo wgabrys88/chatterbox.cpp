@@ -82,7 +82,7 @@ struct Engine::Impl {
         ggml_time_init();
         ggml_log_set(chatterbox_log_cb, nullptr);
         model.backend = init_backend();
-        if (!load_model_gguf(opts.t3_gguf_path, model, N_CTX)) throw std::runtime_error("T3 load failed");
+        if (!load_model_gguf(opts.t3_gguf_path, model)) throw std::runtime_error("T3 load failed");
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!allocr) throw std::runtime_error("T3 allocator failed");
         bake_voice();
