@@ -1,5 +1,5 @@
 #include "s3gen_pipeline.h"
-#include "tts-cpp/chatterbox/nano.h"
+#include "tts-cpp/chatterbox/turbo.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"

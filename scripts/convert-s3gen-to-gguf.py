@@ -52,7 +52,17 @@ def export_conformer_block(writer, state, prefix, gguf_prefix):
 def main():
     ckpt_dir, out = Path(sys.argv[1]), Path(sys.argv[2])
     out.parent.mkdir(parents=True, exist_ok=True)
-    state = expand_weight_norm(load_file(ckpt_dir / "s3gen_meanflow.safetensors"))
+    raw = load_file(ckpt_dir / "s3gen_meanflow.safetensors")
+    allowed = ("flow.", "mel2wav.", "speaker_encoder.", "tokenizer.")
+    for name in sorted(raw):
+        print(f"{name}\t{tuple(raw[name].shape)}", flush=True)
+    unknown = [name for name in raw if not name.startswith(allowed)]
+    if unknown:
+        print("STOP unknown s3gen keys:", file=sys.stderr)
+        for name in unknown:
+            print(f"  {name}\t{tuple(raw[name].shape)}", file=sys.stderr)
+        raise SystemExit("s3gen meanflow keys differ")
+    state = expand_weight_norm(raw)
     gen = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)["gen"]
     writer = gguf.GGUFWriter(str(out), "chatterbox-s3gen")
     writer.add_uint32("s3gen.speech_vocab_size", 6561)

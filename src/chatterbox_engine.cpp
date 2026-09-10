@@ -1,5 +1,5 @@
 #include "tts-cpp/chatterbox/engine.h"
-#include "tts-cpp/chatterbox/nano.h"
+#include "tts-cpp/chatterbox/turbo.h"
 #include <memory>
 #include <random>
 #include <stdexcept>

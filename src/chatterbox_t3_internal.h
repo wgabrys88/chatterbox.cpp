@@ -9,7 +9,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
-#include "tts-cpp/chatterbox/nano.h"
+#include "tts-cpp/chatterbox/turbo.h"
 namespace tts_cpp::chatterbox::detail {
 constexpr int CHBX_MAX_NODES = 8192;
 inline void apply_speech_repeat_penalty(float * scores, int vocab,
