@@ -185,10 +185,11 @@ static ggml_tensor * find_tensor(const model_ctx & m, const std::string & name) 
 static ggml_tensor * conv1d_f32(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor * input,
                                 int stride, int padding, int dilation) {
     ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
-    ggml_tensor * result = ggml_mul_mat(ctx,
-        ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
-        ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]));
-    return ggml_reshape_3d(ctx, result, im2col->ne[1], kernel->ne[2], im2col->ne[2]);
+    // im2col is [K*Cin, T, B]. Preserve B through matmul; flattening T*B
+    // before reshaping to [T, Cout, B] interleaves CFG batches and channels.
+    ggml_tensor * k_flat = ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]);
+    ggml_tensor * result = ggml_mul_mat(ctx, k_flat, im2col); // [Cout, T, B]
+    return ggml_cont(ctx, ggml_permute(ctx, result, 1, 0, 2, 3));
 }
 static ggml_tensor * conv_transpose_1d_f32(ggml_context * ctx, ggml_tensor * kernel,
                                            ggml_tensor * input, int stride, int padding) {
@@ -1004,16 +1005,15 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
     if (!g_s3gen_cache_entry) throw std::runtime_error("S3Gen not loaded");
     const int output_tokens = (int)speech_tokens.size();
     constexpr int sr = 24000;
-    constexpr int pre_lookahead_len = 3;
     const int seed = tts_cpp::chatterbox::SEED;
     std::vector<int32_t> padded;
     for (int32_t token : speech_tokens) if (token >= 0 && token < 6561) padded.push_back(token);
-    padded.insert(padded.end(), pre_lookahead_len, tts_cpp::chatterbox::SILENCE_TOKEN);
     model_ctx& m = *g_s3gen_cache_entry->m;
     const int D = 512;
     const int MEL = 80;
     int n_prompt = (int)m.prompt_token.size();
     int n_total = n_prompt + (int)padded.size();
+    if (n_total <= 0) throw std::runtime_error("S3Gen empty tokens");
     std::vector<int32_t> flow_tokens(n_total);
     std::memcpy(flow_tokens.data(), m.prompt_token.data(), n_prompt * sizeof(int32_t));
     std::memcpy(flow_tokens.data() + n_prompt, padded.data(), padded.size() * sizeof(int32_t));
@@ -1022,8 +1022,8 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
     for (int i = 0; i < n_total; ++i)
         std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)flow_tokens[i] * D, D * sizeof(float));
     mu_T = run_encoder(m, input_embed, n_total, D);
-    int T_mu = 2 * n_total - 2 * pre_lookahead_len;
-    mu_T.resize((size_t)T_mu * MEL);
+    int T_mu = 2 * n_total;
+    if ((int)mu_T.size() != T_mu * MEL) throw std::runtime_error("S3Gen encoder length");
     std::vector<float> mu(T_mu * MEL);
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mu; ++t)
@@ -1104,6 +1104,15 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
     int T_stft = (int)(s_stft.size() / 18);
     auto wav = run_hift_decode(m, mel, T_mel, s_stft, T_stft);
     if ((int)wav.size() != output_tokens * kSamplesPerToken) throw std::runtime_error("S3Gen waveform range mismatch");
+    const int n_trim = sr / 50;
+    const int fade_n = 2 * n_trim;
+    if ((int)wav.size() < fade_n) throw std::runtime_error("S3Gen trim_fade");
+    for (int i = 0; i < n_trim; ++i) wav[(size_t)i] = 0.0f;
+    for (int i = 0; i < n_trim; ++i) {
+        const float u = (n_trim == 1) ? 0.0f : (float)i / (float)(n_trim - 1);
+        const float w = (std::cos((float)M_PI * (1.0f - u)) + 1.0f) * 0.5f;
+        wav[(size_t)(n_trim + i)] *= w;
+    }
     return wav;
 }
 void s3gen_preload(const std::string& path, ggml_backend_t backend) {
