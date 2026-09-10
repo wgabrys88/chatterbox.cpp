@@ -41,10 +41,10 @@ inline void t3_text_align_layout(t3_text_align_state & st, int cond_prompt_len, 
 inline void t3_text_align_advance(t3_text_align_state & st, int32_t token) {
     st.speech_since++;
     if (st.text_cursor >= st.n_text - 1) return;
-    const bool min_met = st.speech_since >= T3_ALIGN_MIN_SPEECH;
     const bool force = st.speech_since >= T3_ALIGN_MAX_SPEECH;
     const bool on_pause = token == T3_SILENCE_TOKEN && st.speech_since >= 4;
-    if (min_met && (force || on_pause)) {
+    const bool min_met = st.speech_since >= T3_ALIGN_MIN_SPEECH;
+    if (force || min_met || on_pause) {
         st.text_cursor++;
         st.speech_since = 0;
     }
