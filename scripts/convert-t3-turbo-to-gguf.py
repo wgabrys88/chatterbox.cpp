@@ -6,26 +6,21 @@ from pathlib import Path
 import gguf
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
-REPOS = {"nano": "ResembleAI/chatterbox-nano", "turbo": "ResembleAI/chatterbox-turbo"}
-ASSETS = ["conds.pt", "ve.safetensors", "vocab.json", "merges.txt", "added_tokens.json", "tokenizer_config.json", "special_tokens_map.json"]
+NANO_REPO = "ResembleAI/chatterbox-nano"
 TEXT_VOCAB_SIZE = 50276
 SPEECH_VOCAB_SIZE = 6563
 START_SPEECH_TOKEN = 6561
 STOP_SPEECH_TOKEN = 6562
 SPEAKER_EMBED_SIZE = 256
 N_CTX = 8196
-N_LAYER = 24
 LAYER_NORM_EPS = 1e-5
 LAYER_RE = re.compile(r"^tfmr\.h\.(\d+)\.(.+)$")
 QUANT_CHOICES = ["f16", "q8_0", "q5_0", "q4_0"]
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert Chatterbox Turbo T3 weights to GGUF.")
-    parser.add_argument("--ckpt-dir", type=Path, help="Local checkpoint dir (downloads from HF if omitted).")
-    parser.add_argument("--model", choices=["auto", "nano", "turbo"], default="auto")
-    parser.add_argument("--out", type=Path, default=Path("models/chatterbox-t3-turbo.gguf"), help="Output GGUF path.")
-    parser.add_argument("--hf-token", default=None, help="Optional Hugging Face token.")
+    parser = argparse.ArgumentParser(description="Convert Chatterbox Nano T3 weights to GGUF.")
+    parser.add_argument("--ckpt-dir", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--quant", choices=QUANT_CHOICES, default="f16",
                         help=("Weight dtype for attention + MLP + speech_head projections. "
                               "f16 (default, ~730 MB), q8_0 (~385 MB), q5_0 (~250 MB), "
@@ -137,29 +132,21 @@ def map_tensor_name(name: str):
     return fmt.format(layer_idx), dtype, transpose
 def main() -> None:
     args = parse_args()
-    model = args.model
-    if args.ckpt_dir:
-        ckpt_dir = args.ckpt_dir
-        if model == "auto": model = "nano" if (ckpt_dir / "t3_nano_v1.safetensors").exists() else "turbo"
-    else:
-        if model == "auto": model = "turbo"
-        ckpt = f"t3_{model}_v1.safetensors"
-        ckpt_dir = Path(snapshot_download(repo_id=REPOS[model], token=args.hf_token, allow_patterns=[ckpt, *ASSETS]))
+    ckpt_dir = args.ckpt_dir
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    ckpt = ckpt_dir / f"t3_{model}_v1.safetensors"
-    print(f"Loading {model} checkpoint from {ckpt_dir}")
+    ckpt = ckpt_dir / "t3_nano_v1.safetensors"
+    print(f"Loading nano checkpoint from {ckpt_dir}")
     state = load_file(ckpt)
     conds = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)
     layer_ids = {int(m.group(1)) for name in state if (m := LAYER_RE.match(name))}
     n_embd = int(state["tfmr.ln_f.weight"].shape[0])
-    n_layer = max(layer_ids) + 1 if layer_ids else N_LAYER
+    n_layer = max(layer_ids) + 1
     if n_embd % 64:
         raise SystemExit(f"n_embd {n_embd} is not divisible by head dim 64")
     n_head = n_embd // 64
     writer = gguf.GGUFWriter(str(args.out), "chatterbox")
-    label = model.capitalize()
-    writer.add_name(f"Chatterbox {label} T3")
-    writer.add_description(f"Chatterbox {label} text-to-speech token generator for ggml.")
+    writer.add_name("Chatterbox Nano T3")
+    writer.add_description("Chatterbox Nano text-to-speech token generator for ggml.")
     writer.add_context_length(N_CTX)
     writer.add_embedding_length(n_embd)
     writer.add_block_count(n_layer)
@@ -176,7 +163,7 @@ def main() -> None:
     writer.add_uint32("chatterbox.speaker_embed_size", SPEAKER_EMBED_SIZE)
     writer.add_float32("chatterbox.layer_norm_eps", LAYER_NORM_EPS)
     writer.add_string("chatterbox.variant", "t3_turbo")
-    writer.add_string("chatterbox.reference_repo", REPOS[model])
+    writer.add_string("chatterbox.reference_repo", NANO_REPO)
     tok_tokens, tok_types, tok_merges = load_tokenizer_assets(ckpt_dir)
     writer.add_tokenizer_model("gpt2")
     writer.add_token_list(tok_tokens)

@@ -10,7 +10,6 @@ struct EngineOptions {
     std::string t3_gguf_path;
     std::string s3gen_gguf_path;
     std::string reference_audio;
-    std::string language;
     int n_gpu_layers = 0;
     int n_threads = 0;
     int seed = 42;
@@ -22,8 +21,6 @@ struct EngineOptions {
     float temperature = .8f;
     float repeat_penalty = 1.2f;
     int repeat_stop_consecutive = 16;
-    float cfg_weight = .5f;
-    float exaggeration = .5f;
     int cfm_steps = 0;
     bool fastconv = false;
     std::string audit_dir;

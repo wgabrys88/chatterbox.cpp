@@ -1,6 +1,5 @@
 #include "tts-cpp/chatterbox/engine.h"
 #include "tts-cpp/chatterbox/log.h"
-#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -15,9 +14,6 @@
 #include <vector>
 #include "chatterbox_t3_internal.h"
 #include "gpt2_bpe.h"
-#ifdef TTS_CPP_MTL
-#include "mtl_tokenizer.h"
-#endif
 #include "s3gen_pipeline.h"
 #include "voice_encoder.h"
 #include "voice_features.h"
@@ -64,11 +60,6 @@ bool consecutive_repeat(const std::vector<int32_t>& generated, int32_t token, in
     }
     return true;
 }
-int threads(int n) {
-    if (n > 0) return n;
-    const int hw = (int)std::thread::hardware_concurrency();
-    return hw > 0 ? std::min(hw, 4) : 4;
-}
 void join(std::thread& t) { if (t.joinable()) t.join(); }
 void ledger_append(const std::string& dir, const char* name, const std::string& line) {
     if (dir.empty()) return;
@@ -86,9 +77,6 @@ struct Engine::Impl {
     int prompt_rows = 0;
     std::vector<float> embedding;
     std::vector<int32_t> prompt_token;
-#ifdef TTS_CPP_MTL
-    std::unique_ptr<mtl_tokenizer> mtl_tok;
-#endif
     s3gen_piece_state acoustic;
     std::vector<int32_t> speech_history;
     std::string piece_text, piece_stop;
@@ -138,19 +126,6 @@ struct Engine::Impl {
         g_log_verbose = 0;
         ggml_log_set(chatterbox_log_cb, nullptr);
         if (!load_model_gguf(opts.t3_gguf_path, model, opts.n_ctx, opts.n_gpu_layers)) throw std::runtime_error("T3 load failed");
-        if (model.hparams.variant != CHBX_VARIANT_TURBO && model.hparams.variant != CHBX_VARIANT_MTL)
-            throw std::runtime_error("unsupported T3 variant");
-#ifndef TTS_CPP_MTL
-        if (model.hparams.variant == CHBX_VARIANT_MTL) throw std::runtime_error("multilingual T3 was not compiled");
-#else
-        if (model.hparams.variant == CHBX_VARIANT_MTL) {
-            mtl_tok = std::make_unique<mtl_tokenizer>();
-            if (model.mtl_tokenizer_json.empty() || !mtl_tok->load_from_json(model.mtl_tokenizer_json))
-                throw std::runtime_error("MTL tokenizer missing");
-            if (opts.language == "zh" && (model.mtl_cangjie_json.empty() || !mtl_tok->load_cangjie_json(model.mtl_cangjie_json)))
-                throw std::runtime_error("MTL Cangjie mapping missing or invalid");
-        }
-#endif
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!allocr) throw std::runtime_error("T3 allocator failed");
         preload = std::thread([this] { s3gen_preload(opts.s3gen_gguf_path, opts.n_gpu_layers, opts.fastconv); });
@@ -165,20 +140,17 @@ struct Engine::Impl {
         free_model();
     }
     void free_model() {
-        if (model.buffer_stack || model.ctx_stack) t3_stack_unregister(model.buffer_stack, model.ctx_stack);
         if (model.buffer_w) ggml_backend_buffer_free(model.buffer_w);
         if (model.buffer_kv) ggml_backend_buffer_free(model.buffer_kv);
-        if (model.buffer_stack) ggml_backend_buffer_free(model.buffer_stack);
         if (model.buffer_override) ggml_backend_buffer_free(model.buffer_override);
         if (model.backend) ggml_backend_free(model.backend);
         if (model.ctx_w) ggml_free(model.ctx_w);
         if (model.ctx_kv) ggml_free(model.ctx_kv);
-        if (model.ctx_stack) ggml_free(model.ctx_stack);
         if (model.ctx_override) ggml_free(model.ctx_override);
         model = {};
     }
     void bake_voice() {
-        const int n_threads = threads(opts.n_threads);
+        const int n_threads = opts.n_threads;
         voice_encoder_weights ve;
         if (!voice_encoder_load(opts.t3_gguf_path, ve)) throw std::runtime_error("VoiceEncoder weights missing");
         std::vector<float> wav, speaker;
@@ -215,7 +187,7 @@ struct Engine::Impl {
         if (session_index >= 0) { synthesis_context.valid = true; synthesis_context.piece = external_piece; }
         tts_context_scope context_scope(synthesis_context);
         const auto started = std::chrono::steady_clock::now();
-        const int n_threads = threads(opts.n_threads);
+        const int n_threads = opts.n_threads;
         std::mt19937 rng(opts.seed);
         chatterbox_sampling_params sp;
         sp.top_k = opts.top_k;
@@ -223,103 +195,52 @@ struct Engine::Impl {
         sp.min_p = opts.min_p;
         sp.temp = opts.temperature;
         sp.repeat_penalty = opts.repeat_penalty;
-        sp.cfg_weight = opts.cfg_weight;
 
-        std::vector<int32_t> text_tokens;
-#ifdef TTS_CPP_MTL
-        if (model.hparams.variant == CHBX_VARIANT_MTL) {
-            if (!mtl_tok) throw std::runtime_error("MTL tokenizer missing");
-            text_tokens = mtl_tok->encode(text, opts.language);
-            text_tokens.insert(text_tokens.begin(), model.hparams.start_text_token);
-            text_tokens.push_back(model.hparams.stop_text_token);
-        } else
-#endif
-        {
-            if (model.tok_tokens.empty()) throw std::runtime_error("Turbo tokenizer missing");
-            gpt2_bpe bpe;
-            bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
-            text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
-        }
-        if (text_tokens.empty()) throw std::runtime_error("empty T3 text tokens");
+        gpt2_bpe bpe;
+        bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
+        std::vector<int32_t> text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
         emit_t3_text_tokens(text_tokens);
 
-        int n_past = 0, speech_pos = 1;
-        int32_t token = 0, pending_mtl = -1;
+        int n_past = 0;
+        int32_t token = 0;
         bool repeat_stopped = false;
         std::vector<int32_t> out, tokens;
         out.reserve((size_t)opts.n_predict + 1);
         tokens.reserve((size_t)opts.n_predict);
         const int32_t stop = model.hparams.stop_speech_token;
+        const int n_text = (int)text_tokens.size();
         auto hold_eos = [&](std::vector<float> & logits) {
-            if ((int)out.size() < (int)text_tokens.size() * 4
-                && stop >= 0 && stop < (int)logits.size())
+            if ((int)out.size() < n_text * 4)
                 logits[(size_t)stop] = -INFINITY;
         };
-        auto publish = [&](int32_t value) {
-            if (value < 0 || value >= model.hparams.start_speech_token || value == stop) return;
-#ifdef TTS_CPP_MTL
-            if (model.hparams.variant == CHBX_VARIANT_MTL) {
-                if (pending_mtl >= 0) tokens.push_back(pending_mtl);
-                pending_mtl = value;
-                return;
-            }
-#endif
-            tokens.push_back(value);
-        };
 
-#ifdef TTS_CPP_MTL
-        if (model.hparams.variant == CHBX_VARIANT_MTL) {
-            std::vector<float> logits_c, logits_u;
-            if (!eval_prompt_mtl(model, allocr, n_threads, text_tokens, opts.exaggeration, logits_c, logits_u, n_past))
-                throw std::runtime_error("MTL prompt failed");
-            token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, stop);
-        } else
-#endif
-        {
-            std::vector<float> logits;
-            if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past))
-                throw std::runtime_error("Turbo prompt failed");
-            hold_eos(logits);
-            token = sample_next_token_ex(logits, out, sp, rng);
-        }
+        std::vector<float> logits;
+        if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past))
+            throw std::runtime_error("T3 prompt failed");
+        hold_eos(logits);
+        token = sample_next_token_ex(logits, out, sp, rng);
         out.push_back(token);
-        publish(token);
+        if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
 
         for (int step = 1; step < opts.n_predict && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
-#ifdef TTS_CPP_MTL
-            if (model.hparams.variant == CHBX_VARIANT_MTL) {
-                std::vector<float> logits_c, logits_u;
-                if (!eval_step_mtl(model, allocr, n_threads, n_past++, speech_pos++, token, logits_c, logits_u))
-                    throw std::runtime_error("MTL step failed");
-                token = sample_next_token_mtl(logits_c, logits_u, out, sp, rng, stop);
-            } else
-#endif
-            {
-                std::vector<float> logits;
-                if (!eval_step(model, allocr, n_threads, n_past++, token, logits))
-                    throw std::runtime_error("Turbo step failed");
-                hold_eos(logits);
-                token = sample_next_token_ex(logits, out, sp, rng);
-            }
+            if (!eval_step(model, allocr, n_threads, n_past++, token, logits))
+                throw std::runtime_error("T3 step failed");
+            hold_eos(logits);
+            token = sample_next_token_ex(logits, out, sp, rng);
             if (opts.repeat_stop_consecutive >= 2 && consecutive_repeat(out, token, opts.repeat_stop_consecutive)) {
                 repeat_stopped = true;
                 token = stop;
             }
             out.push_back(token);
-            publish(token);
+            if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
         }
 
         if (token != stop) throw std::runtime_error("T3 stopped without EOS");
-#ifdef TTS_CPP_MTL
-        if (tokens.empty() && pending_mtl >= 0) tokens.push_back(pending_mtl);
-#endif
         piece_text = text;
         piece_text_tokens = std::move(text_tokens);
         piece_speech = tokens;
         piece_stop = repeat_stopped ? "repeat" : "eos";
         piece_t3_ms = (int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + .5);
-        (void)speech_pos;
-        (void)external_piece;
         return tokens;
     }
     void emit_piece_ledger(std::uint32_t response, std::uint32_t piece, const std::vector<int32_t>& neu) {
@@ -362,7 +283,7 @@ struct Engine::Impl {
         s3gen_synthesize_opts s;
         s.s3gen_gguf_path = opts.s3gen_gguf_path;
         s.seed = opts.seed;
-        s.n_threads = threads(opts.n_threads);
+        s.n_threads = opts.n_threads;
         s.n_gpu_layers = opts.n_gpu_layers;
         s.fastconv = opts.fastconv;
         s.cfm_steps = opts.cfm_steps;

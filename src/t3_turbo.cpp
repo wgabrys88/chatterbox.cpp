@@ -2,11 +2,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "gguf.h"
-#ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
-#elif defined(GGML_USE_CUDA)
-#include "ggml-cuda.h"
-#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -35,51 +31,17 @@ static ggml_tensor * require_tensor(const chatterbox_model & m, const char * nam
 }
 ggml_backend_t init_backend(int n_gpu_layers) {
     if (n_gpu_layers <= 0) throw std::runtime_error("GPU layers required");
-#ifdef GGML_USE_VULKAN
     auto * b = ggml_backend_vk_init(0);
     if (!b) throw std::runtime_error("Vulkan backend init failed");
-#elif defined(GGML_USE_CUDA)
-    auto * b = ggml_backend_cuda_init(0);
-    if (!b) throw std::runtime_error("CUDA backend init failed");
-#else
-#error "No Chatterbox GPU backend selected"
-#endif
     return b;
 }
 bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
-    {
-        gguf_init_params peek_params = {  true,  nullptr };
-        gguf_context * peek_ctx = gguf_init_from_file(path.c_str(), peek_params);
-        if (peek_ctx) {
-            std::string variant = "t3_turbo";
-            const int64_t vk = gguf_find_key(peek_ctx, KEY_VARIANT);
-            if (vk >= 0 && gguf_get_kv_type(peek_ctx, vk) == GGUF_TYPE_STRING) {
-                const char * v = gguf_get_val_str(peek_ctx, vk);
-                if (v) variant = v;
-            } else if (vk >= 0) {
-                fprintf(stderr, "%s: %s has unexpected GGUF type %d (expected STRING); refusing to load\n",
-                        __func__, KEY_VARIANT, (int) gguf_get_kv_type(peek_ctx, vk));
-                gguf_free(peek_ctx);
-                return false;
-            }
-            gguf_free(peek_ctx);
-            if (variant == "t3_mtl") {
-#ifdef TTS_CPP_MTL
-                return load_model_gguf_mtl(path, model, requested_ctx, n_gpu_layers);
-#else
-                fprintf(stderr, "%s: multilingual T3 was not compiled (TTS_CPP_MTL=OFF)\n", __func__);
-                return false;
-#endif
-            }
-        }
-    }
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gguf_params = {  false,  &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
     if (!gguf_ctx) { fprintf(stderr, "%s: failed to open '%s'\n", __func__, path.c_str()); return false; }
     try {
         auto & hp = model.hparams;
-        hp.variant = CHBX_VARIANT_TURBO;
         hp.n_text_vocab       = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_TEXT_VOCAB_SIZE));
         hp.n_speech_vocab     = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_SPEECH_VOCAB_SIZE));
         hp.start_speech_token = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_START_SPEECH));
@@ -150,25 +112,16 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
                 ggml_backend_buffer_get_size(model.buffer_w) / (1024.0*1024.0),
                 ggml_backend_buffer_get_size(model.buffer_kv) / (1024.0*1024.0));
         {
-            const int64_t tok_kid = gguf_find_key(gguf_ctx, "tokenizer.ggml.tokens");
-            const int64_t mer_kid = gguf_find_key(gguf_ctx, "tokenizer.ggml.merges");
-            if (tok_kid >= 0 && mer_kid >= 0) {
-                const size_t n_tok = gguf_get_arr_n(gguf_ctx, tok_kid);
-                const size_t n_mer = gguf_get_arr_n(gguf_ctx, mer_kid);
-                model.tok_tokens.reserve(n_tok);
-                for (size_t i = 0; i < n_tok; ++i) {
-                    model.tok_tokens.emplace_back(gguf_get_arr_str(gguf_ctx, tok_kid, i));
-                }
-                model.tok_merges.reserve(n_mer);
-                for (size_t i = 0; i < n_mer; ++i) {
-                    model.tok_merges.emplace_back(gguf_get_arr_str(gguf_ctx, mer_kid, i));
-                }
-                if (g_log_verbose) fprintf(stderr, "%s: tokenizer embedded (%zu tokens, %zu merges)\n",
-                        __func__, n_tok, n_mer);
-            } else {
-                fprintf(stderr, "%s: no embedded tokenizer; --tokenizer-dir will be required for --text\n",
-                        __func__);
-            }
+            const int64_t tok_kid = require_key(gguf_ctx, "tokenizer.ggml.tokens");
+            const int64_t mer_kid = require_key(gguf_ctx, "tokenizer.ggml.merges");
+            const size_t n_tok = gguf_get_arr_n(gguf_ctx, tok_kid);
+            const size_t n_mer = gguf_get_arr_n(gguf_ctx, mer_kid);
+            model.tok_tokens.reserve(n_tok);
+            for (size_t i = 0; i < n_tok; ++i)
+                model.tok_tokens.emplace_back(gguf_get_arr_str(gguf_ctx, tok_kid, i));
+            model.tok_merges.reserve(n_mer);
+            for (size_t i = 0; i < n_mer; ++i)
+                model.tok_merges.emplace_back(gguf_get_arr_str(gguf_ctx, mer_kid, i));
         }
     } catch (const std::exception & e) {
         fprintf(stderr, "%s: %s\n", __func__, e.what());

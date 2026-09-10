@@ -3,11 +3,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "gguf.h"
-#ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
-#elif defined(GGML_USE_CUDA)
-#include "ggml-cuda.h"
-#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -72,8 +68,8 @@ struct time_mixed_cache {
     ~time_mixed_cache() { reset(); }
 };
 struct cfm_estimator_cache {
-    ggml_backend_t backend = nullptr; int T = -1; bool b2 = false; ggml_context* ctx = nullptr; ggml_cgraph* gf = nullptr; ggml_gallocr_t allocr = nullptr; std::vector<uint8_t> buf;
-    void reset() { if (allocr) ggml_gallocr_free(allocr); if (ctx) ggml_free(ctx); allocr=nullptr; ctx=nullptr; gf=nullptr; backend=nullptr; T=-1; b2=false; }
+    ggml_backend_t backend = nullptr; int T = -1; ggml_context* ctx = nullptr; ggml_cgraph* gf = nullptr; ggml_gallocr_t allocr = nullptr; std::vector<uint8_t> buf;
+    void reset() { if (allocr) ggml_gallocr_free(allocr); if (ctx) ggml_free(ctx); allocr=nullptr; ctx=nullptr; gf=nullptr; backend=nullptr; T=-1; }
     ~cfm_estimator_cache() { reset(); }
 };
 struct model_ctx {
@@ -81,9 +77,6 @@ struct model_ctx {
     ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
-    bool meanflow = true;
-    int n_timesteps = 2;
-    float cfg_rate = 0.0f;
     std::vector<float> input_embedding, spk_affine_w, spk_affine_b, hift_linear_w;
     std::map<std::string, std::vector<float>> inv_alpha;
     float hift_linear_b = 0.0f;
@@ -94,22 +87,8 @@ struct model_ctx {
 };
 static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
     if (n_gpu_layers <= 0) throw std::runtime_error("GPU layers required");
-    char desc[256] = {0};
-#ifdef GGML_USE_VULKAN
     auto * b = ggml_backend_vk_init(0);
     if (!b) throw std::runtime_error("Vulkan S3Gen backend init failed");
-    ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
-    const char * backend_name = "Vulkan";
-#elif defined(GGML_USE_CUDA)
-    auto * b = ggml_backend_cuda_init(0);
-    if (!b) throw std::runtime_error("CUDA S3Gen backend init failed");
-    ggml_backend_cuda_get_device_description(0, desc, sizeof(desc));
-    const char * backend_name = "CUDA";
-#else
-#error "No Chatterbox GPU backend selected"
-#endif
-    (void)desc;
-    (void)backend_name;
     return b;
 }
 static model_ctx load_s3gen_gguf(const std::string&, int, bool);
@@ -182,12 +161,6 @@ static model_ctx load_s3gen_gguf(const std::string& path, int n_gpu_layers, bool
             s3_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
         }
     }
-    int64_t k = gguf_find_key(g, "s3gen.meanflow");
-    if (k >= 0) m.meanflow = gguf_get_val_bool(g, k);
-    k = gguf_find_key(g, "s3gen.n_timesteps");
-    m.n_timesteps = k >= 0 ? (int)gguf_get_val_u32(g, k) : (m.meanflow ? 2 : 10);
-    k = gguf_find_key(g, "s3gen.cfg_rate");
-    m.cfg_rate = k >= 0 ? gguf_get_val_f32(g, k) : (m.meanflow ? 0.0f : 0.7f);
     auto cache_f32 = [&](const char* name, std::vector<float>& out) {
         auto it = m.tensors.find(name); if (it == m.tensors.end()) throw std::runtime_error(std::string("tensor not found: ") + name);
         if (it->second->type != GGML_TYPE_F32) throw std::runtime_error(std::string("immutable S3Gen tensor must be F32: ") + name);
@@ -222,13 +195,6 @@ static ggml_tensor * conv1d_f32(ggml_context * ctx, ggml_tensor * kernel, ggml_t
         ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
         ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]));
     return ggml_reshape_3d(ctx, result, im2col->ne[1], kernel->ne[2], im2col->ne[2]);
-}
-static ggml_tensor * conv1d_f32_b(ggml_context * ctx, ggml_tensor * kernel, ggml_tensor * input,
-                                  int stride, int padding, int dilation) {
-    ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
-    ggml_tensor * k_flat = ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]);
-    ggml_tensor * prod = ggml_mul_mat(ctx, k_flat, im2col);
-    return ggml_cont(ctx, ggml_permute(ctx, prod, 1, 0, 2, 3));
 }
 static ggml_tensor * conv_transpose_1d_f32(ggml_context * ctx, ggml_tensor * kernel,
                                            ggml_tensor * input, int stride, int padding) {
@@ -587,73 +553,6 @@ static ggml_tensor * cfm_causal_k3(ggml_context * ctx, ggml_tensor * x,
     ggml_tensor * y = conv1d_f32(ctx, w, xp, 1, 0, 1);
     return ggml_add(ctx, y, ggml_reshape_2d(ctx, b, 1, C_out));
 }
-static ggml_tensor * cfm_causal_block_b(ggml_context * ctx, ggml_tensor * x,
-                                        ggml_tensor * conv_w, ggml_tensor * conv_b,
-                                        ggml_tensor * ln_w, ggml_tensor * ln_b, int64_t C_out) {
-    ggml_tensor * xp = zero_pad_dim0(ctx, x, 2, 0);
-    ggml_tensor * y = conv1d_f32_b(ctx, conv_w, xp, 1, 0, 1);
-    y = ggml_add(ctx, y, ggml_reshape_2d(ctx, conv_b, 1, C_out));
-    y = layer_norm_on_channel(ctx, y, ln_w, ln_b);
-    return ggml_mish_fn(ctx, y);
-}
-static ggml_tensor * cfm_resnet_b(ggml_context * ctx, const cfm_resnet_w & w,
-                                  ggml_tensor * x, ggml_tensor * t_emb_b, int64_t C_out) {
-    ggml_tensor * h = cfm_causal_block_b(ctx, x, w.b1_conv_w, w.b1_conv_b, w.b1_ln_w, w.b1_ln_b, C_out);
-    ggml_tensor * t_feat = ggml_mish_fn(ctx, t_emb_b);
-    ggml_tensor * t_proj = ggml_add(ctx, ggml_mul_mat(ctx, w.mlp_w, t_feat),
-                                    w.mlp_b);
-    const int64_t B = t_proj->ne[1];
-    h = ggml_add(ctx, h, ggml_reshape_3d(ctx, t_proj, 1, C_out, B));
-    h = cfm_causal_block_b(ctx, h, w.b2_conv_w, w.b2_conv_b, w.b2_ln_w, w.b2_ln_b, C_out);
-    ggml_tensor * res = conv1d_f32_b(ctx, w.res_w, x, 1, 0, 1);
-    res = ggml_add(ctx, res, ggml_reshape_2d(ctx, w.res_b, 1, C_out));
-    return ggml_add(ctx, h, res);
-}
-static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
-                                 ggml_tensor * x, int T, int C, int B,
-                                 bool f16_kv_attn,
-                                 int H = 8, int HD = 64) {
-    int INNER = H * HD;
-    ggml_tensor * nx = layer_norm(ctx, x, w.norm1_w, w.norm1_b);
-    ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);
-    ggml_tensor * k = ggml_mul_mat(ctx, w.to_k, nx);
-    ggml_tensor * v = ggml_mul_mat(ctx, w.to_v, nx);
-    const size_t col_stride   = (size_t) INNER   * sizeof(float);
-    const size_t head_stride  = (size_t) HD      * sizeof(float);
-    const size_t batch_stride = (size_t) INNER * T * sizeof(float);
-    q = ggml_view_4d(ctx, q, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
-    k = ggml_view_4d(ctx, k, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
-    v = ggml_view_4d(ctx, v, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
-    if (f16_kv_attn) {
-        ggml_tensor * k_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HD, T, H, B);
-        ggml_tensor * v_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HD, T, H, B);
-        k = ggml_cpy(ctx, k, k_f16);
-        v = ggml_cpy(ctx, v, v_f16);
-    }
-    ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, nullptr,
-                                                1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
-    ggml_tensor * flat = ggml_reshape_3d(ctx, attn_fa, INNER, T, B);
-    ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, w.to_out_w, flat), w.to_out_b);
-    x = ggml_add(ctx, x, attn_out);
-    ggml_tensor * nx2 = layer_norm(ctx, x, w.norm3_w, w.norm3_b);
-    ggml_tensor * ff = ggml_add(ctx, ggml_mul_mat(ctx, w.ff0_w, nx2), w.ff0_b);
-    ff = ggml_gelu_erf(ctx, ff);
-    ff = ggml_add(ctx, ggml_mul_mat(ctx, w.ff2_w, ff), w.ff2_b);
-    return ggml_add(ctx, x, ff);
-}
-static ggml_tensor * apply_tfm_stack_b(ggml_context * ctx, const cfm_tfm_stack & s,
-                                       ggml_tensor * x, int T, int C, int B,
-                                       bool f16_kv_attn) {
-    ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
-    for (const auto & b : s.blocks) xt = basic_tfm_b(ctx, b, xt, T, C, B, f16_kv_attn);
-    return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
-}
-static ggml_tensor * cfm_causal_k3_b(ggml_context * ctx, ggml_tensor * x,
-                                     ggml_tensor * w, ggml_tensor * b, int C_out) {
-    ggml_tensor * xp = zero_pad_dim0(ctx, x, 2, 0);
-    ggml_tensor * y = conv1d_f32_b(ctx, w, xp, 1, 0, 1);
-    return ggml_add(ctx, y, ggml_reshape_2d(ctx, b, 1, C_out));
-}
 static std::vector<float> compute_time_mlp(model_ctx & m, float t_val) {
     const int TDIM = 320;
     std::vector<float> t_sin(TDIM);
@@ -732,13 +631,13 @@ static std::vector<float> cfm_estimator_forward(
     bool f16_kv_attn) {
     const int MEL = 80, CH = 256, TIME_DIM = 1024;
     const int N_MID = 12, N_BLOCKS = 4;
-    const bool build_graph = cache.backend != m.backend || cache.T != T || cache.b2;
+    const bool build_graph = cache.backend != m.backend || cache.T != T;
     if (build_graph) {
         cache.reset(); cache.buf.resize(64 * 1024 * 1024);
         ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
         cache.ctx = ggml_init(gp);
         cache.gf = ggml_new_graph_custom(cache.ctx, 65536, false);
-        cache.backend = m.backend; cache.T = T; cache.b2 = false;
+        cache.backend = m.backend; cache.T = T;
     }
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;
@@ -798,108 +697,6 @@ static std::vector<float> cfm_estimator_forward(
     std::vector<float> out_data(ggml_nelements(out_t));
     s3_tensor_get(out_t, out_data.data(), 0, ggml_nbytes(out_t));
     return out_data;
-}
-static void cfm_estimator_forward_b2(
-    const model_ctx & m,
-    cfm_estimator_cache & cache,
-    const std::vector<float> & x_c,     const std::vector<float> & x_u,
-    const std::vector<float> & mu_c,    const std::vector<float> & mu_u,
-    const std::vector<float> & t_emb_c, const std::vector<float> & t_emb_u,
-    const std::vector<float> & spks_c,  const std::vector<float> & spks_u,
-    const std::vector<float> & cond_c,  const std::vector<float> & cond_u,
-    std::vector<float> & out_c, std::vector<float> & out_u,
-    int T,
-    bool f16_kv_attn) {
-    const int MEL = 80, CH = 256, TIME_DIM = 1024;
-    const int N_MID = 12, N_BLOCKS = 4;
-    const int B = 2;
-    const bool build_graph = cache.backend != m.backend || cache.T != T || !cache.b2;
-    if (build_graph) {
-        cache.reset(); cache.buf.resize(64 * 1024 * 1024);
-        ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
-        cache.ctx = ggml_init(gp);
-        cache.gf = ggml_new_graph_custom(cache.ctx, 65536, false);
-        cache.backend = m.backend; cache.T = T; cache.b2 = true;
-    }
-    ggml_context * ctx = cache.ctx;
-    ggml_cgraph * gf = cache.gf;
-    if (build_graph) {
-    ggml_tensor * x_in    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, B); ggml_set_name(x_in, "x_in");       ggml_set_input(x_in);
-    ggml_tensor * mu_in   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, B); ggml_set_name(mu_in, "mu_in");     ggml_set_input(mu_in);
-    ggml_tensor * spks_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, MEL, B);    ggml_set_name(spks_in, "spks_in"); ggml_set_input(spks_in);
-    ggml_tensor * cond_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, B); ggml_set_name(cond_in, "cond_in"); ggml_set_input(cond_in);
-    ggml_tensor * t_emb_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, TIME_DIM, B); ggml_set_name(t_emb_in, "t_emb"); ggml_set_input(t_emb_in);
-    ggml_tensor * spks_bc = ggml_repeat(ctx,
-        ggml_reshape_3d(ctx, spks_in, 1, MEL, B), x_in);
-    ggml_tensor * xc = ggml_concat(ctx, x_in, mu_in, 1);
-    xc = ggml_concat(ctx, xc, spks_bc, 1);
-    xc = ggml_concat(ctx, xc, cond_in, 1);
-    auto down_rn = load_cfm_resnet(m, "cfm/down_blocks/0/0");
-    auto down_tfms = load_tfm_stack(m, "cfm/down_blocks/0/1", N_BLOCKS);
-    ggml_tensor * down_conv_w = find_tensor(m, "cfm/down_blocks/0/2/weight");
-    ggml_tensor * down_conv_b = find_tensor(m, "cfm/down_blocks/0/2/bias");
-    ggml_tensor * z = cfm_resnet_b(ctx, down_rn, xc, t_emb_in, CH);
-    z = apply_tfm_stack_b(ctx, down_tfms, z, T, CH, B, f16_kv_attn);
-    ggml_tensor * hidden = z;
-    z = cfm_causal_k3_b(ctx, z, down_conv_w, down_conv_b, CH);
-    for (int i = 0; i < N_MID; ++i) {
-        auto rn = load_cfm_resnet(m, "cfm/mid_blocks/" + std::to_string(i) + "/0");
-        auto tfms = load_tfm_stack(m, "cfm/mid_blocks/" + std::to_string(i) + "/1", N_BLOCKS);
-        z = cfm_resnet_b(ctx, rn, z, t_emb_in, CH);
-        z = apply_tfm_stack_b(ctx, tfms, z, T, CH, B, f16_kv_attn);
-    }
-    auto up_rn = load_cfm_resnet(m, "cfm/up_blocks/0/0");
-    auto up_tfms = load_tfm_stack(m, "cfm/up_blocks/0/1", N_BLOCKS);
-    ggml_tensor * up_conv_w = find_tensor(m, "cfm/up_blocks/0/2/weight");
-    ggml_tensor * up_conv_b = find_tensor(m, "cfm/up_blocks/0/2/bias");
-    z = ggml_concat(ctx, z, hidden, 1);
-    z = cfm_resnet_b(ctx, up_rn, z, t_emb_in, CH);
-    z = apply_tfm_stack_b(ctx, up_tfms, z, T, CH, B, f16_kv_attn);
-    z = cfm_causal_k3_b(ctx, z, up_conv_w, up_conv_b, CH);
-    ggml_tensor * fb_conv_w = find_tensor(m, "cfm/final_block/block/0/weight");
-    ggml_tensor * fb_conv_b = find_tensor(m, "cfm/final_block/block/0/bias");
-    ggml_tensor * fb_ln_w   = find_tensor(m, "cfm/final_block/block/2/weight");
-    ggml_tensor * fb_ln_b   = find_tensor(m, "cfm/final_block/block/2/bias");
-    z = cfm_causal_block_b(ctx, z, fb_conv_w, fb_conv_b, fb_ln_w, fb_ln_b, CH);
-    ggml_tensor * fp_w = find_tensor(m, "cfm/final_proj/weight");
-    ggml_tensor * fp_b = find_tensor(m, "cfm/final_proj/bias");
-    ggml_tensor * out = conv1d_f32_b(ctx, fp_w, z, 1, 0, 1);
-    out = ggml_add(ctx, out, ggml_reshape_2d(ctx, fp_b, 1, MEL));
-    ggml_set_name(out, "out"); ggml_set_output(out);
-    ggml_build_forward_expand(gf, out);
-    cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    s3_reserve(cache.allocr, gf); s3_alloc_graph(cache.allocr, gf);
-    }
-    const size_t one_tm = (size_t) T * MEL * sizeof(float);
-    const size_t one_m  = (size_t) MEL * sizeof(float);
-    const size_t one_td = (size_t) TIME_DIM * sizeof(float);
-    ggml_tensor * x_t    = ggml_graph_get_tensor(gf, "x_in");
-    ggml_tensor * mu_t   = ggml_graph_get_tensor(gf, "mu_in");
-    ggml_tensor * spks_t = ggml_graph_get_tensor(gf, "spks_in");
-    ggml_tensor * cond_t = ggml_graph_get_tensor(gf, "cond_in");
-    ggml_tensor * te_t   = ggml_graph_get_tensor(gf, "t_emb");
-    s3_tensor_set(x_t,     x_c.data(),     0 * one_tm, one_tm);
-    s3_tensor_set(x_t,     x_u.data(),     1 * one_tm, one_tm);
-    s3_tensor_set(mu_t,    mu_c.data(),    0 * one_tm, one_tm);
-    s3_tensor_set(mu_t,    mu_u.data(),    1 * one_tm, one_tm);
-    s3_tensor_set(cond_t,  cond_c.data(),  0 * one_tm, one_tm);
-    s3_tensor_set(cond_t,  cond_u.data(),  1 * one_tm, one_tm);
-    s3_tensor_set(spks_t,  spks_c.data(),  0 * one_m,  one_m);
-    s3_tensor_set(spks_t,  spks_u.data(),  1 * one_m,  one_m);
-    s3_tensor_set(te_t,    t_emb_c.data(), 0 * one_td, one_td);
-    s3_tensor_set(te_t,    t_emb_u.data(), 1 * one_td, one_td);
-    compute(m.backend, gf);
-    ggml_tensor * out_t = ggml_graph_get_tensor(gf, "out");
-    const size_t half = (size_t) T * MEL;
-    thread_local std::vector<float> both;
-    both.resize((size_t) ggml_nelements(out_t));
-    const size_t want = both.size() * sizeof(float);
-    if (want > ggml_nbytes(out_t) || both.size() < 2 * half) {
-        throw std::runtime_error("cfm b2 out size mismatch");
-    }
-    s3_tensor_get(out_t, both.data(), 0, want);
-    out_c.assign(both.begin(), both.begin() + half);
-    out_u.assign(both.begin() + half, both.begin() + 2 * half);
 }
 static std::vector<float> build_hann_window(int n, bool periodic = true) {
     std::vector<float> w(n);
@@ -1291,41 +1088,27 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < mel_len1; ++t)
             cond[m2 * T_mu + t] = pf_raw[t * MEL + m2];
-    const bool meanflow = m.meanflow;
     std::vector<float> z(T_mu * MEL);
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mu; ++t) {
             const bool generated = t >= mel_len1;
             const int64_t frame = generated ? t - mel_len1 + 2 * opts.token_start : t;
-            z[m2 * T_mu + t] = positioned_noise(seed + (generated && meanflow ? 2 : 0), frame * MEL + m2);
+            z[m2 * T_mu + t] = positioned_noise(seed + (generated ? 2 : 0), frame * MEL + m2);
         }
-    const int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps : (meanflow ? 2 : m.n_timesteps);
-    if (!meanflow && cfm_steps < 5) throw std::runtime_error("non-meanflow CFM requires at least 5 steps");
+    const int cfm_steps = opts.cfm_steps;
     std::vector<float> t_span;
     t_span.reserve(cfm_steps + 1);
-    for (int i = 0; i <= cfm_steps; ++i) {
-        float t = (float)i / (float)cfm_steps;
-        t_span.push_back(meanflow ? t : 1.0f - std::cos(t * .5f * (float)M_PI));
-    }
-    const std::vector<float> zeros_tm(T_mu * MEL, 0.0f), zeros_m(MEL, 0.0f);
+    for (int i = 0; i <= cfm_steps; ++i)
+        t_span.push_back((float)i / (float)cfm_steps);
     cfm_estimator_cache later_cfm;
     if (opts.first_piece && !m.first_cfm) m.first_cfm = std::make_unique<cfm_estimator_cache>();
     cfm_estimator_cache & cfm_cache = opts.first_piece ? *m.first_cfm : later_cfm;
     const double cfm_started = now_ms();
     for (size_t step = 0; step + 1 < t_span.size(); ++step) {
-            const float t = t_span[step], r = t_span[step + 1], dt = r - t;
-        auto t_emb = compute_time_mlp(m, t);
-        if (meanflow) t_emb = compute_time_mixed(m, t_emb, compute_time_mlp(m, r));
-        std::vector<float> dxdt;
-        if (!meanflow && m.cfg_rate != 0.0f) {
-            std::vector<float> uncond;
-            cfm_estimator_forward_b2(m, cfm_cache, z, z, mu, zeros_tm, t_emb, t_emb,
-                spks, zeros_m, cond, zeros_tm, dxdt, uncond, T_mu, false);
-            for (size_t i = 0; i < dxdt.size(); ++i) dxdt[i] = (1.0f + m.cfg_rate) * dxdt[i] - m.cfg_rate * uncond[i];
-        } else {
-            dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, false);
-        }
-            for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
+        const float t = t_span[step], r = t_span[step + 1], dt = r - t;
+        auto t_emb = compute_time_mixed(m, compute_time_mlp(m, t), compute_time_mlp(m, r));
+        std::vector<float> dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, false);
+        for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
     }
     cfm_ms = now_ms() - cfm_started;
     const int T_mel = T_mu - mel_len1;

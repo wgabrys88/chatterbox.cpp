@@ -74,14 +74,13 @@ tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
     auto i = [&](const char* k) { return std::stoi(s(k)); };
     auto f = [&](const char* k) { return std::stof(s(k)); };
     o.t3_gguf_path = s("--model"); o.s3gen_gguf_path = s("--s3gen-gguf");
-    o.reference_audio = s("--reference"); o.language = s("--language");
+    o.reference_audio = s("--reference");
     o.n_gpu_layers = i("--n-gpu-layers"); o.n_threads = i("--threads"); o.seed = i("--seed");
     o.n_predict = i("--max-tokens"); o.n_ctx = i("--context"); o.top_k = i("--top-k");
     o.top_p = f("--top-p"); o.min_p = f("--min-p"); o.temperature = f("--temperature");
     o.repeat_penalty = f("--repeat-penalty");
-    if (args.count("--repeat-stop")) o.repeat_stop_consecutive = i("--repeat-stop");
-    o.cfg_weight = f("--cfg-weight");
-    o.exaggeration = f("--exaggeration"); o.cfm_steps = i("--cfm-steps");
+    o.repeat_stop_consecutive = i("--repeat-stop");
+    o.cfm_steps = i("--cfm-steps");
     o.fastconv = i("--fastconv") != 0; o.audit_dir = s("--audit-dir");
     return tts_cpp::chatterbox::Engine(o);
 }
@@ -115,13 +114,10 @@ void emit_server_config(const args_t& args) {
         + ",\"top_k\":" + s("--top-k")
         + ",\"repeat_penalty\":" + s("--repeat-penalty")
         + ",\"repeat_last_n\":" + std::to_string(tts_cpp::chatterbox::detail::REPEAT_PENALTY_LAST_N)
-        + ",\"repeat_stop_consecutive\":" + (args.count("--repeat-stop") ? s("--repeat-stop")
-            : std::to_string(tts_cpp::chatterbox::detail::REPEAT_STOP_CONSECUTIVE))
+        + ",\"repeat_stop_consecutive\":" + s("--repeat-stop")
         + ",\"max_tokens\":" + s("--max-tokens")
         + ",\"context\":" + s("--context")
         + ",\"cfm_steps\":" + s("--cfm-steps")
-        + ",\"cfg_weight\":" + s("--cfg-weight")
-        + ",\"exaggeration\":" + s("--exaggeration")
         + "}";
     tts_jsonl(json);
 }
@@ -259,7 +255,7 @@ int main(int argc, char** argv) {
         if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address))) throw std::runtime_error("bind failed");
         if (listen(listener, 1)) throw std::runtime_error("listen failed");
         tts_emit("server.ready", "port=" + std::to_string(ntohs(address.sin_port)) +
-            " family=" + args.at("--family") + " language=" + args.at("--language"));
+            " family=" + args.at("--family"));
 
         unsigned long long connection = 0;
         for (;;) {
