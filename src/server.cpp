@@ -92,21 +92,12 @@ void emit_server_config() {
         + "}");
 }
 
-void emit_synthesis_begin(const std::vector<request_t>& requests) {
-    std::size_t total_chars = 0;
-    for (const auto& request : requests) total_chars += request.text.size();
-    std::string json =
-        std::string("{\"event\":\"synthesis.begin\"")
-        + ",\"response\":" + std::to_string(requests[0].response)
-        + ",\"pieces\":" + std::to_string(requests.size())
-        + ",\"total_chars\":" + std::to_string(total_chars)
-        + ",\"piece_chars\":[";
-    for (std::size_t i = 0; i < requests.size(); ++i) {
-        if (i) json += ',';
-        json += std::to_string(requests[i].text.size());
-    }
-    json += "]}";
-    tts_jsonl(json);
+void emit_synthesis_begin(const request_t& request) {
+    tts_jsonl(std::string("{\"event\":\"synthesis.begin\"")
+        + ",\"response\":" + std::to_string(request.response)
+        + ",\"pieces\":1"
+        + ",\"total_chars\":" + std::to_string(request.text.size())
+        + "}");
 }
 
 bool receive(SOCKET socket, request_t& request) {
@@ -134,65 +125,29 @@ bool receive(SOCKET socket, request_t& request) {
 
 void serve(SOCKET client, tts_cpp::chatterbox::Engine& tts) {
     wire_writer writer{client};
-    request_t first;
-    if (!receive(client, first)) return;
-    if (first.kind == request_kind::close) {
-        writer.terminal(response_kind::closed, first);
+    request_t request;
+    if (!receive(client, request)) return;
+    if (request.kind == request_kind::close) {
+        writer.terminal(response_kind::closed, request);
         return;
     }
-    if (first.piece != 0) throw std::runtime_error("first TTS piece must be zero");
-
-    std::vector<request_t> requests;
-    requests.reserve(first.total);
-    requests.push_back(std::move(first));
-    for (std::uint32_t expected = 1; expected < requests[0].total; ++expected) {
-        request_t request;
-        if (!receive(client, request)) throw std::runtime_error("TTS request ended before all pieces arrived");
-        if (request.kind != request_kind::synthesize || request.response != requests[0].response ||
-            request.total != requests[0].total || request.piece != expected)
-            throw std::runtime_error("non-contiguous TTS request");
-        requests.push_back(std::move(request));
-    }
-
-    std::vector<tts_cpp::chatterbox::SynthesisPiece> pieces;
-    pieces.reserve(requests.size());
-    for (const auto& request : requests) {
-        pieces.push_back({request.piece, request.text});
-    }
-
-    emit_synthesis_begin(requests);
-
-    std::vector<bool> done(requests.size(), false);
-    tts_context_scope synthesis_context(requests[0].response, 0);
+    emit_synthesis_begin(request);
+    tts_context_scope synthesis_context(request.response, 0);
     try {
-        tts.synthesize_pieces_streaming(pieces, [&](int index, const float* data, std::size_t size, int chunk, bool final) {
-            if (index < 0 || static_cast<std::size_t>(index) >= requests.size())
-                throw std::runtime_error("invalid TTS callback index");
-            const auto& request = requests[static_cast<std::size_t>(index)];
-            tts_context_scope context(request.response, request.piece);
-            if (size) {
-                writer.pcm(request, static_cast<std::uint32_t>(chunk), data, size);
-            }
-            if (final) {
-                done[static_cast<std::size_t>(index)] = true;
-                writer.terminal(response_kind::done, request);
-            }
+        tts.synthesize(request.text, [&](const float* data, std::size_t size) {
+            if (size) writer.pcm(request, 0, data, size);
+            writer.terminal(response_kind::done, request);
         });
     } catch (const std::exception& error) {
-        auto it = std::find(done.begin(), done.end(), false);
-        const std::size_t index = it == done.end() ? requests.size() - 1 : static_cast<std::size_t>(it - done.begin());
-        tts_context_scope context(requests[index].response, requests[index].piece);
-        writer.terminal(response_kind::error, requests[index], error.what());
+        writer.terminal(response_kind::error, request, error.what());
         tts_emit("synthesis.failed", "error=" + std::string(error.what()));
         return;
     }
-
     request_t close;
     if (!receive(client, close)) {
         tts_emit("client.disconnected", "after=synthesis");
         return;
     }
-    if (close.kind != request_kind::close) throw std::runtime_error("expected TTS close frame");
     writer.terminal(response_kind::closed, close);
 }
 } // namespace
@@ -206,7 +161,6 @@ int main(int argc, char** argv) {
         tts_set_run_identity(args.at("--run-id"));
         tts_emit("server.start", "port=" + args.at("--port"));
         auto tts = make_engine(args);
-        tts.warm_up();
         emit_server_config();
 
         WSADATA wsa{};

@@ -80,7 +80,6 @@ struct Engine::Impl {
         if (!std::filesystem::exists(opts.s3gen_gguf_path)) throw std::runtime_error("S3Gen GGUF missing");
         if (!validate_reference_audio(opts.reference_audio)) throw std::runtime_error("reference WAV invalid");
         ggml_time_init();
-        g_log_verbose = 0;
         ggml_log_set(chatterbox_log_cb, nullptr);
         model.backend = init_backend();
         if (!load_model_gguf(opts.t3_gguf_path, model, N_CTX)) throw std::runtime_error("T3 load failed");
@@ -130,10 +129,7 @@ struct Engine::Impl {
         if (!compute_embedding_native(opts.reference_audio, opts.s3gen_gguf_path, embedding, model.backend)) throw std::runtime_error("CAMPPlus failed");
         if (prompt_token.empty() || prompt_feat.empty() || embedding.empty()) throw std::runtime_error("voice conditioning empty");
     }
-    std::vector<int32_t> generate_t3(const std::string& text, int session_index, std::uint32_t external_piece) {
-        auto synthesis_context = tts_get_context();
-        if (session_index >= 0) { synthesis_context.valid = true; synthesis_context.piece = external_piece; }
-        tts_context_scope context_scope(synthesis_context);
+    std::vector<int32_t> generate_t3(const std::string& text) {
         const auto started = std::chrono::steady_clock::now();
         std::mt19937 rng(SEED);
         chatterbox_sampling_params sp;
@@ -188,10 +184,10 @@ struct Engine::Impl {
         piece_t3_ms = (int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + .5);
         return tokens;
     }
-    void emit_piece_ledger(std::uint32_t response, std::uint32_t piece, const std::vector<int32_t>& neu) {
+    void emit_piece_ledger(const std::vector<int32_t>& neu) {
         const auto ctx = tts_get_context();
-        tts_jsonl(std::string("{\"response\":") + std::to_string(ctx.valid ? ctx.response : response) +
-            ",\"piece\":" + std::to_string(piece) +
+        tts_jsonl(std::string("{\"response\":") + std::to_string(ctx.response) +
+            ",\"piece\":" + std::to_string(ctx.piece) +
             ",\"text\":\"" + json_escape(piece_text) + "\"" +
             ",\"text_sha\":\"" + hash_hex(hash_bytes(piece_text.data(), piece_text.size())) + "\"" +
             ",\"n_text_tok\":" + std::to_string(piece_text_tokens.size()) +
@@ -205,10 +201,7 @@ struct Engine::Impl {
             ",\"s3_new\":" + std::to_string(neu.size()) +
             ",\"emitted_samples\":" + std::to_string(acoustic.emitted) + "}");
     }
-    void run_s3(const std::vector<int32_t>& tokens, int session_index, std::uint32_t external_piece, bool last_piece, const PieceCallback& cb) {
-        auto synthesis_context = tts_get_context();
-        if (session_index >= 0) { synthesis_context.valid = true; synthesis_context.piece = external_piece; }
-        tts_context_scope context_scope(synthesis_context);
+    void run_s3(const std::vector<int32_t>& tokens, const PcmCallback& cb) {
         if (tokens.empty()) throw std::runtime_error("S3Gen speech tokens empty");
         acoustic.encoder_ms = acoustic.cfm_ms = acoustic.f0_ms = acoustic.stft_ms = acoustic.hift_ms = acoustic.pipeline_ms = 0;
         acoustic.samples = acoustic.prompt_tokens = acoustic.speech_tokens = 0;
@@ -226,8 +219,8 @@ struct Engine::Impl {
         s.state = &acoustic;
         s.token_start = 0;
         s.token_end = (int)window.size();
-        s.last_piece = last_piece;
-        s.first_piece = (session_index <= 0);
+        s.last_piece = true;
+        s.first_piece = true;
         s.chunk_id = 0;
         std::vector<float> pcm;
         s.pcm_out = &pcm;
@@ -235,11 +228,8 @@ struct Engine::Impl {
         s3gen_synthesize(window, s);
         piece_s3_ms = (int)(std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - s3_started).count() + .5);
-        if (cb) cb(session_index, pcm.data(), pcm.size(), 0, true);
-        if (session_index >= 0) {
-            const auto ctx = tts_get_context();
-            emit_piece_ledger(ctx.response, external_piece, tokens);
-        }
+        if (cb) cb(pcm.data(), pcm.size());
+        emit_piece_ledger(tokens);
         if ((int)window.size() > kSpeechHistoryTokens) {
             speech_history.assign(window.end() - kSpeechHistoryTokens, window.end());
         } else {
@@ -251,25 +241,8 @@ Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pim
 Engine::~Engine() = default;
 Engine::Engine(Engine&&) noexcept = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
-void Engine::synthesize_pieces_streaming(const std::vector<SynthesisPiece>& pieces, const PieceCallback& cb) {
+void Engine::synthesize(const std::string& text, const PcmCallback& cb) {
     pimpl_->reset_acoustics();
-    for (std::size_t index = 0; index < pieces.size(); ++index) {
-        const auto& piece = pieces[index];
-        if (piece.text.empty()) throw std::runtime_error("empty synthesis piece");
-        auto tokens = pimpl_->generate_t3(piece.text, (int)index, piece.id);
-        pimpl_->run_s3(tokens, (int)index, piece.id, index + 1 == pieces.size(),
-            [&](int, const float* pcm, std::size_t n, int chunk, bool final) {
-                if (cb) cb((int)index, pcm, n, chunk, final);
-            });
-    }
-}
-void Engine::warm_up() {
-    pimpl_->reset_acoustics();
-    std::size_t samples = 0;
-    auto tokens = pimpl_->generate_t3("Warm up.", -1, 0);
-    pimpl_->run_s3(tokens, -1, 0, true, [&](int, const float*, std::size_t n, int, bool) { samples += n; });
-    if (!samples) throw std::runtime_error("warm-up produced no PCM");
-    if (pimpl_->model.buffer_kv) ggml_backend_buffer_clear(pimpl_->model.buffer_kv, 0);
-    pimpl_->reset_acoustics();
+    pimpl_->run_s3(pimpl_->generate_t3(text), cb);
 }
 }

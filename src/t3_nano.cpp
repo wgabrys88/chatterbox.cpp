@@ -105,12 +105,6 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
         model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
         model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
         model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
-        if (g_log_verbose) fprintf(stderr, "%s: ctx=%d embd=%d layers=%d heads=%d text_vocab=%d speech_vocab=%d cond_prompt=%d\n",
-                __func__, hp.n_ctx, hp.n_embd, hp.n_layer, hp.n_head,
-                hp.n_text_vocab, hp.n_speech_vocab, hp.cond_prompt_len);
-        if (g_log_verbose) fprintf(stderr, "%s: weights=%.2f MB  KV=%.2f MB\n", __func__,
-                ggml_backend_buffer_get_size(model.buffer_w) / (1024.0*1024.0),
-                ggml_backend_buffer_get_size(model.buffer_kv) / (1024.0*1024.0));
         {
             const int64_t tok_kid = require_key(gguf_ctx, "tokenizer.ggml.tokens");
             const int64_t mer_kid = require_key(gguf_ctx, "tokenizer.ggml.merges");

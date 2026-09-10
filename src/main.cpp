@@ -92,7 +92,6 @@ bool compute_speech_tokens_native(const std::string & wav_path,
     std::vector<float> cond_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), 15 * 16000));
     return s3tokv2_tokenize(cond_wav, w, max_cond_tokens, out_cond_tokens, backend);
 }
-int g_log_verbose = 0;
 void chatterbox_log_cb(ggml_log_level level, const char * text, void * ) {
     if (level >= GGML_LOG_LEVEL_ERROR && text) fputs(text, stderr);
 }

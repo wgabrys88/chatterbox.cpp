@@ -122,7 +122,6 @@ int32_t sample_next_token_ex(
     const chatterbox_sampling_params &  params,
     std::mt19937 &                      rng);
 void chatterbox_log_cb(ggml_log_level level, const char * text, void * ud);
-extern int g_log_verbose;
 bool compute_prompt_feat_native(
     const std::string &  wav_path,
     const std::string &  s3gen_gguf,
