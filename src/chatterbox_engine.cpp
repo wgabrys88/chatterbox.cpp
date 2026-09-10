@@ -1,18 +1,26 @@
 #include "tts-cpp/chatterbox/engine.h"
-#include "tts-cpp/chatterbox/nano.h"
+#include "tts-cpp/chatterbox/v3.h"
+#include <algorithm>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include "chatterbox_t3_internal.h"
-#include "gpt2_bpe.h"
+#include "mtl_bpe.h"
 #include "s3gen_pipeline.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 namespace tts_cpp::chatterbox {
 using namespace detail;
+static std::vector<int32_t> drop_invalid_tokens(const std::vector<int32_t> & x, int32_t sos, int32_t eos) {
+    size_t s = 0, e = x.size();
+    for (size_t i = 0; i < x.size(); ++i) if (x[i] == sos) { s = i + 1; break; }
+    for (size_t i = 0; i < x.size(); ++i) if (x[i] == eos) { e = i; break; }
+    if (s > e) throw std::runtime_error("drop_invalid");
+    return std::vector<int32_t>(x.begin() + (std::ptrdiff_t)s, x.begin() + (std::ptrdiff_t)e);
+}
 struct Engine::Impl {
     EngineOptions opts;
     chatterbox_model model{};
@@ -36,35 +44,45 @@ struct Engine::Impl {
         if (model.ctx_kv) ggml_free(model.ctx_kv);
     }
     std::vector<int32_t> generate_t3(const std::string& text) {
+        if (opts.language_id.empty()) throw std::runtime_error("language");
         std::mt19937 rng(SEED);
-        gpt2_bpe bpe;
-        bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
-        auto text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
+        mtl_bpe bpe;
+        if (!bpe.load_from_arrays(model.tok_tokens, model.tok_types, model.tok_merges))
+            throw std::runtime_error("tokenizer");
+        auto ids = bpe.encode(text, opts.language_id);
+        std::vector<int32_t> text_tokens;
+        text_tokens.reserve(ids.size() + 2);
+        text_tokens.push_back(model.hparams.start_text_token);
+        text_tokens.insert(text_tokens.end(), ids.begin(), ids.end());
+        text_tokens.push_back(model.hparams.stop_text_token);
         int n_past = 0;
-        int32_t token = 0;
-        std::vector<int32_t> out, tokens;
-        out.reserve((size_t)N_PREDICT + 1);
-        tokens.reserve((size_t)N_PREDICT + (size_t)SILENCE_COUNT);
         const int32_t stop = model.hparams.stop_speech_token;
+        const int32_t sos = model.hparams.start_speech_token;
         std::vector<float> logits;
         eval_prompt(model, allocr, text_tokens, logits, n_past);
-        token = sample_next_token_ex(logits, out, rng);
-        out.push_back(token);
-        if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
-        for (int step = 1; step < N_PREDICT && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
-            eval_step(model, allocr, n_past++, token, logits);
-            token = sample_next_token_ex(logits, out, rng);
-            out.push_back(token);
-            if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
+        std::vector<int32_t> generated;
+        generated.push_back(sos);
+        std::vector<int32_t> predicted;
+        predicted.reserve((size_t)N_PREDICT);
+        for (int i = 0; i < N_PREDICT && n_past + 1 <= model.hparams.n_ctx; ++i) {
+            int32_t token = sample_next_token_ex(logits, generated, rng);
+            predicted.push_back(token);
+            generated.push_back(token);
+            if (token == stop) break;
+            eval_step(model, allocr, n_past++, token, i + 1, logits);
         }
-        if (token != stop) throw std::runtime_error("T3 stopped without EOS");
-        tokens.insert(tokens.end(), (size_t)SILENCE_COUNT, SILENCE_TOKEN);
-        return tokens;
+        if (predicted.empty() || predicted.back() != stop) throw std::runtime_error("T3 stopped without EOS");
+        return drop_invalid_tokens(predicted, sos, stop);
     }
 };
 Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(); }
 Engine::~Engine() = default;
 std::vector<float> Engine::synthesize(const std::string& text) {
-    return s3gen_synthesize(pimpl_->generate_t3(text));
+    auto tokens = pimpl_->generate_t3(text);
+    auto wav = s3gen_synthesize(tokens);
+    const int n_tokens = (int)tokens.size();
+    const int st_len = std::max(1, n_tokens - 1);
+    wav.resize((size_t)st_len * (size_t)kSamplesPerToken);
+    return wav;
 }
 }

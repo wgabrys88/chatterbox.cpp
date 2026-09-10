@@ -101,7 +101,7 @@ int main(int, char ** argv) {
     wav_load(ref, wav, sr);
     normalise_lufs(wav, sr, -27.0);
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
-    if (wav.size() > 30u * 16000u) wav.resize(30u * 16000u);
+    if (wav.empty()) throw std::runtime_error("reference wav");
     if (!voice_encoder_embed(wav, ve, backend, speaker)) throw std::runtime_error("VE embed");
     if (speaker.size() != 256) throw std::runtime_error("speaker_emb size");
 

@@ -71,7 +71,7 @@ void compute_speech_tokens_native(const std::string & wav_path, const std::strin
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
     std::vector<float> prompt_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), 10 * 16000));
     s3tokv2_tokenize(prompt_wav, w, -1, out_prompt_tokens, backend);
-    std::vector<float> cond_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), 15 * 16000));
+    std::vector<float> cond_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), 6 * 16000));
     s3tokv2_tokenize(cond_wav, w, max_cond_tokens, out_cond_tokens, backend);
 }
 }

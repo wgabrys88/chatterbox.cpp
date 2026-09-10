@@ -15,8 +15,8 @@ if(NOT GGML_VULKAN OR GGML_CUDA OR GGML_CPU)
     message(FATAL_ERROR "tts-cpp requires GGML_VULKAN=ON, GGML_CUDA=OFF, GGML_CPU=OFF")
 endif()
 add_library(tts-cpp STATIC
-    src/t3_nano.cpp
-    src/gpt2_bpe.cpp
+    src/t3_v3.cpp
+    src/mtl_bpe.cpp
     src/chatterbox_tts.cpp
     src/chatterbox_engine.cpp)
 target_include_directories(tts-cpp PUBLIC include PRIVATE src ggml/include)

@@ -1,5 +1,5 @@
 #include "s3gen_pipeline.h"
-#include "tts-cpp/chatterbox/nano.h"
+#include "tts-cpp/chatterbox/v3.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -499,19 +499,22 @@ static basic_tfm_w load_basic_tfm(const model_ctx & m, const std::string & pfx) 
 }
 static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
                                ggml_tensor * x, int T, int C, bool f16_kv_attn, int H = 8, int HD = 64) {
-    int INNER = H * HD;
+    const int INNER = H * HD;
+    const int B = (int)x->ne[2];
+    if (B <= 0) throw std::runtime_error("cfm batch");
     ggml_tensor * nx = layer_norm(ctx, x, w.norm1_w, w.norm1_b);
     ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);
     ggml_tensor * k = ggml_mul_mat(ctx, w.to_k, nx);
     ggml_tensor * v = ggml_mul_mat(ctx, w.to_v, nx);
     const size_t col_stride  = (size_t) INNER * sizeof(float);
     const size_t head_stride = (size_t) HD    * sizeof(float);
-    q = ggml_view_3d(ctx, q, HD, T, H, col_stride, head_stride, 0);
-    k = ggml_view_3d(ctx, k, HD, T, H, col_stride, head_stride, 0);
-    v = ggml_view_3d(ctx, v, HD, T, H, col_stride, head_stride, 0);
+    const size_t batch_stride = (size_t) INNER * T * sizeof(float);
+    q = ggml_view_4d(ctx, q, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
+    k = ggml_view_4d(ctx, k, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
+    v = ggml_view_4d(ctx, v, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
     if (f16_kv_attn) {
-        ggml_tensor * k_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
-        ggml_tensor * v_f16 = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, T, H);
+        ggml_tensor * k_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HD, T, H, B);
+        ggml_tensor * v_f16 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, HD, T, H, B);
         k = ggml_cpy(ctx, k, k_f16);
         v = ggml_cpy(ctx, v, v_f16);
     }
@@ -519,7 +522,7 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
                                                 1.0f / std::sqrt((float)HD),
                                                 0.0f,
                                                 0.0f);
-    ggml_tensor * flat = ggml_reshape_2d(ctx, attn_fa, INNER, T);
+    ggml_tensor * flat = ggml_reshape_3d(ctx, attn_fa, INNER, T, B);
     ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, w.to_out_w, flat), w.to_out_b);
     x = ggml_add(ctx, x, attn_out);
     ggml_tensor * nx2 = layer_norm(ctx, x, w.norm3_w, w.norm3_b);
@@ -635,12 +638,12 @@ static std::vector<float> cfm_estimator_forward(
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;
     if (build_graph) {
-    ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL); ggml_set_name(x_in, "x_in"); ggml_set_input(x_in);
-    ggml_tensor * mu_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL); ggml_set_name(mu_in, "mu_in"); ggml_set_input(mu_in);
-    ggml_tensor * spks_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, MEL); ggml_set_name(spks_in, "spks_in"); ggml_set_input(spks_in);
-    ggml_tensor * cond_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T, MEL); ggml_set_name(cond_in, "cond_in"); ggml_set_input(cond_in);
+    ggml_tensor * x_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, 2); ggml_set_name(x_in, "x_in"); ggml_set_input(x_in);
+    ggml_tensor * mu_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, 2); ggml_set_name(mu_in, "mu_in"); ggml_set_input(mu_in);
+    ggml_tensor * spks_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, MEL, 2); ggml_set_name(spks_in, "spks_in"); ggml_set_input(spks_in);
+    ggml_tensor * cond_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T, MEL, 2); ggml_set_name(cond_in, "cond_in"); ggml_set_input(cond_in);
     ggml_tensor * t_emb_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, TIME_DIM); ggml_set_name(t_emb_in, "t_emb"); ggml_set_input(t_emb_in);
-    ggml_tensor * spks_bc = ggml_repeat(ctx, ggml_reshape_2d(ctx, spks_in, 1, MEL), x_in);
+    ggml_tensor * spks_bc = ggml_repeat(ctx, ggml_reshape_3d(ctx, spks_in, 1, MEL, 2), x_in);
     ggml_tensor * xc = ggml_concat(ctx, x_in, mu_in, 1);
     xc = ggml_concat(ctx, xc, spks_bc, 1);
     xc = ggml_concat(ctx, xc, cond_in, 1);
@@ -1053,17 +1056,37 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
             z[m2 * T_mu + t] = positioned_noise(seed + (generated ? 2 : 0), frame * MEL + m2);
         }
     const int cfm_steps = tts_cpp::chatterbox::CFM_STEPS;
+    const float cfm_cfg = tts_cpp::chatterbox::CFM_CFG;
     std::vector<float> t_span;
     t_span.reserve(cfm_steps + 1);
-    for (int i = 0; i <= cfm_steps; ++i)
-        t_span.push_back((float)i / (float)cfm_steps);
+    for (int i = 0; i <= cfm_steps; ++i) {
+        float u = (float)i / (float)cfm_steps;
+        t_span.push_back(1.0f - std::cos(u * 0.5f * (float)M_PI));
+    }
     if (!m.first_cfm) m.first_cfm = std::make_unique<cfm_estimator_cache>();
     cfm_estimator_cache & cfm_cache = *m.first_cfm;
+    std::vector<float> x2((size_t)T_mu * MEL * 2), mu2((size_t)T_mu * MEL * 2, 0.f);
+    std::vector<float> cond2((size_t)T_mu * MEL * 2, 0.f), spks2((size_t)MEL * 2, 0.f);
     for (size_t step = 0; step + 1 < t_span.size(); ++step) {
         const float t = t_span[step], r = t_span[step + 1], dt = r - t;
-        auto t_emb = compute_time_mixed(m, compute_time_mlp(m, t), compute_time_mlp(m, r));
-        std::vector<float> dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, false);
-        for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
+        auto t_emb = compute_time_mlp(m, t);
+        for (int m2 = 0; m2 < MEL; ++m2) {
+            spks2[m2] = spks[m2];
+            for (int tt = 0; tt < T_mu; ++tt) {
+                const float xv = z[(size_t)m2 * T_mu + tt];
+                x2[(size_t)tt + (size_t)T_mu * (m2 + MEL * 0)] = xv;
+                x2[(size_t)tt + (size_t)T_mu * (m2 + MEL * 1)] = xv;
+                mu2[(size_t)tt + (size_t)T_mu * (m2 + MEL * 0)] = mu[(size_t)m2 * T_mu + tt];
+                cond2[(size_t)tt + (size_t)T_mu * (m2 + MEL * 0)] = cond[(size_t)m2 * T_mu + tt];
+            }
+        }
+        std::vector<float> dxdt2 = cfm_estimator_forward(m, cfm_cache, x2, mu2, t_emb, spks2, cond2, T_mu, false);
+        for (int m2 = 0; m2 < MEL; ++m2)
+            for (int tt = 0; tt < T_mu; ++tt) {
+                const float cdx = dxdt2[(size_t)tt + (size_t)T_mu * (m2 + MEL * 0)];
+                const float udx = dxdt2[(size_t)tt + (size_t)T_mu * (m2 + MEL * 1)];
+                z[(size_t)m2 * T_mu + tt] += dt * ((1.0f + cfm_cfg) * cdx - cfm_cfg * udx);
+            }
     }
     const int T_mel = T_mu - mel_len1;
     std::vector<float> mel(MEL * T_mel);
