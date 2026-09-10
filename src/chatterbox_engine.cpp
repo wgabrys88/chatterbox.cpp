@@ -133,7 +133,8 @@ struct Engine::Impl {
     void emit_t3_text_tokens(const std::vector<int32_t>& ids) {
         emit_forensic("t3.text_tokens", ",\"ids\":" + json_i32(ids));
     }
-    void emit_t3_step(int step, int32_t chosen, const t3_sample_decision& decision, int n_past, int speech_pos) {
+    void emit_t3_step(int step, int32_t chosen, const t3_sample_decision& decision, int n_past, int speech_pos,
+                      int text_cursor = -1) {
         std::string body = ",\"step\":" + std::to_string(step)
             + ",\"chosen\":" + std::to_string(chosen)
             + ",\"candidates\":" + std::to_string(decision.candidates)
@@ -150,6 +151,7 @@ struct Engine::Impl {
         }
         body += "],\"n_past\":" + std::to_string(n_past)
             + ",\"speech_pos\":" + std::to_string(speech_pos);
+        if (text_cursor >= 0) body += ",\"text_cursor\":" + std::to_string(text_cursor);
         emit_forensic("t3.step", body, "04-t3-step.jsonl");
     }
     void emit_t3_repeat_abort(int step, int32_t token, int count) {
@@ -180,6 +182,7 @@ struct Engine::Impl {
             << ",\"top_p\":" << opts.top_p
             << ",\"audit_tensors\":" << (opts.audit_tensors ? "true" : "false")
             << ",\"forensics\":" << (opts.forensics ? "true" : "false")
+            << ",\"text_aligned_decode\":" << (opts.text_aligned_decode ? "true" : "false")
             << ",\"ledgers\":{"
             << "\"speech_ids\":\"04-speech-ids.jsonl\""
             << ",\"t3_step\":\"04-t3-step.jsonl\""
@@ -302,6 +305,11 @@ struct Engine::Impl {
         int n_past = 0, speech_pos = 1;
         int32_t token = 0, pending_mtl = -1;
         bool repeat_stopped = false;
+        t3_text_align_state align{};
+        const bool text_aligned = opts.text_aligned_decode
+            && model.hparams.variant == CHBX_VARIANT_TURBO;
+        if (text_aligned) t3_text_align_layout(align, model.hparams.cond_prompt_len, (int)text_tokens.size());
+        const t3_text_align_state * align_ptr = text_aligned ? &align : nullptr;
         std::vector<int32_t> out, tokens;
         out.reserve((size_t)opts.n_predict + 1);
         tokens.reserve((size_t)opts.n_predict);
@@ -327,13 +335,15 @@ struct Engine::Impl {
 #endif
         {
             std::vector<float> logits;
-            if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past)) throw std::runtime_error("Turbo prompt failed");
+            if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past, align_ptr))
+                throw std::runtime_error("Turbo prompt failed");
             t3_sample_decision decision{};
             token = sample_next_token_ex(logits, out, sp, rng, should_log_steps() ? &decision : nullptr);
-            if (should_log_steps()) emit_t3_step(0, token, decision, n_past, speech_pos);
+            if (should_log_steps()) emit_t3_step(0, token, decision, n_past, speech_pos, text_aligned ? align.text_cursor : -1);
         }
         out.push_back(token);
         publish(token);
+        if (text_aligned) t3_text_align_advance(align, token);
 
         for (int step = 1; step < opts.n_predict && token != model.hparams.stop_speech_token && n_past + 1 <= model.hparams.n_ctx; ++step) {
 #ifdef TTS_CPP_MTL
@@ -345,11 +355,18 @@ struct Engine::Impl {
             } else
 #endif
             {
+                if (text_aligned) {
+                    const int remaining_text = align.n_text - align.text_cursor - 1;
+                    if (remaining_text > 0 && step + remaining_text * T3_ALIGN_MIN_SPEECH > opts.n_predict - 16)
+                        align.text_cursor = align.n_text - 1;
+                }
                 std::vector<float> logits;
-                if (!eval_step(model, allocr, n_threads, n_past++, token, logits)) throw std::runtime_error("Turbo step failed");
+                if (!eval_step(model, allocr, n_threads, n_past++, token, logits, align_ptr))
+                    throw std::runtime_error("Turbo step failed");
                 t3_sample_decision decision{};
                 token = sample_next_token_ex(logits, out, sp, rng, should_log_steps() ? &decision : nullptr);
-                if (should_log_steps()) emit_t3_step(step, token, decision, n_past, speech_pos);
+                if (should_log_steps()) emit_t3_step(step, token, decision, n_past, speech_pos,
+                    text_aligned ? align.text_cursor : -1);
             }
             if (opts.repeat_stop_consecutive >= 2
                 && consecutive_repeat(out, token, opts.repeat_stop_consecutive)) {
@@ -359,6 +376,7 @@ struct Engine::Impl {
             }
             out.push_back(token);
             publish(token);
+            if (text_aligned) t3_text_align_advance(align, token);
         }
 
         if (token != model.hparams.stop_speech_token) throw std::runtime_error("T3 stopped without EOS");

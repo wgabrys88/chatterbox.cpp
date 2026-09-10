@@ -103,6 +103,7 @@ tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
     o.exaggeration = f("--exaggeration"); o.cfm_steps = i("--cfm-steps");
     o.fastconv = i("--fastconv") != 0; o.audit_dir = s("--audit-dir");
     if (args.count("--forensics")) o.forensics = i("--forensics") != 0;
+    if (args.count("--text-aligned")) o.text_aligned_decode = i("--text-aligned") != 0;
     if (const char* tensors = std::getenv("TTS_AUDIT_TENSORS"))
         o.audit_tensors = tensors[0] == '1' && tensors[1] == 0;
     return tts_cpp::chatterbox::Engine(o);
@@ -144,6 +145,7 @@ void emit_server_config(const args_t& args) {
         + ",\"cfm_steps\":" + s("--cfm-steps")
         + ",\"cfg_weight\":" + s("--cfg-weight")
         + ",\"exaggeration\":" + s("--exaggeration")
+        + ",\"text_aligned_decode\":" + (args.count("--text-aligned") ? s("--text-aligned") : "1")
         + "}";
     tts_jsonl(json);
 }

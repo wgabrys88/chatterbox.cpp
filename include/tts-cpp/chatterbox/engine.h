@@ -29,6 +29,7 @@ struct EngineOptions {
     std::string audit_dir;
     bool audit_tensors = false;
     bool forensics = false;
+    bool text_aligned_decode = true;
 };
 struct SynthesisPiece {
     std::uint32_t id = 0;
