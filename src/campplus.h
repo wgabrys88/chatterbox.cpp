@@ -73,4 +73,5 @@ struct campplus_weights {
 bool campplus_load(const std::string & s3gen_gguf_path,
                    campplus_weights & out);
 bool campplus_embed(const std::vector<float>& fbank_t_by_c, int T,
-                    const campplus_weights& w, std::vector<float>& out);
+                    const campplus_weights& w, ggml_backend_t backend,
+                    std::vector<float>& out);

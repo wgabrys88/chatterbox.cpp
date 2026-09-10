@@ -97,19 +97,13 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
     }
     return out;
 }
-std::vector<float> mel_extract_stft_hann_ggml(
-    const std::vector<float> & wav,
-    const std::vector<float> & mel_fb,
-    int n_fft, int hop, int win, int n_mels,
-    int center_mode, float power_exp, float log_floor);
-std::vector<float> fbank_kaldi_80_ggml(const std::vector<float> & wav_16k,
-                                       const std::vector<float> & mel_fb);
 std::vector<float> mel_extract_24k_80(const std::vector<float> & wav_24k,
-                                      const std::vector<float> & mel_filterbank)
+                                      const std::vector<float> & mel_filterbank,
+                                      ggml_backend_t backend)
 {
     return mel_extract_stft_hann_ggml(wav_24k, mel_filterbank,
         1920, 480, 1920, 80,
-        0, 1.0f, 1e-5f);
+        0, 1.0f, 1e-5f, backend);
 }
 struct _biquad {
     double b0, b1, b2, a1, a2;
@@ -205,14 +199,16 @@ void normalise_lufs(std::vector<float> & wav, int sr, double target_lufs)
     for (float & v : wav) v = (float)((double)v * gain_lin);
 }
 std::vector<float> mel_extract_16k_40(const std::vector<float> & wav_16k,
-                                      const std::vector<float> & mel_filterbank)
+                                      const std::vector<float> & mel_filterbank,
+                                      ggml_backend_t backend)
 {
     return mel_extract_stft_hann_ggml(wav_16k, mel_filterbank,
         400, 160, 400, 40,
-        1, 2.0f, -1.0f);
+        1, 2.0f, -1.0f, backend);
 }
 std::vector<float> fbank_kaldi_80(const std::vector<float> & wav_16k,
-                                  const std::vector<float> & mel_filterbank)
+                                  const std::vector<float> & mel_filterbank,
+                                  ggml_backend_t backend)
 {
-    return fbank_kaldi_80_ggml(wav_16k, mel_filterbank);
+    return fbank_kaldi_80_ggml(wav_16k, mel_filterbank, backend);
 }

@@ -1,5 +1,7 @@
 #include "campplus.h"
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 #include <algorithm>
 #include <cmath>
@@ -8,9 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
+static ggml_backend_t g_vk = nullptr;
 static bool copy_f32(ggml_context * ctx, const char * name,
                      std::vector<float> & out)
 {
@@ -200,7 +200,6 @@ bool campplus_load(const std::string & path, campplus_weights & w)
 static inline void bn_apply(float * x, const float * scale, const float * shift,
                             int C, int T)
 {
-    #pragma omp parallel for
     for (int c = 0; c < C; ++c) {
         const float s = scale[c], b = shift[c];
         float * row = x + (size_t)c * T;
@@ -208,37 +207,50 @@ static inline void bn_apply(float * x, const float * scale, const float * shift,
     }
 }
 static inline void relu_inplace(float * x, size_t n) {
-    #pragma omp parallel for
-    for (int64_t i = 0; i < (int64_t)n; ++i) if (x[i] < 0.0f) x[i] = 0.0f;
+    for (size_t i = 0; i < n; ++i) if (x[i] < 0.0f) x[i] = 0.0f;
 }
 static inline void sigmoid_inplace(float * x, size_t n) {
-    #pragma omp parallel for
-    for (int64_t i = 0; i < (int64_t)n; ++i) x[i] = 1.0f / (1.0f + std::exp(-x[i]));
+    for (size_t i = 0; i < n; ++i) x[i] = 1.0f / (1.0f + std::exp(-x[i]));
+}
+static void vk_compute(ggml_tensor * out, ggml_cgraph * gf, ggml_backend_t backend, float * dst, size_t bytes) {
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_gallocr_reserve(alloc, gf);
+    ggml_gallocr_alloc_graph(alloc, gf);
+    ggml_backend_graph_compute(backend, gf);
+    ggml_backend_tensor_get(out, dst, 0, bytes);
+    ggml_gallocr_free(alloc);
 }
 static void conv1d(const float * x, int C_in, int T_in,
                    const float * w, const float * bias,
                    int C_out, int k, int stride, int pad, int dilation,
                    float * y, int T_out)
 {
-    #pragma omp parallel for
-    for (int co = 0; co < C_out; ++co) {
-        const float bias_v = bias ? bias[co] : 0.0f;
-        const float * w_co = w + (size_t)co * C_in * k;
-        float * y_row = y + (size_t)co * T_out;
-        for (int to = 0; to < T_out; ++to) {
-            float acc = bias_v;
-            const int base_t = to * stride - pad;
-            for (int ci = 0; ci < C_in; ++ci) {
-                const float * x_row = x + (size_t)ci * T_in;
-                const float * w_row = w_co + (size_t)ci * k;
-                for (int kk = 0; kk < k; ++kk) {
-                    const int ti = base_t + kk * dilation;
-                    if (ti >= 0 && ti < T_in) acc += w_row[kk] * x_row[ti];
-                }
-            }
-            y_row[to] = acc;
-        }
-    }
+    ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * tw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, C_in, C_out);
+    ggml_tensor * tx = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, T_in, C_in, 1);
+    ggml_tensor * tb = bias ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C_out) : nullptr;
+    ggml_set_input(tx);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, g_vk);
+    ggml_backend_tensor_set(tw, w, 0, (size_t)k * C_in * C_out * sizeof(float));
+    ggml_backend_tensor_set(tx, x, 0, (size_t)T_in * C_in * sizeof(float));
+    if (tb) ggml_backend_tensor_set(tb, bias, 0, (size_t)C_out * sizeof(float));
+    const int max_nodes = 32;
+    const size_t gs = ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    std::vector<uint8_t> gbuf(gs);
+    ggml_context * gctx = ggml_init({ gs, gbuf.data(), true });
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, max_nodes, false);
+    ggml_tensor * im2 = ggml_im2col(gctx, tw, tx, stride, 0, pad, 0, dilation, 0, false, GGML_TYPE_F32);
+    ggml_tensor * r = ggml_mul_mat(gctx,
+        ggml_reshape_2d(gctx, im2, im2->ne[0], im2->ne[2] * im2->ne[1]),
+        ggml_reshape_2d(gctx, tw, tw->ne[0] * tw->ne[1], tw->ne[2]));
+    r = ggml_reshape_3d(gctx, r, im2->ne[1], tw->ne[2], im2->ne[2]);
+    if (tb) r = ggml_add(gctx, r, tb);
+    ggml_build_forward_expand(gf, r);
+    vk_compute(r, gf, g_vk, y, (size_t)C_out * T_out * sizeof(float));
+    ggml_free(gctx);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
 }
 static void conv2d(const float * x, int C_in, int H, int W,
                    const float * w, const float * bias,
@@ -246,32 +258,31 @@ static void conv2d(const float * x, int C_in, int H, int W,
                    int sH, int sW, int pH, int pW,
                    float * y, int H_out, int W_out)
 {
-    #pragma omp parallel for
-    for (int co = 0; co < C_out; ++co) {
-        const float bias_v = bias ? bias[co] : 0.0f;
-        const float * w_co = w + (size_t)co * C_in * kH * kW;
-        for (int ho = 0; ho < H_out; ++ho) {
-            for (int wo = 0; wo < W_out; ++wo) {
-                float acc = bias_v;
-                const int base_h = ho * sH - pH;
-                const int base_w = wo * sW - pW;
-                for (int ci = 0; ci < C_in; ++ci) {
-                    const float * x_c = x + (size_t)ci * H * W;
-                    const float * w_c = w_co + (size_t)ci * kH * kW;
-                    for (int kh = 0; kh < kH; ++kh) {
-                        const int hi = base_h + kh;
-                        if (hi < 0 || hi >= H) continue;
-                        for (int kw = 0; kw < kW; ++kw) {
-                            const int wi = base_w + kw;
-                            if (wi < 0 || wi >= W) continue;
-                            acc += w_c[kh * kW + kw] * x_c[hi * W + wi];
-                        }
-                    }
-                }
-                y[(size_t)co * H_out * W_out + ho * W_out + wo] = acc;
-            }
-        }
-    }
+    (void)bias;
+    ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * tw = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kW, kH, C_in, C_out);
+    ggml_tensor * tx = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, W, H, C_in, 1);
+    ggml_set_input(tx);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, g_vk);
+    ggml_backend_tensor_set(tw, w, 0, (size_t)kW * kH * C_in * C_out * sizeof(float));
+    ggml_backend_tensor_set(tx, x, 0, (size_t)W * H * C_in * sizeof(float));
+    const int max_nodes = 48;
+    const size_t gs = ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    std::vector<uint8_t> gbuf(gs);
+    ggml_context * gctx = ggml_init({ gs, gbuf.data(), true });
+    ggml_cgraph * gf = ggml_new_graph_custom(gctx, max_nodes, false);
+    ggml_tensor * im2 = ggml_im2col(gctx, tw, tx, sW, sH, pW, pH, 1, 1, true, GGML_TYPE_F32);
+    ggml_tensor * r = ggml_mul_mat(gctx,
+        ggml_reshape_2d(gctx, im2, im2->ne[0], im2->ne[3] * im2->ne[2] * im2->ne[1]),
+        ggml_reshape_2d(gctx, tw, tw->ne[0] * tw->ne[1] * tw->ne[2], tw->ne[3]));
+    r = ggml_reshape_4d(gctx, r, im2->ne[1], im2->ne[2], im2->ne[3], tw->ne[3]);
+    r = ggml_cont(gctx, ggml_permute(gctx, r, 0, 1, 3, 2));
+    ggml_build_forward_expand(gf, r);
+    vk_compute(r, gf, g_vk, y, (size_t)C_out * H_out * W_out * sizeof(float));
+    ggml_free(gctx);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
 }
 static inline int conv_out_len(int L_in, int k, int stride, int pad, int dilation) {
     return (L_in + 2 * pad - dilation * (k - 1) - 1) / stride + 1;
@@ -359,7 +370,6 @@ static void seg_pool_expand(const float * x, int C, int T, int seg_len,
 {
     const int S = (T + seg_len - 1) / seg_len;
     std::vector<float> pooled((size_t)C * S);
-    #pragma omp parallel for
     for (int c = 0; c < C; ++c) {
         const float * row = x + (size_t)c * T;
         for (int s = 0; s < S; ++s) {
@@ -371,7 +381,6 @@ static void seg_pool_expand(const float * x, int C, int T, int seg_len,
             pooled[(size_t)c * S + s] = acc / std::max(n, 1);
         }
     }
-    #pragma omp parallel for
     for (int c = 0; c < C; ++c) {
         float * dst = out + (size_t)c * T;
         for (int s = 0; s < S; ++s) {
@@ -395,7 +404,6 @@ static void cam_layer_forward(const campplus_cam_dense_tdnn_layer & L,
            growth, kernel_size, 1, pad, dilation,
            y_local.data(), T);
     std::vector<float> mean_ctx(C_bn);
-    #pragma omp parallel for
     for (int c = 0; c < C_bn; ++c) {
         const float * row = x_in + (size_t)c * T;
         double acc = 0.0;
@@ -447,7 +455,6 @@ static int cam_dense_tdnn_layer_forward(const campplus_cam_dense_tdnn_layer & L,
 }
 static void stats_pool(const float * x, int C, int T, float * out)
 {
-    #pragma omp parallel for
     for (int c = 0; c < C; ++c) {
         const float * row = x + (size_t)c * T;
         double sum = 0.0, sq = 0.0;
@@ -463,8 +470,10 @@ static void stats_pool(const float * x, int C, int T, float * out)
     }
 }
 bool campplus_embed(const std::vector<float> & fbank_t_by_c, int T,
-                               const campplus_weights & w, std::vector<float> & out)
+                               const campplus_weights & w, ggml_backend_t backend,
+                               std::vector<float> & out)
 {
+    g_vk = backend;
     if ((int64_t)fbank_t_by_c.size() != (int64_t)T * w.feat_dim) {
         fprintf(stderr, "campplus_embed: fbank has %zu elts, expected %d*%d\n",
                 fbank_t_by_c.size(), T, w.feat_dim);

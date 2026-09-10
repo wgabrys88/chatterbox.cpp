@@ -3,7 +3,6 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 #include "gguf.h"
 #include <algorithm>
 #include <cmath>
@@ -110,7 +109,6 @@ static void compute_partials(int n_frames, int partial, float rate,
 }
 struct ve_graph {
     ggml_backend_t           backend      = nullptr;
-    bool                     owns_backend = false;
     ggml_context           * weights_ctx  = nullptr;
     ggml_backend_buffer_t    weights_buf  = nullptr;
     ggml_gallocr_t           allocr       = nullptr;
@@ -131,7 +129,7 @@ static void ve_graph_free(ve_graph & g) {
     if (g.allocr)      { ggml_gallocr_free(g.allocr);                g.allocr = nullptr; }
     if (g.weights_buf) { ggml_backend_buffer_free(g.weights_buf);    g.weights_buf = nullptr; }
     if (g.weights_ctx) { ggml_free(g.weights_ctx);                   g.weights_ctx = nullptr; }
-    if (g.owns_backend && g.backend) { ggml_backend_free(g.backend); g.backend = nullptr; }
+    g.backend = nullptr;
 }
 static bool ve_graph_init_weights(ve_graph & G, const voice_encoder_weights & w)
 {
@@ -295,7 +293,7 @@ bool voice_encoder_embed(const std::vector<float> & wav_16k,
         fprintf(stderr, "voice_encoder_embed: weights are incomplete\n");
         return false;
     }
-    std::vector<float> mel = mel_extract_16k_40(wav_16k, w.mel_fb);
+    std::vector<float> mel = mel_extract_16k_40(wav_16k, w.mel_fb, backend);
     if (mel.empty()) {
         fprintf(stderr, "voice_encoder_embed: mel extraction failed\n");
         return false;

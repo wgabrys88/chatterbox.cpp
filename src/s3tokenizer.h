@@ -47,10 +47,10 @@ bool s3tokv2_load(const std::string & s3gen_gguf_path,
                   s3tokv2_weights & out);
 std::vector<float> s3tokv2_log_mel(const std::vector<float> & wav_16k,
                                    const s3tokv2_weights & w,
+                                   ggml_backend_t backend,
                                    int & out_T);
 bool s3tokv2_tokenize(const std::vector<float> & wav_16k,
                       const s3tokv2_weights & w,
                       int max_tokens,
                       std::vector<int32_t> & out_tokens,
-                      int n_threads = 0,
-                      ggml_backend_t backend = nullptr);
+                      ggml_backend_t backend);

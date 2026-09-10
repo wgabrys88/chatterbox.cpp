@@ -107,14 +107,12 @@ bool load_model_gguf(
 bool eval_prompt(
     const chatterbox_model &     model,
     ggml_gallocr_t               allocr,
-    int                          n_threads,
     const std::vector<int32_t> & text_tokens,
     std::vector<float> &         logits_out,
     int &                        prompt_len);
 bool eval_step(
     const chatterbox_model & model,
     ggml_gallocr_t           allocr,
-    int                      n_threads,
     int                      n_past,
     int32_t                  token,
     std::vector<float> &     logits_out);
@@ -130,20 +128,18 @@ bool compute_prompt_feat_native(
     const std::string &  s3gen_gguf,
     std::vector<float> & prompt_feat,
     int &                prompt_feat_rows,
-    bool                 verbose);
+    ggml_backend_t       backend);
 bool compute_embedding_native(
     const std::string &  wav_path,
     const std::string &  s3gen_gguf,
     std::vector<float> & embedding,
-    bool                 verbose);
+    ggml_backend_t       backend);
 bool compute_speech_tokens_native(
     const std::string &    wav_path,
     const std::string &    s3gen_gguf,
     int                    max_cond_tokens,
     std::vector<int32_t> & prompt_token,
     std::vector<int32_t> & cond_prompt_tokens,
-    int                    n_threads,
-    ggml_backend_t         backend,
-    bool                   verbose);
+    ggml_backend_t         backend);
 bool validate_reference_audio(const std::string & path);
 }

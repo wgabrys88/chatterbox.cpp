@@ -255,9 +255,8 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
     return gf;
 }
 bool eval_prompt(
-    const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
+    const chatterbox_model & model, ggml_gallocr_t allocr,
     const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
-    (void)n_threads;
     prompt_len = 1 + model.hparams.cond_prompt_len + (int)text_tokens.size() + 1;
     if (prompt_len > model.hparams.n_ctx) {
         fprintf(stderr, "%s: prompt %d exceeds context %d\n", __func__, prompt_len, model.hparams.n_ctx);
@@ -294,9 +293,8 @@ bool eval_prompt(
     return true;
 }
 bool eval_step(
-    const chatterbox_model & model, ggml_gallocr_t allocr, int n_threads,
+    const chatterbox_model & model, ggml_gallocr_t allocr,
     int n_past, int32_t token, std::vector<float> & logits_out) {
-    (void)n_threads;
     ggml_cgraph * gf = build_step_graph(model, n_past);
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);

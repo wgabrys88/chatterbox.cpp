@@ -1,15 +1,15 @@
 #include "s3tokenizer.h"
+#include "voice_features.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 #include "gguf.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
-#include <thread>
 #include <vector>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -102,63 +102,33 @@ static void reflect_pad(const float * in, int L, int left, int right,
 }
 std::vector<float> s3tokv2_log_mel(const std::vector<float> & wav,
                                    const s3tokv2_weights & w,
+                                   ggml_backend_t backend,
                                    int & out_T)
 {
     const int n_fft  = w.n_fft;
     const int hop    = w.hop;
     const int F      = n_fft / 2 + 1;
     const int n_mels = w.n_mels;
-    if ((int)w.mel_fb.size() != n_mels * F) {
-        fprintf(stderr, "s3tokv2_log_mel: mel_fb size mismatch (%zu vs %d)\n",
-                w.mel_fb.size(), n_mels * F);
-        return {};
-    }
     const int L = (int)wav.size();
-    if (L < n_fft) return {};
     const int pad = n_fft / 2;
     std::vector<float> padded;
     reflect_pad(wav.data(), L, pad, pad, padded);
-    const int L_pad = (int)padded.size();
-    const int n_frames = (L_pad - n_fft) / hop + 1;
-    const int T        = n_frames - 1;
-    if (T <= 0) return {};
+    const int n_frames = ((int)padded.size() - n_fft) / hop + 1;
+    const int T = n_frames - 1;
     std::vector<float> hann(n_fft);
     for (int n = 0; n < n_fft; ++n)
         hann[n] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * (float)n / (float)n_fft));
-    std::vector<float> cos_tbl((size_t)F * n_fft);
-    std::vector<float> sin_tbl((size_t)F * n_fft);
-    for (int k = 0; k < F; ++k) {
-        for (int n = 0; n < n_fft; ++n) {
-            double th = 2.0 * M_PI * (double)k * (double)n / (double)n_fft;
-            cos_tbl[(size_t)k * n_fft + n] = (float)std::cos(th);
-            sin_tbl[(size_t)k * n_fft + n] = (float)std::sin(th);
-        }
-    }
-    std::vector<float> spec((size_t)F * T);
-    std::vector<float> frame(n_fft);
+    std::vector<float> frames((size_t)T * n_fft, 0.0f);
     for (int t = 0; t < T; ++t) {
         const float * x = padded.data() + t * hop;
-        for (int n = 0; n < n_fft; ++n) frame[n] = x[n] * hann[n];
-        for (int k = 0; k < F; ++k) {
-            const float * cs = cos_tbl.data() + (size_t)k * n_fft;
-            const float * sn = sin_tbl.data() + (size_t)k * n_fft;
-            float re = 0.0f, im = 0.0f;
-            for (int n = 0; n < n_fft; ++n) {
-                re += frame[n] * cs[n];
-                im -= frame[n] * sn[n];
-            }
-            spec[(size_t)k * T + t] = re * re + im * im;
-        }
+        float * f = frames.data() + (size_t)t * n_fft;
+        for (int n = 0; n < n_fft; ++n) f[n] = x[n] * hann[n];
     }
+    std::vector<float> mel_tm = mel_graph_run(frames, w.mel_fb, T, n_fft, F, n_mels, 2.0f, -1.0f, backend);
     std::vector<float> mel((size_t)n_mels * T);
-    for (int m = 0; m < n_mels; ++m) {
-        const float * fb_row = w.mel_fb.data() + (size_t)m * F;
-        for (int t = 0; t < T; ++t) {
-            float acc = 0.0f;
-            for (int k = 0; k < F; ++k) acc += fb_row[k] * spec[(size_t)k * T + t];
-            mel[(size_t)m * T + t] = acc;
-        }
-    }
+    for (int t = 0; t < T; ++t)
+        for (int m = 0; m < n_mels; ++m)
+            mel[(size_t)m * T + t] = mel_tm[(size_t)t * n_mels + m];
     const float log10_inv = 1.0f / std::log(10.0f);
     float max_v = -std::numeric_limits<float>::infinity();
     for (float & v : mel) {
@@ -176,7 +146,6 @@ std::vector<float> s3tokv2_log_mel(const std::vector<float> & wav,
 namespace {
 struct encoder_ctx {
     ggml_backend_t          backend      = nullptr;
-    bool                    owns_backend = false;
     ggml_context         *  ctx          = nullptr;
     ggml_backend_buffer_t   buffer       = nullptr;
     ggml_gallocr_t          alloc        = nullptr;
@@ -270,7 +239,6 @@ static bool build_encoder_ctx(encoder_ctx & ec, const s3tokv2_weights & w,
         return false;
     }
     ec.backend = backend;
-    ec.owns_backend = false;
     const int n_tensors = 4 + 16 * w.n_layer + 8;
     ggml_init_params ip = {
          (size_t)n_tensors * ggml_tensor_overhead(),
@@ -344,9 +312,6 @@ static void free_encoder_ctx(encoder_ctx & ec) {
     if (ec.alloc)  { ggml_gallocr_free(ec.alloc);  ec.alloc = nullptr; }
     if (ec.buffer) { ggml_backend_buffer_free(ec.buffer); ec.buffer = nullptr; }
     if (ec.ctx)    { ggml_free(ec.ctx); ec.ctx = nullptr; }
-    if (ec.backend && ec.owns_backend) {
-        ggml_backend_free(ec.backend);
-    }
     ec.backend = nullptr;
 }
 static ggml_tensor * build_encoder_graph(encoder_ctx & ec,
@@ -413,11 +378,10 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
                       const s3tokv2_weights & w,
                       int max_tokens,
                       std::vector<int32_t> & out_tokens,
-                      int n_threads,
                       ggml_backend_t backend)
 {
     int T_mel = 0;
-    std::vector<float> mel = s3tokv2_log_mel(wav, w, T_mel);
+    std::vector<float> mel = s3tokv2_log_mel(wav, w, backend, T_mel);
     if (mel.empty()) return false;
     const int T1 = (T_mel + 2 - 2 - 1) / 2 + 1;
     const int T2 = (T1    + 2 - 2 - 1) / 2 + 1;
@@ -470,10 +434,6 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
         ggml_backend_buffer_free(input_buf); ggml_free(input_ctx);
         ggml_free(run_ctx);
         return false;
-    }
-    if (n_threads <= 0) n_threads = (int)std::thread::hardware_concurrency();
-    if (ggml_backend_is_cpu(ec.backend)) {
-        ggml_backend_cpu_set_n_threads(ec.backend, n_threads);
     }
     if (ggml_backend_graph_compute(ec.backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "s3tokv2: graph_compute failed\n");

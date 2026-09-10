@@ -105,7 +105,6 @@ struct Engine::Impl {
         model = {};
     }
     void bake_voice() {
-        const int n_threads = N_THREADS;
         voice_encoder_weights ve;
         if (!voice_encoder_load(opts.t3_gguf_path, ve)) throw std::runtime_error("VoiceEncoder weights missing");
         std::vector<float> wav, speaker;
@@ -119,18 +118,16 @@ struct Engine::Impl {
         ggml_backend_tensor_set(model.builtin_speaker_emb, speaker.data(), 0, ggml_nbytes(model.builtin_speaker_emb));
         std::vector<int32_t> cond;
         if (!compute_speech_tokens_native(opts.reference_audio, opts.s3gen_gguf_path, model.hparams.cond_prompt_len,
-                prompt_token, cond, n_threads, model.backend, false)) throw std::runtime_error("S3Tokenizer failed");
+                prompt_token, cond, model.backend)) throw std::runtime_error("S3Tokenizer failed");
         ggml_init_params p = {ggml_tensor_overhead() * 2, nullptr, true};
         model.ctx_override = ggml_init(p);
-        if (!model.ctx_override) throw std::runtime_error("conditioning context failed");
         auto* t = ggml_new_tensor_1d(model.ctx_override, GGML_TYPE_I32, (int64_t)cond.size());
         model.buffer_override = ggml_backend_alloc_ctx_tensors(model.ctx_override, model.backend);
-        if (!model.buffer_override) throw std::runtime_error("conditioning buffer failed");
         ggml_backend_tensor_set(t, cond.data(), 0, cond.size() * sizeof(int32_t));
         model.builtin_cond_prompt_tokens = t;
         model.hparams.cond_prompt_len = (int32_t)cond.size();
-        if (!compute_prompt_feat_native(opts.reference_audio, opts.s3gen_gguf_path, prompt_feat, prompt_rows, false)) throw std::runtime_error("prompt feature failed");
-        if (!compute_embedding_native(opts.reference_audio, opts.s3gen_gguf_path, embedding, false)) throw std::runtime_error("CAMPPlus failed");
+        if (!compute_prompt_feat_native(opts.reference_audio, opts.s3gen_gguf_path, prompt_feat, prompt_rows, model.backend)) throw std::runtime_error("prompt feature failed");
+        if (!compute_embedding_native(opts.reference_audio, opts.s3gen_gguf_path, embedding, model.backend)) throw std::runtime_error("CAMPPlus failed");
         if (prompt_token.empty() || prompt_feat.empty() || embedding.empty()) throw std::runtime_error("voice conditioning empty");
     }
     std::vector<int32_t> generate_t3(const std::string& text, int session_index, std::uint32_t external_piece) {
@@ -138,7 +135,6 @@ struct Engine::Impl {
         if (session_index >= 0) { synthesis_context.valid = true; synthesis_context.piece = external_piece; }
         tts_context_scope context_scope(synthesis_context);
         const auto started = std::chrono::steady_clock::now();
-        const int n_threads = N_THREADS;
         std::mt19937 rng(SEED);
         chatterbox_sampling_params sp;
         sp.top_k = TOP_K;
@@ -164,7 +160,7 @@ struct Engine::Impl {
         };
 
         std::vector<float> logits;
-        if (!eval_prompt(model, allocr, n_threads, text_tokens, logits, n_past))
+        if (!eval_prompt(model, allocr, text_tokens, logits, n_past))
             throw std::runtime_error("T3 prompt failed");
         hold_eos(logits);
         token = sample_next_token_ex(logits, out, sp, rng);
@@ -172,7 +168,7 @@ struct Engine::Impl {
         if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
 
         for (int step = 1; step < N_PREDICT && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
-            if (!eval_step(model, allocr, n_threads, n_past++, token, logits))
+            if (!eval_step(model, allocr, n_past++, token, logits))
                 throw std::runtime_error("T3 step failed");
             hold_eos(logits);
             token = sample_next_token_ex(logits, out, sp, rng);
