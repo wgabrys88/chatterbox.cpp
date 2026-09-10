@@ -6,7 +6,6 @@
 #include "gguf.h"
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -18,7 +17,7 @@ static bool copy_f32(ggml_context * ctx, const char * name,
                      std::vector<float> & out)
 {
     ggml_tensor * t = ggml_get_tensor(ctx, name);
-    if (!t) { fprintf(stderr, "s3tokv2_load: missing tensor %s\n", name); return false; }
+    if (!t) throw std::runtime_error(name);
     out.resize(ggml_nelements(t));
     std::memcpy(out.data(), ggml_get_data(t), ggml_nbytes(t));
     return true;
@@ -28,7 +27,7 @@ bool s3tokv2_load(const std::string & path, s3tokv2_weights & w)
     ggml_context * tmp = nullptr;
     gguf_init_params gp = {  false,  &tmp };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
-    if (!g) { fprintf(stderr, "s3tokv2_load: cannot open %s\n", path.c_str()); return false; }
+    if (!g) throw std::runtime_error(path);
     auto u32 = [&](const char * k) {
         int64_t id = gguf_find_key(g, k);
         if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
@@ -57,8 +56,7 @@ bool s3tokv2_load(const std::string & path, s3tokv2_weights & w)
         w.rope_theta   = f32("s3tokv2.rope_theta");
         w.rope_max_pos = (int)u32("s3tokv2.rope_max_pos");
     } catch (const std::exception & e) {
-        fprintf(stderr, "s3tokv2_load: %s\n", e.what());
-        gguf_free(g); if (tmp) ggml_free(tmp); return false;
+        gguf_free(g); if (tmp) ggml_free(tmp); throw;
     }
     bool ok = true;
     ok &= copy_f32(tmp, "s3tokv2/mel_fb",              w.mel_fb);
@@ -100,7 +98,7 @@ static void reflect_pad(const float * in, int L, int left, int right,
     for (int i = 0; i < L;     ++i) out[left + i]   = in[i];
     for (int i = 0; i < right; ++i) out[left + L + i] = in[L - 2 - i];
 }
-std::vector<float> s3tokv2_log_mel(const std::vector<float> & wav,
+static std::vector<float> s3tokv2_log_mel(const std::vector<float> & wav,
                                    const s3tokv2_weights & w,
                                    ggml_backend_t backend,
                                    int & out_T)
@@ -234,10 +232,7 @@ static ggml_tensor * add_weight_f32_3d(ggml_context * ctx, int64_t a, int64_t b,
 static bool build_encoder_ctx(encoder_ctx & ec, const s3tokv2_weights & w,
                                ggml_backend_t backend)
 {
-    if (!backend) {
-        fprintf(stderr, "s3tokv2: backend required\n");
-        return false;
-    }
+    if (!backend) throw std::runtime_error("Vulkan");
     ec.backend = backend;
     const int n_tensors = 4 + 16 * w.n_layer + 8;
     ggml_init_params ip = {
@@ -246,7 +241,7 @@ static bool build_encoder_ctx(encoder_ctx & ec, const s3tokv2_weights & w,
          true,
     };
     ec.ctx = ggml_init(ip);
-    if (!ec.ctx) { fprintf(stderr, "s3tokv2: ggml_init failed\n"); return false; }
+    if (!ec.ctx) throw std::runtime_error("ggml_init");
     ec.conv1_w = add_weight_f32_3d(ec.ctx, 3, w.n_mels, w.n_state, "s3tokv2/conv1_w");
     ec.conv1_b = add_weight_f32_1d(ec.ctx, w.n_state, "s3tokv2/conv1_b");
     ec.conv2_w = add_weight_f32_3d(ec.ctx, 3, w.n_state, w.n_state, "s3tokv2/conv2_w");
@@ -275,13 +270,11 @@ static bool build_encoder_ctx(encoder_ctx & ec, const s3tokv2_weights & w,
         B.mlp2_b    = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/mlp2_b").c_str());
     }
     ec.buffer = ggml_backend_alloc_ctx_tensors(ec.ctx, ec.backend);
-    if (!ec.buffer) { fprintf(stderr, "s3tokv2: alloc weights buffer failed\n"); return false; }
+    if (!ec.buffer) throw std::runtime_error("s3tokv2 buffer");
     auto set = [&](ggml_tensor * t, const std::vector<float> & src) {
         size_t bytes = src.size() * sizeof(float);
         if (bytes != ggml_nbytes(t)) {
-            fprintf(stderr, "s3tokv2: size mismatch for %s: expected %zu bytes, got %zu\n",
-                    ggml_get_name(t), ggml_nbytes(t), bytes);
-            return false;
+            throw std::runtime_error(ggml_get_name(t));
         }
         ggml_backend_tensor_set(t, src.data(), 0, bytes);
         return true;
@@ -411,9 +404,7 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
         };
         run_ctx = ggml_init(ip3);
         if (!run_ctx) {
-            fprintf(stderr, "s3tokv2: ggml_init(run_ctx) failed\n");
-            free_encoder_ctx(ec); ggml_backend_buffer_free(input_buf); ggml_free(input_ctx);
-            return false;
+            throw std::runtime_error("s3tokv2 run_ctx");
         }
     }
     std::vector<float> mel_time_major((size_t)T_mel * w.n_mels);
@@ -429,18 +420,10 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
     ggml_build_forward_expand(gf, h_out);
     ec.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ec.backend));
     if (!ggml_gallocr_alloc_graph(ec.alloc, gf)) {
-        fprintf(stderr, "s3tokv2: gallocr_alloc_graph failed\n");
-        free_encoder_ctx(ec);
-        ggml_backend_buffer_free(input_buf); ggml_free(input_ctx);
-        ggml_free(run_ctx);
-        return false;
+        throw std::runtime_error("s3tokv2 alloc");
     }
     if (ggml_backend_graph_compute(ec.backend, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "s3tokv2: graph_compute failed\n");
-        free_encoder_ctx(ec);
-        ggml_backend_buffer_free(input_buf); ggml_free(input_ctx);
-        ggml_free(run_ctx);
-        return false;
+        throw std::runtime_error("s3tokv2 compute");
     }
     const int T_out = (int)h_out->ne[1];
     const int D_out = (int)h_out->ne[0];

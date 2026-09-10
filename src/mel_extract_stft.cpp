@@ -142,7 +142,7 @@ std::vector<float> mel_extract_stft_hann_ggml(
     return mel_graph_run(build_windowed_frames(padded, T, hop, win, n_fft, hann),
                          mel_fb, T, n_fft, F, n_mels, power_exp, log_floor, backend);
 }
-std::vector<float> fbank_kaldi_80_ggml(const std::vector<float> & wav_16k,
+std::vector<float> fbank_kaldi_80(const std::vector<float> & wav_16k,
                                        const std::vector<float> & mel_fb,
                                        ggml_backend_t backend)
 {

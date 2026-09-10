@@ -1,29 +1,16 @@
 #pragma once
-#include <cstddef>
-#include <cstdint>
 #include <string>
 #include <vector>
 struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
-constexpr int kSpeechLookaheadTokens = 3;
 constexpr int kSamplesPerToken = 960;
-struct s3gen_piece_state {
-    std::vector<float> source;
-    std::vector<double> phase;
-    double encoder_ms = 0, cfm_ms = 0, f0_ms = 0, stft_ms = 0, hift_ms = 0, pipeline_ms = 0;
-    int samples = 0, prompt_tokens = 0, speech_tokens = 0;
-    int history_tokens = 0, window_tokens = 0, cfm_steps_used = 0;
-    std::size_t emitted = 0;
-};
 struct s3gen_synthesize_opts {
     std::string s3gen_gguf_path;
-    std::vector<float>* pcm_out = nullptr;
     std::vector<float> prompt_feat;
     int prompt_rows = 0;
     std::vector<float> embedding;
     std::vector<int32_t> prompt_token;
-    s3gen_piece_state* state = nullptr;
 };
-void s3gen_synthesize(const std::vector<int32_t>&, const s3gen_synthesize_opts&);
+std::vector<float> s3gen_synthesize(const std::vector<int32_t>&, const s3gen_synthesize_opts&);
 void s3gen_preload(const std::string&, ggml_backend_t);
 void s3gen_unload();

@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-struct ggml_tensor;
+struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
 struct s3tokv2_block {
     std::vector<float> attn_ln_w;
@@ -43,14 +43,6 @@ struct s3tokv2_weights {
     std::vector<float> fsq_w;
     std::vector<float> fsq_b;
 };
-bool s3tokv2_load(const std::string & s3gen_gguf_path,
-                  s3tokv2_weights & out);
-std::vector<float> s3tokv2_log_mel(const std::vector<float> & wav_16k,
-                                   const s3tokv2_weights & w,
-                                   ggml_backend_t backend,
-                                   int & out_T);
-bool s3tokv2_tokenize(const std::vector<float> & wav_16k,
-                      const s3tokv2_weights & w,
-                      int max_tokens,
-                      std::vector<int32_t> & out_tokens,
-                      ggml_backend_t backend);
+bool s3tokv2_load(const std::string & s3gen_gguf_path, s3tokv2_weights & out);
+bool s3tokv2_tokenize(const std::vector<float> & wav_16k, const s3tokv2_weights & w,
+                      int max_tokens, std::vector<int32_t> & out_tokens, ggml_backend_t backend);

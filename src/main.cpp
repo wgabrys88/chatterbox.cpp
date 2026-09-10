@@ -2,8 +2,8 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include "chatterbox_t3_internal.h"
@@ -12,21 +12,11 @@
 #include "s3tokenizer.h"
 using namespace tts_cpp::chatterbox::detail;
 namespace tts_cpp::chatterbox::detail {
-bool validate_reference_audio(const std::string & path) {
+void compute_prompt_feat_native(const std::string & wav_path, const std::string & s3gen_gguf_path,
+                                std::vector<float> & out_feat, int & out_rows, ggml_backend_t backend) {
     std::vector<float> wav;
     int sr = 0;
-    if (!wav_load(path, wav, sr)) return false;
-    return (double)wav.size() / (double)sr > 5.0;
-}
-bool compute_prompt_feat_native(const std::string & wav_path,
-                                       const std::string & s3gen_gguf_path,
-                                       std::vector<float> & out_feat,
-                                       int & out_rows,
-                                       ggml_backend_t backend)
-{
-    std::vector<float> wav;
-    int sr = 0;
-    if (!wav_load(wav_path, wav, sr)) return false;
+    wav_load(wav_path, wav, sr);
     if (sr != 24000) wav = resample_sinc(wav, sr, 24000);
     normalise_lufs(wav, 24000, -27.0);
     if ((int)wav.size() > 10 * 24000) wav.resize(10 * 24000);
@@ -40,15 +30,11 @@ bool compute_prompt_feat_native(const std::string & wav_path,
     ggml_free(tmp_ctx);
     out_feat = mel_extract_24k_80(wav, mel_fb, backend);
     out_rows = (int)(out_feat.size() / 80);
-    return !out_feat.empty();
 }
-bool compute_embedding_native(const std::string & wav_path,
-                                     const std::string & s3gen_gguf_path,
-                                     std::vector<float> & out_emb,
-                                     ggml_backend_t backend)
-{
+void compute_embedding_native(const std::string & wav_path, const std::string & s3gen_gguf_path,
+                              std::vector<float> & out_emb, ggml_backend_t backend) {
     campplus_weights w;
-    if (!campplus_load(s3gen_gguf_path, w)) return false;
+    campplus_load(s3gen_gguf_path, w);
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = { false, &tmp_ctx };
     gguf_context * g = gguf_init_from_file(s3gen_gguf_path.c_str(), gp);
@@ -59,7 +45,7 @@ bool compute_embedding_native(const std::string & wav_path,
     ggml_free(tmp_ctx);
     std::vector<float> wav;
     int sr = 0;
-    if (!wav_load(wav_path, wav, sr)) return false;
+    wav_load(wav_path, wav, sr);
     normalise_lufs(wav, sr, -27.0);
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
     if ((int)wav.size() > 10 * 16000) wav.resize(10 * 16000);
@@ -71,28 +57,21 @@ bool compute_embedding_native(const std::string & wav_path,
     for (int c = 0; c < 80; ++c) col_mean[c] /= (float)T;
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < 80; ++c) fbank[(size_t)t * 80 + c] -= col_mean[c];
-    return campplus_embed(fbank, T, w, backend, out_emb);
+    campplus_embed(fbank, T, w, backend, out_emb);
 }
-bool compute_speech_tokens_native(const std::string & wav_path,
-                                         const std::string & s3gen_gguf_path,
-                                         int max_cond_tokens,
-                                         std::vector<int32_t> & out_prompt_tokens,
-                                         std::vector<int32_t> & out_cond_tokens,
-                                         ggml_backend_t backend)
-{
+void compute_speech_tokens_native(const std::string & wav_path, const std::string & s3gen_gguf_path,
+                                  int max_cond_tokens, std::vector<int32_t> & out_prompt_tokens,
+                                  std::vector<int32_t> & out_cond_tokens, ggml_backend_t backend) {
     s3tokv2_weights w;
-    if (!s3tokv2_load(s3gen_gguf_path, w)) return false;
+    s3tokv2_load(s3gen_gguf_path, w);
     std::vector<float> wav;
     int sr = 0;
-    if (!wav_load(wav_path, wav, sr)) return false;
+    wav_load(wav_path, wav, sr);
     normalise_lufs(wav, sr, -27.0);
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
     std::vector<float> prompt_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), 10 * 16000));
-    if (!s3tokv2_tokenize(prompt_wav, w, -1, out_prompt_tokens, backend)) return false;
+    s3tokv2_tokenize(prompt_wav, w, -1, out_prompt_tokens, backend);
     std::vector<float> cond_wav(wav.begin(), wav.begin() + std::min((int)wav.size(), 15 * 16000));
-    return s3tokv2_tokenize(cond_wav, w, max_cond_tokens, out_cond_tokens, backend);
-}
-void chatterbox_log_cb(ggml_log_level level, const char * text, void * ) {
-    if (level >= GGML_LOG_LEVEL_ERROR && text) fputs(text, stderr);
+    s3tokv2_tokenize(cond_wav, w, max_cond_tokens, out_cond_tokens, backend);
 }
 }

@@ -1,109 +1,55 @@
 #!/usr/bin/env python3
-import argparse
-import json
-import re
+import json, re, sys
 from pathlib import Path
-import gguf
-import numpy as np
-import torch
+import gguf, numpy as np, torch
 from safetensors.torch import load_file
-NANO_REPO = "ResembleAI/chatterbox-nano"
-TEXT_VOCAB_SIZE = 50276
-SPEECH_VOCAB_SIZE = 6563
-START_SPEECH_TOKEN = 6561
-STOP_SPEECH_TOKEN = 6562
-SPEAKER_EMBED_SIZE = 256
-LAYER_NORM_EPS = 1e-5
+TEXT_VOCAB_SIZE, SPEECH_VOCAB_SIZE = 50276, 6563
+START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, SPEAKER_EMBED_SIZE = 6561, 6562, 256
 LAYER_RE = re.compile(r"^tfmr\.h\.(\d+)\.(.+)$")
-QUANT_CHOICES = ["f16", "q8_0", "q5_0", "q4_0"]
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert Chatterbox Nano T3 weights to GGUF.")
-    parser.add_argument("--ckpt-dir", type=Path, required=True)
-    parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--quant", choices=QUANT_CHOICES, default="f16",
-                        help="Weight dtype for attention + MLP + speech_head projections.")
-    return parser.parse_args()
-def as_numpy(tensor: torch.Tensor, *, dtype=None, transpose: bool = False) -> np.ndarray:
-    if dtype is not None:
-        tensor = tensor.to(dtype)
+QTYPE = gguf.GGMLQuantizationType.Q8_0
+def as_numpy(tensor, *, dtype=None, transpose=False):
+    if dtype is not None: tensor = tensor.to(dtype)
     array = tensor.detach().cpu().numpy()
-    if transpose:
-        array = array.T
+    if transpose: array = array.T
     return np.ascontiguousarray(array)
-def _is_quantizable_weight(gguf_name: str) -> bool:
-    if gguf_name == "chatterbox/speech_head":
-        return True
-    if gguf_name.startswith("model/h") and (
-        gguf_name.endswith("/attn/c_attn/w") or
-        gguf_name.endswith("/attn/c_proj/w") or
-        gguf_name.endswith("/mlp/c_fc/w") or
-        gguf_name.endswith("/mlp/c_proj/w")
-    ):
-        return True
-    return False
-_QUANT_TYPE = {
-    "q8_0": gguf.GGMLQuantizationType.Q8_0,
-    "q5_0": gguf.GGMLQuantizationType.Q5_0,
-    "q4_0": gguf.GGMLQuantizationType.Q4_0,
-}
-def add_maybe_quantized(writer: "gguf.GGUFWriter", name: str, array: np.ndarray, quant: str):
-    if quant == "f16" or not _is_quantizable_weight(name):
+def quantizable(name):
+    if name == "chatterbox/speech_head": return True
+    return name.startswith("model/h") and name.endswith(("/attn/c_attn/w", "/attn/c_proj/w", "/mlp/c_fc/w", "/mlp/c_proj/w"))
+def add(writer, name, array):
+    if not quantizable(name):
         writer.add_tensor(name, array)
-        return str(array.dtype)
-    qtype = _QUANT_TYPE[quant]
-    qdata = gguf.quants.quantize(array.astype(np.float32), qtype)
-    writer.add_tensor(name, qdata, raw_shape=qdata.shape, raw_dtype=qtype)
-    return qtype.name
-def load_tokenizer_assets(ckpt_dir: Path):
-    vocab_path  = ckpt_dir / "vocab.json"
-    merges_path = ckpt_dir / "merges.txt"
-    added_path  = ckpt_dir / "added_tokens.json"
-    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
-    added = json.loads(added_path.read_text(encoding="utf-8"))
-    id_to_tok = {int(idx): tok for tok, idx in vocab.items()}
-    for tok, idx in added.items():
-        id_to_tok[int(idx)] = tok
-    max_id = max(id_to_tok)
-    tokens = []
-    types  = []
-    for i in range(max_id + 1):
+        return
+    qdata = gguf.quants.quantize(array.astype(np.float32), QTYPE)
+    writer.add_tensor(name, qdata, raw_shape=qdata.shape, raw_dtype=QTYPE)
+def tokenizer(ckpt_dir):
+    vocab = json.loads((ckpt_dir / "vocab.json").read_text(encoding="utf-8"))
+    added = json.loads((ckpt_dir / "added_tokens.json").read_text(encoding="utf-8"))
+    id_to_tok = {int(i): t for t, i in vocab.items()}
+    for t, i in added.items(): id_to_tok[int(i)] = t
+    tokens, types = [], []
+    for i in range(max(id_to_tok) + 1):
         tok = id_to_tok[i]
         tokens.append(tok)
-        types.append(int(gguf.TokenType.USER_DEFINED) if tok in added else int(gguf.TokenType.NORMAL))
-    merges = []
-    for line in merges_path.read_text(encoding="utf-8").splitlines():
-        line = line.rstrip("\r\n")
-        if not line or line.startswith("#"):
-            continue
-        merges.append(line)
+        types.append(int(gguf.TokenType.USER_DEFINED if tok in added else gguf.TokenType.NORMAL))
+    merges = [ln.rstrip("\r\n") for ln in (ckpt_dir / "merges.txt").read_text(encoding="utf-8").splitlines() if ln and not ln.startswith("#")]
     return tokens, types, merges
-def map_tensor_name(name: str):
-    if name == "tfmr.wte.weight":
-        return None
-    if name == "tfmr.wpe.weight":
-        return "model/wpe", torch.float32, False
-    if name == "tfmr.ln_f.weight":
-        return "model/ln_f/g", torch.float32, False
-    if name == "tfmr.ln_f.bias":
-        return "model/ln_f/b", torch.float32, False
-    if name == "text_emb.weight":
-        return "chatterbox/text_emb", torch.float16, False
-    if name == "speech_emb.weight":
-        return "chatterbox/speech_emb", torch.float16, False
-    if name == "speech_head.weight":
-        return "chatterbox/speech_head", torch.float16, False
-    if name == "speech_head.bias":
-        return "chatterbox/speech_head_bias", torch.float32, False
-    if name == "cond_enc.spkr_enc.weight":
-        return "chatterbox/cond_spkr/w", torch.float32, False
-    if name == "cond_enc.spkr_enc.bias":
-        return "chatterbox/cond_spkr/b", torch.float32, False
-    match = LAYER_RE.match(name)
-    if not match:
-        return None
-    layer_idx = int(match.group(1))
-    suffix = match.group(2)
+def map_name(name):
     table = {
+        "tfmr.wpe.weight": ("model/wpe", torch.float32, False),
+        "tfmr.ln_f.weight": ("model/ln_f/g", torch.float32, False),
+        "tfmr.ln_f.bias": ("model/ln_f/b", torch.float32, False),
+        "text_emb.weight": ("chatterbox/text_emb", torch.float16, False),
+        "speech_emb.weight": ("chatterbox/speech_emb", torch.float16, False),
+        "speech_head.weight": ("chatterbox/speech_head", torch.float16, False),
+        "speech_head.bias": ("chatterbox/speech_head_bias", torch.float32, False),
+        "cond_enc.spkr_enc.weight": ("chatterbox/cond_spkr/w", torch.float32, False),
+        "cond_enc.spkr_enc.bias": ("chatterbox/cond_spkr/b", torch.float32, False),
+    }
+    if name in table: return table[name]
+    if name == "tfmr.wte.weight": return None
+    m = LAYER_RE.match(name)
+    if not m: return None
+    layers = {
         "ln_1.weight": ("model/h{}/ln_1/g", torch.float32, False),
         "ln_1.bias": ("model/h{}/ln_1/b", torch.float32, False),
         "ln_2.weight": ("model/h{}/ln_2/g", torch.float32, False),
@@ -117,33 +63,19 @@ def map_tensor_name(name: str):
         "mlp.c_proj.weight": ("model/h{}/mlp/c_proj/w", torch.float16, True),
         "mlp.c_proj.bias": ("model/h{}/mlp/c_proj/b", torch.float32, False),
     }
-    if suffix not in table:
-        return None
-    fmt, dtype, transpose = table[suffix]
-    return fmt.format(layer_idx), dtype, transpose
-def main() -> None:
-    args = parse_args()
-    ckpt_dir = args.ckpt_dir
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    ckpt = ckpt_dir / "t3_nano_v1.safetensors"
-    print(f"Loading nano checkpoint from {ckpt_dir}")
-    state = load_file(ckpt)
+    if m.group(2) not in layers: return None
+    fmt, dtype, transpose = layers[m.group(2)]
+    return fmt.format(int(m.group(1))), dtype, transpose
+def main():
+    ckpt_dir, out = Path(sys.argv[1]), Path(sys.argv[2])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    state = load_file(ckpt_dir / "t3_nano_v1.safetensors")
     conds = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)
-    layer_ids = {int(m.group(1)) for name in state if (m := LAYER_RE.match(name))}
     n_embd = int(state["tfmr.ln_f.weight"].shape[0])
     n_ctx = int(state["tfmr.wpe.weight"].shape[0])
-    n_layer = max(layer_ids) + 1
-    if n_embd % 64:
-        raise SystemExit(f"n_embd {n_embd} is not divisible by head dim 64")
+    n_layer = max(int(m.group(1)) for name in state if (m := LAYER_RE.match(name))) + 1
     n_head = n_embd // 64
-    writer = gguf.GGUFWriter(str(args.out), "chatterbox")
-    writer.add_name("Chatterbox Nano T3")
-    writer.add_description("Chatterbox Nano text-to-speech token generator for ggml.")
-    writer.add_context_length(n_ctx)
-    writer.add_embedding_length(n_embd)
-    writer.add_block_count(n_layer)
-    writer.add_head_count(n_head)
-    writer.add_vocab_size(TEXT_VOCAB_SIZE)
+    writer = gguf.GGUFWriter(str(out), "chatterbox")
     writer.add_uint32("chatterbox.n_ctx", n_ctx)
     writer.add_uint32("chatterbox.n_embd", n_embd)
     writer.add_uint32("chatterbox.n_head", n_head)
@@ -153,77 +85,42 @@ def main() -> None:
     writer.add_uint32("chatterbox.start_speech_token", START_SPEECH_TOKEN)
     writer.add_uint32("chatterbox.stop_speech_token", STOP_SPEECH_TOKEN)
     writer.add_uint32("chatterbox.speaker_embed_size", SPEAKER_EMBED_SIZE)
-    writer.add_float32("chatterbox.layer_norm_eps", LAYER_NORM_EPS)
-    writer.add_string("chatterbox.reference_repo", NANO_REPO)
-    tok_tokens, tok_types, tok_merges = load_tokenizer_assets(ckpt_dir)
+    writer.add_float32("chatterbox.layer_norm_eps", 1e-5)
+    tokens, types, merges = tokenizer(ckpt_dir)
     writer.add_tokenizer_model("gpt2")
-    writer.add_token_list(tok_tokens)
-    writer.add_token_types(tok_types)
-    writer.add_token_merges(tok_merges)
-    print(f"Embedded tokenizer: {len(tok_tokens)} tokens, "
-          f"{sum(1 for t in tok_types if t == int(gguf.TokenType.USER_DEFINED))} added, "
-          f"{len(tok_merges)} merges")
-    writer.add_string("chatterbox.quantization", args.quant)
-    exported = 0
-    quantized = 0
-    ignored = []
+    writer.add_token_list(tokens)
+    writer.add_token_types(types)
+    writer.add_token_merges(merges)
     for name, tensor in state.items():
-        mapped = map_tensor_name(name)
-        if mapped is None:
-            ignored.append(name)
-            continue
+        mapped = map_name(name)
+        if mapped is None: continue
         gguf_name, dtype, transpose = mapped
-        array = as_numpy(tensor, dtype=dtype, transpose=transpose)
-        written_type = add_maybe_quantized(writer, gguf_name, array, args.quant)
-        exported += 1
-        if written_type not in ("float32", "float16"):
-            quantized += 1
-        print(f"{gguf_name:32s} {str(tuple(array.shape)):18s} {written_type}")
-    builtin_speaker = conds["t3"]["speaker_emb"].reshape(1, SPEAKER_EMBED_SIZE)
+        add(writer, gguf_name, as_numpy(tensor, dtype=dtype, transpose=transpose))
     builtin_tokens = conds["t3"]["cond_prompt_speech_tokens"].reshape(-1).to(torch.int32)
     writer.add_uint32("chatterbox.cond_prompt_length", int(builtin_tokens.numel()))
-    writer.add_tensor("chatterbox/builtin/speaker_emb", as_numpy(builtin_speaker, dtype=torch.float32))
+    writer.add_tensor("chatterbox/builtin/speaker_emb", as_numpy(conds["t3"]["speaker_emb"].reshape(1, SPEAKER_EMBED_SIZE), dtype=torch.float32))
     writer.add_tensor("chatterbox/builtin/cond_prompt_speech_tokens", as_numpy(builtin_tokens))
-    ve_state = load_file(ckpt_dir / "ve.safetensors")
-    VE_HIDDEN = 256
-    VE_INPUT  = 40
-    writer.add_uint32("voice_encoder.n_mels",        VE_INPUT)
-    writer.add_uint32("voice_encoder.hidden_size",   VE_HIDDEN)
-    writer.add_uint32("voice_encoder.num_layers",    3)
-    writer.add_uint32("voice_encoder.embedding_size", VE_HIDDEN)
+    ve = load_file(ckpt_dir / "ve.safetensors")
+    writer.add_uint32("voice_encoder.n_mels", 40)
+    writer.add_uint32("voice_encoder.hidden_size", 256)
+    writer.add_uint32("voice_encoder.num_layers", 3)
+    writer.add_uint32("voice_encoder.embedding_size", 256)
     writer.add_uint32("voice_encoder.partial_frames", 160)
-    writer.add_uint32("voice_encoder.sample_rate",   16000)
-    writer.add_uint32("voice_encoder.n_fft",         400)
-    writer.add_uint32("voice_encoder.hop_size",      160)
-    writer.add_uint32("voice_encoder.win_size",      400)
-    writer.add_float32("voice_encoder.overlap",      0.5)
-    writer.add_float32("voice_encoder.rate",         1.3)
+    writer.add_uint32("voice_encoder.sample_rate", 16000)
+    writer.add_uint32("voice_encoder.n_fft", 400)
+    writer.add_uint32("voice_encoder.hop_size", 160)
+    writer.add_uint32("voice_encoder.win_size", 400)
+    writer.add_float32("voice_encoder.overlap", 0.5)
+    writer.add_float32("voice_encoder.rate", 1.3)
     writer.add_float32("voice_encoder.min_coverage", 0.8)
-    for k, t in ve_state.items():
-        if k.startswith("similarity_"):
-            continue
-        writer.add_tensor(
-            f"voice_encoder/{k.replace('.', '/')}",
-            as_numpy(t, dtype=torch.float32),
-        )
+    for k, t in ve.items():
+        if not k.startswith("similarity_"):
+            writer.add_tensor(f"voice_encoder/{k.replace('.', '/')}", as_numpy(t, dtype=torch.float32))
     import librosa
-    ve_mel_fb = librosa.filters.mel(
-        sr=16000, n_fft=400, n_mels=40, fmin=0, fmax=8000,
-    ).astype(np.float32)
-    writer.add_tensor("voice_encoder/mel_fb",
-                      np.ascontiguousarray(ve_mel_fb))
-    print(f"Embedded VoiceEncoder: 14 tensors, mel_fb {ve_mel_fb.shape}")
+    writer.add_tensor("voice_encoder/mel_fb", np.ascontiguousarray(librosa.filters.mel(sr=16000, n_fft=400, n_mels=40, fmin=0, fmax=8000).astype(np.float32)))
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
-    print(f"\nWrote {exported + 2} tensors to {args.out}")
-    print(f"  --quant {args.quant}: {quantized}/{exported} weight tensors quantized "
-          f"({'f16/f32' if args.quant == 'f16' else args.quant.upper()} for quantized; "
-          f"embeddings + biases + layer-norms unchanged)")
-    if ignored:
-        print("\nIgnored tensors:")
-        for n in ignored:
-            print(f"  {n}")
 if __name__ == "__main__":
     main()

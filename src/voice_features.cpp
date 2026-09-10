@@ -1,25 +1,25 @@
 #include "voice_features.h"
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <fstream>
 #include <iterator>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 static uint16_t u16(const unsigned char* p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t u32(const unsigned char* p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
-bool wav_load(const std::string& path, std::vector<float>& out, int& sr) {
+void wav_load(const std::string& path, std::vector<float>& out, int& sr) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
     std::vector<unsigned char> b((std::istreambuf_iterator<char>(f)), {});
-    if (b.size() < 44 || std::memcmp(b.data(), "RIFF", 4) || std::memcmp(b.data() + 8, "WAVE", 4)) return false;
+    if (b.size() < 44 || std::memcmp(b.data(), "RIFF", 4) || std::memcmp(b.data() + 8, "WAVE", 4))
+        throw std::runtime_error("WAV");
     uint16_t format = 0, channels = 0, bits = 0, block = 0;
     const unsigned char* data = nullptr;
     size_t bytes = 0;
     for (size_t p = 12; p + 8 <= b.size();) {
         const uint32_t n = u32(b.data() + p + 4);
-        if (p + 8ull + n > b.size()) return false;
+        if (p + 8ull + n > b.size()) throw std::runtime_error("WAV");
         const unsigned char* q = b.data() + p + 8;
         if (!std::memcmp(b.data() + p, "fmt ", 4) && n >= 16) {
             format = u16(q); channels = u16(q + 2); sr = (int)u32(q + 4); block = u16(q + 12); bits = u16(q + 14);
@@ -28,11 +28,11 @@ bool wav_load(const std::string& path, std::vector<float>& out, int& sr) {
         if (!std::memcmp(b.data() + p, "data", 4)) { data = q; bytes = n; }
         p += 8 + n + (n & 1u);
     }
-    if (!data || !channels || !sr || !block || !bits || bytes % block) return false;
+    if (!data || !channels || !sr || !block || !bits || bytes % block) throw std::runtime_error("WAV");
     const size_t frames = bytes / block;
     out.assign(frames, 0.f);
     const size_t sample_bytes = bits / 8;
-    if (!sample_bytes || sample_bytes * channels > block) return false;
+    if (!sample_bytes || sample_bytes * channels > block) throw std::runtime_error("WAV");
     for (size_t i = 0; i < frames; ++i) {
         float sum = 0.f;
         for (uint16_t c = 0; c < channels; ++c) {
@@ -43,12 +43,11 @@ bool wav_load(const std::string& path, std::vector<float>& out, int& sr) {
             else if (format == 1 && bits == 24) { int32_t x = q[0] | q[1] << 8 | q[2] << 16; if (x & 0x800000) x |= ~0xffffff; v = x / 8388608.f; }
             else if (format == 1 && bits == 32) v = (int32_t)u32(q) / 2147483648.f;
             else if (format == 3 && bits == 32) std::memcpy(&v, q, 4);
-            else return false;
+            else throw std::runtime_error("WAV");
             sum += v;
         }
         out[i] = sum / channels;
     }
-    return true;
 }
 static double bessel_i0(double x) {
     double sum = 1.0;
@@ -144,7 +143,7 @@ static _biquad _kweight_hipass(int sr) {
     q.b0 /= a0; q.b1 /= a0; q.b2 /= a0;
     return q;
 }
-double measure_lufs(const std::vector<float> & wav, int sr)
+static double measure_lufs(const std::vector<float> & wav, int sr)
 {
     if ((int)wav.size() < (int)(0.4 * sr)) {
         return -std::numeric_limits<double>::infinity();
@@ -205,10 +204,4 @@ std::vector<float> mel_extract_16k_40(const std::vector<float> & wav_16k,
     return mel_extract_stft_hann_ggml(wav_16k, mel_filterbank,
         400, 160, 400, 40,
         1, 2.0f, -1.0f, backend);
-}
-std::vector<float> fbank_kaldi_80(const std::vector<float> & wav_16k,
-                                  const std::vector<float> & mel_filterbank,
-                                  ggml_backend_t backend)
-{
-    return fbank_kaldi_80_ggml(wav_16k, mel_filterbank, backend);
 }

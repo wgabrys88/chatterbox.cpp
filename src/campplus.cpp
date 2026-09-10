@@ -5,7 +5,6 @@
 #include "gguf.h"
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -15,7 +14,7 @@ static bool copy_f32(ggml_context * ctx, const char * name,
                      std::vector<float> & out)
 {
     ggml_tensor * t = ggml_get_tensor(ctx, name);
-    if (!t) { fprintf(stderr, "campplus_load: missing tensor %s\n", name); return false; }
+    if (!t) throw std::runtime_error(name);
     out.resize(ggml_nelements(t));
     std::memcpy(out.data(), ggml_get_data(t), ggml_nbytes(t));
     return true;
@@ -35,9 +34,7 @@ static bool load_conv1d(ggml_context * ctx,
 {
     if (!copy_f32(ctx, w_name.c_str(), conv.w)) return false;
     if ((int64_t)conv.w.size() != (int64_t)k * C_in * C_out) {
-        fprintf(stderr, "campplus_load: %s size mismatch (have %zu, want %d)\n",
-                w_name.c_str(), conv.w.size(), k * C_in * C_out);
-        return false;
+        throw std::runtime_error(w_name);
     }
     if (!b_name_or_empty.empty()) {
         if (!copy_f32(ctx, b_name_or_empty.c_str(), conv.b)) return false;
@@ -59,8 +56,7 @@ static bool load_conv2d(ggml_context * ctx,
 {
     if (!copy_f32(ctx, w_name.c_str(), conv.w)) return false;
     if ((int64_t)conv.w.size() != (int64_t)kH * kW * C_in * C_out) {
-        fprintf(stderr, "campplus_load: %s size mismatch\n", w_name.c_str());
-        return false;
+        throw std::runtime_error(w_name);
     }
     conv.C_out = C_out;
     conv.C_in  = C_in;
@@ -126,7 +122,7 @@ bool campplus_load(const std::string & path, campplus_weights & w)
     ggml_context * tmp = nullptr;
     gguf_init_params gp = {  false,  &tmp };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
-    if (!g) { fprintf(stderr, "campplus_load: cannot open %s\n", path.c_str()); return false; }
+    if (!g) throw std::runtime_error(path);
     auto u32 = [&](const char * k) {
         int64_t id = gguf_find_key(g, k);
         if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
@@ -150,9 +146,8 @@ bool campplus_load(const std::string & path, campplus_weights & w)
         b2_dil        = (int)u32("campplus.block2_dilation");
         b3_dil        = (int)u32("campplus.block3_dilation");
         k_size        = (int)u32("campplus.kernel_size");
-    } catch (const std::exception & e) {
-        fprintf(stderr, "campplus_load: %s\n", e.what());
-        gguf_free(g); if (tmp) ggml_free(tmp); return false;
+    } catch (...) {
+        gguf_free(g); if (tmp) ggml_free(tmp); throw;
     }
     bool ok = true;
     ok &= load_conv2d(tmp, "campplus/head/conv1/weight", 3, 3, 1, 32, 1, 1, 1, 1, w.head.conv1);
@@ -475,9 +470,7 @@ bool campplus_embed(const std::vector<float> & fbank_t_by_c, int T,
 {
     g_vk = backend;
     if ((int64_t)fbank_t_by_c.size() != (int64_t)T * w.feat_dim) {
-        fprintf(stderr, "campplus_embed: fbank has %zu elts, expected %d*%d\n",
-                fbank_t_by_c.size(), T, w.feat_dim);
-        return false;
+        throw std::runtime_error("CAMPPlus fbank");
     }
     std::vector<float> fbank_ct((size_t)w.feat_dim * T);
     for (int t = 0; t < T; ++t)

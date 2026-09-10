@@ -1,8 +1,5 @@
 #pragma once
 namespace tts_cpp::chatterbox {
-// Live Turbo/Nano contract: T3.inference_turbo() + ChatterboxTurboTTS.generate().
-// CFG / min_p / exaggeration are official no-ops and are not knobs here.
-inline constexpr int N_THREADS = 4;
 inline constexpr int SEED = 42;
 inline constexpr int N_PREDICT = 1000;
 inline constexpr int TOP_K = 1000;

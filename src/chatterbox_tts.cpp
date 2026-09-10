@@ -5,24 +5,16 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
-static double now_ms() {
-    using clock = std::chrono::steady_clock;
-    return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
-}
 static void s3_tensor_set(ggml_tensor* t, const void* data, size_t off, size_t bytes) {
     ::ggml_backend_tensor_set(t, data, off, bytes);
 }
@@ -36,7 +28,6 @@ static void compute(ggml_backend_t backend, ggml_cgraph * gf) {
     if (status != GGML_STATUS_SUCCESS) throw std::runtime_error("S3Gen graph failed");
 }
 
-// Counter-based noise: coordinates remain identical when the bounded window moves.
 static float positioned_noise(uint32_t seed, uint64_t position) {
     auto uniform = [](uint64_t x) {
         x += 0x9e3779b97f4a7c15ULL;
@@ -87,11 +78,9 @@ struct model_ctx {
 static model_ctx load_s3gen_gguf(const std::string&, ggml_backend_t);
 namespace {
 struct s3gen_cache_entry { std::string path; std::unique_ptr<model_ctx> m; };
-static std::mutex                            g_s3gen_cache_mu;
-static std::unique_ptr<s3gen_cache_entry>    g_s3gen_cache_entry;
+static std::unique_ptr<s3gen_cache_entry> g_s3gen_cache_entry;
 }
 static void s3gen_model_cache_release() {
-    std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
     if (!g_s3gen_cache_entry) return;
     model_ctx * m = g_s3gen_cache_entry->m.get();
     if (m) {
@@ -104,7 +93,6 @@ static void s3gen_model_cache_release() {
     g_s3gen_cache_entry.reset();
 }
 static model_ctx * s3gen_model_cache_get(const std::string& path, ggml_backend_t backend) {
-    std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
     if (g_s3gen_cache_entry && g_s3gen_cache_entry->path == path) {
         return g_s3gen_cache_entry->m.get();
     }
@@ -792,7 +780,7 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
                                          int harmonic_num, float sine_amp, float noise_std,
                                          float voiced_threshold,
                                          const std::vector<float> & l_w, float l_b,
-                                         uint32_t seed, s3gen_piece_state& state, int64_t sample_start) {
+                                         uint32_t seed) {
     int T_wav = (int)f0_wav.size();
     int H = harmonic_num + 1;
     std::mt19937 rng(seed);
@@ -800,8 +788,7 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
     std::vector<float> phase_vec(H, 0.0f);
     for (int h = 1; h < H; ++h) phase_vec[h] = uniform(rng);
     std::vector<float> sine_waves((size_t)H * T_wav, 0.0f);
-    state.phase.assign(H, 0.0);
-    auto& cum_phase = state.phase;
+    std::vector<double> cum_phase(H, 0.0);
     for (int t = 0; t < T_wav; ++t) {
         float f0 = f0_wav[t];
         bool voiced = f0 > voiced_threshold;
@@ -812,7 +799,7 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
             float sine = sine_amp * std::sin((float)theta + phase_vec[h]);
             float namp = voiced ? noise_std : sine_amp / 3.0f;
             float uv = voiced ? 1.0f : 0.0f;
-            sine_waves[(size_t)h * T_wav + t] = sine * uv + namp * positioned_noise(seed, (sample_start + t) * H + h);
+            sine_waves[(size_t)h * T_wav + t] = sine * uv + namp * positioned_noise(seed, (uint64_t)t * H + h);
         }
     }
     std::vector<float> src(T_wav, 0.0f);
@@ -995,58 +982,34 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     ggml_free(ctx);
     return wav;
 }
-void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_synthesize_opts& opts) {
-    if (speech_tokens.empty()) throw std::runtime_error("S3Gen speech tokens empty");
-    if (!opts.pcm_out) throw std::runtime_error("S3Gen PCM output missing");
-    if (!opts.state) throw std::runtime_error("S3Gen piece state missing");
-    auto& state = *opts.state;
+std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_synthesize_opts& opts) {
     const int output_tokens = (int)speech_tokens.size();
-    if (opts.prompt_token.empty() || opts.embedding.empty() || opts.prompt_feat.empty() || opts.prompt_rows <= 0)
-        throw std::runtime_error("S3Gen voice conditioning missing");
     constexpr int sr = 24000;
-    constexpr int pre_lookahead_len = kSpeechLookaheadTokens;
+    constexpr int pre_lookahead_len = 3;
     const int seed = tts_cpp::chatterbox::SEED;
-    std::vector<float> emb_data = opts.embedding;
-    std::vector<int32_t> pt_data = opts.prompt_token;
-    std::vector<float> pf_data = opts.prompt_feat;
-    int pf_rows = opts.prompt_rows;
     std::vector<int32_t> padded;
     for (int32_t token : speech_tokens) if (token >= 0 && token < 6561) padded.push_back(token);
-    if (padded.empty()) throw std::runtime_error("S3Gen speech tokens invalid");
     padded.insert(padded.end(), pre_lookahead_len, tts_cpp::chatterbox::SILENCE_TOKEN);
     model_ctx& m = *s3gen_model_cache_get(opts.s3gen_gguf_path, nullptr);
-    const model_ctx& m_hift = m;
-    double pipeline_t0 = now_ms();
-    double encoder_ms = 0, cfm_ms = 0, f0_ms = 0, stft_ms = 0, hift_ms = 0;
     const int D = 512;
     const int MEL = 80;
-    int n_prompt = (int)pt_data.size();
+    int n_prompt = (int)opts.prompt_token.size();
     int n_total = n_prompt + (int)padded.size();
     std::vector<int32_t> flow_tokens(n_total);
-    std::memcpy(flow_tokens.data(), pt_data.data(), n_prompt * sizeof(int32_t));
+    std::memcpy(flow_tokens.data(), opts.prompt_token.data(), n_prompt * sizeof(int32_t));
     std::memcpy(flow_tokens.data() + n_prompt, padded.data(), padded.size() * sizeof(int32_t));
-    ggml_tensor * emb_w = find_tensor(m, "flow/input_embedding");
     const std::vector<float>& emb_w_data = m.input_embedding;
-    int vocab_size = (int)emb_w->ne[1];
     std::vector<float> input_embed(n_total * D), mu_T;
-    for (int i = 0; i < n_total; ++i) {
-        int32_t tok = flow_tokens[i];
-        if (tok < 0 || tok >= vocab_size) throw std::runtime_error("S3Gen token out of range");
-        std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)tok * D, D * sizeof(float));
-    }
-    { const double t0 = now_ms();
-      std::vector<float> tmp = run_encoder(m, input_embed, n_total, D); encoder_ms = now_ms() - t0; mu_T.swap(tmp); }
-    int T_mu = 2 * n_total;
-    // Dummy pad is encoder lookahead, not audio. Each hop speaks its own tokens once.
-    const int dropped_lookahead_tokens = pre_lookahead_len;
-    T_mu -= 2 * dropped_lookahead_tokens;
-    if (T_mu <= 0) throw std::runtime_error("S3Gen lookahead trim emptied the encoder");
+    for (int i = 0; i < n_total; ++i)
+        std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)flow_tokens[i] * D, D * sizeof(float));
+    mu_T = run_encoder(m, input_embed, n_total, D);
+    int T_mu = 2 * n_total - 2 * pre_lookahead_len;
     mu_T.resize((size_t)T_mu * MEL);
     std::vector<float> mu(T_mu * MEL);
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mu; ++t)
             mu[m2 * T_mu + t] = mu_T[t * MEL + m2];
-    const float * emb_raw = emb_data.data();
+    const float * emb_raw = opts.embedding.data();
     float norm = 0.0f;
     for (int i = 0; i < 192; ++i) norm += emb_raw[i] * emb_raw[i];
     norm = std::sqrt(norm + 1e-12f);
@@ -1060,10 +1023,9 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         for (int i = 0; i < 192; ++i) acc += saw_data[o * 192 + i] * emb_norm[i];
         spks[o] = acc;
     }
-    int mel_len1 = pf_rows;
-    if (mel_len1 > T_mu) throw std::runtime_error("S3Gen prompt exceeds output");
+    int mel_len1 = opts.prompt_rows;
     std::vector<float> cond(T_mu * MEL, 0.0f);
-    const float * pf_raw = pf_data.data();
+    const float * pf_raw = opts.prompt_feat.data();
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < mel_len1; ++t)
             cond[m2 * T_mu + t] = pf_raw[t * MEL + m2];
@@ -1081,52 +1043,29 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
         t_span.push_back((float)i / (float)cfm_steps);
     if (!m.first_cfm) m.first_cfm = std::make_unique<cfm_estimator_cache>();
     cfm_estimator_cache & cfm_cache = *m.first_cfm;
-    const double cfm_started = now_ms();
     for (size_t step = 0; step + 1 < t_span.size(); ++step) {
         const float t = t_span[step], r = t_span[step + 1], dt = r - t;
         auto t_emb = compute_time_mixed(m, compute_time_mlp(m, t), compute_time_mlp(m, r));
         std::vector<float> dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, false);
         for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
     }
-    cfm_ms = now_ms() - cfm_started;
     const int T_mel = T_mu - mel_len1;
-    if (T_mel <= 0) throw std::runtime_error("S3Gen streaming mel range empty");
     std::vector<float> mel(MEL * T_mel);
-    const int mel_off = mel_len1;
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mel; ++t)
-            mel[m2 * T_mel + t] = z[m2 * T_mu + (t + mel_off)];
-    const double f0_started = now_ms();
-    auto f0 = run_f0_predictor(m_hift, mel, T_mel); f0_ms = now_ms() - f0_started;
+            mel[m2 * T_mel + t] = z[m2 * T_mu + (t + mel_len1)];
+    auto f0 = run_f0_predictor(m, mel, T_mel);
     int upsample = 8 * 5 * 3 * 4;
     int T_wav = T_mel * upsample;
     std::vector<float> f0_up(T_wav);
     for (int i = 0; i < T_mel; ++i)
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
-    auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, m_hift.hift_linear_w, m_hift.hift_linear_b,
-        (uint32_t)(seed + 1), state, 0);
-    const double stft_started = now_ms();
-    auto s_stft = run_stft(m_hift, src); stft_ms = now_ms() - stft_started;
+    auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, m.hift_linear_w, m.hift_linear_b, (uint32_t)(seed + 1));
+    auto s_stft = run_stft(m, src);
     int T_stft = (int)(s_stft.size() / 18);
-    const double hift_started = now_ms();
-    auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft); hift_ms = now_ms() - hift_started;
+    auto wav = run_hift_decode(m, mel, T_mel, s_stft, T_stft);
     if ((int)wav.size() != output_tokens * kSamplesPerToken) throw std::runtime_error("S3Gen waveform range mismatch");
-    state.source = std::move(src);
-    const double pipeline_total = now_ms() - pipeline_t0;
-    state.encoder_ms += encoder_ms;
-    state.cfm_ms += cfm_ms;
-    state.f0_ms += f0_ms;
-    state.stft_ms += stft_ms;
-    state.hift_ms += hift_ms;
-    state.pipeline_ms += pipeline_total;
-    state.samples += (int)wav.size();
-    state.prompt_tokens = n_prompt;
-    state.speech_tokens = output_tokens;
-    state.history_tokens = 0;
-    state.window_tokens = output_tokens;
-    state.cfm_steps_used = cfm_steps;
-    state.emitted = wav.size();
-    *opts.pcm_out = std::move(wav);
+    return wav;
 }
 void s3gen_preload(const std::string& path, ggml_backend_t backend) {
     (void)s3gen_model_cache_get(path, backend);

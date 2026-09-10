@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <map>
 #include <random>
@@ -34,11 +33,11 @@ ggml_backend_t init_backend() {
     if (!b) throw std::runtime_error("Vulkan backend init failed");
     return b;
 }
-bool load_model_gguf(const std::string & path, chatterbox_model & model) {
+void load_model_gguf(const std::string & path, chatterbox_model & model) {
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gguf_params = {  false,  &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
-    if (!gguf_ctx) { fprintf(stderr, "%s: failed to open '%s'\n", __func__, path.c_str()); return false; }
+    if (!gguf_ctx) throw std::runtime_error("T3 GGUF open failed");
     try {
         auto & hp = model.hparams;
         hp.n_text_vocab       = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_TEXT_VOCAB_SIZE));
@@ -117,14 +116,12 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model) {
             for (size_t i = 0; i < n_mer; ++i)
                 model.tok_merges.emplace_back(gguf_get_arr_str(gguf_ctx, mer_kid, i));
         }
-    } catch (const std::exception & e) {
-        fprintf(stderr, "%s: %s\n", __func__, e.what());
+    } catch (...) {
         gguf_free(gguf_ctx); if (tmp_ctx) ggml_free(tmp_ctx);
-        return false;
+        throw;
     }
     gguf_free(gguf_ctx);
     ggml_free(tmp_ctx);
-    return true;
 }
 static ggml_tensor * build_transformer_core(
     ggml_context * ctx, ggml_cgraph * gf,
@@ -248,14 +245,11 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
     ggml_free(ctx);
     return gf;
 }
-bool eval_prompt(
+void eval_prompt(
     const chatterbox_model & model, ggml_gallocr_t allocr,
     const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
     prompt_len = 1 + model.hparams.cond_prompt_len + (int)text_tokens.size() + 1;
-    if (prompt_len > model.hparams.n_ctx) {
-        fprintf(stderr, "%s: prompt %d exceeds context %d\n", __func__, prompt_len, model.hparams.n_ctx);
-        return false;
-    }
+    if (prompt_len > model.hparams.n_ctx) throw std::runtime_error("T3 prompt exceeds context");
     ggml_cgraph * gf = build_prompt_graph(model, (int)text_tokens.size());
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
@@ -268,7 +262,7 @@ bool eval_prompt(
     {
         const int N = prompt_len;
         ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "kq_mask");
-        if (!kq_mask) return false;
+        if (!kq_mask) throw std::runtime_error("T3 kq_mask missing");
         const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
         std::vector<ggml_fp16_t> mask((size_t)N * N, zero_h);
@@ -277,16 +271,14 @@ bool eval_prompt(
                 if (k > q) mask[(size_t)q * N + k] = ninf_h;
         ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
     }
-    const auto status = ggml_backend_graph_compute(model.backend, gf);
-    if (status != GGML_STATUS_SUCCESS) return false;
+    if (ggml_backend_graph_compute(model.backend, gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("T3 prompt failed");
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);
     ggml_backend_tensor_get(logits, logits_out.data(),
         (size_t)model.hparams.n_speech_vocab*(prompt_len-1)*sizeof(float),
         (size_t)model.hparams.n_speech_vocab*sizeof(float));
-    return true;
 }
-bool eval_step(
+void eval_step(
     const chatterbox_model & model, ggml_gallocr_t allocr,
     int n_past, int32_t token, std::vector<float> & logits_out) {
     ggml_cgraph * gf = build_step_graph(model, n_past);
@@ -295,40 +287,35 @@ bool eval_step(
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
     int32_t position = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), &position, 0, sizeof(position));
-    const auto status = ggml_backend_graph_compute(model.backend, gf);
-    if (status != GGML_STATUS_SUCCESS) return false;
+    if (ggml_backend_graph_compute(model.backend, gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("T3 step failed");
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);
     ggml_backend_tensor_get(logits, logits_out.data(), 0, (size_t)model.hparams.n_speech_vocab*sizeof(float));
-    return true;
 }
 int32_t sample_next_token_ex(
     const std::vector<float> & logits,
     const std::vector<int32_t> & generated,
-    const chatterbox_sampling_params & params,
     std::mt19937 & rng) {
     const int n = (int)logits.size();
-    
     std::vector<float> scores(logits.begin(), logits.end());
-    if (params.temp > 0.0f && params.temp != 1.0f) {
-        float inv_t = 1.0f / params.temp;
+    if (TEMPERATURE > 0.0f && TEMPERATURE != 1.0f) {
+        float inv_t = 1.0f / TEMPERATURE;
         for (float & s : scores) s *= inv_t;
     }
-    if (params.top_k > 0 && params.top_k < n) {
+    if (TOP_K > 0 && TOP_K < n) {
         std::vector<float> tmp(scores);
-        std::nth_element(tmp.begin(), tmp.begin() + params.top_k, tmp.end(), std::greater<float>());
-        float threshold = tmp[params.top_k];
+        std::nth_element(tmp.begin(), tmp.begin() + TOP_K, tmp.end(), std::greater<float>());
+        float threshold = tmp[TOP_K];
         int kept = 0;
         for (float s : scores) if (s > threshold) ++kept;
-        if (kept < params.top_k) threshold -= 1e-10f;
+        if (kept < TOP_K) threshold -= 1e-10f;
         for (float & s : scores) if (s <= threshold) s = -INFINITY;
     }
-    if (params.top_p < 1.0f) {
+    if (TOP_P < 1.0f) {
         struct IS { int idx; float s; };
         std::vector<IS> sorted;
         sorted.reserve(n);
         for (int i = 0; i < n; ++i) if (scores[i] != -INFINITY) sorted.push_back({i, scores[i]});
-        if (sorted.empty()) throw std::runtime_error("top_p emptied the speech vocab");
         std::sort(sorted.begin(), sorted.end(), [](const IS& a, const IS& b){ return a.s > b.s; });
         float mx = sorted[0].s;
         std::vector<float> probs(sorted.size());
@@ -340,12 +327,11 @@ int32_t sample_next_token_ex(
         for (size_t i = 0; i < sorted.size(); ++i) {
             cum += probs[i];
             keep_set.insert(sorted[i].idx);
-            if (cum >= params.top_p) break;
+            if (cum >= TOP_P) break;
         }
-        if (keep_set.empty()) throw std::runtime_error("top_p emptied the speech vocab");
         for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
-    apply_speech_repeat_penalty(scores.data(), n, generated, params.repeat_penalty);
+    apply_speech_repeat_penalty(scores.data(), n, generated);
     float mx = -INFINITY;
     for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
     std::vector<float> probs(n);

@@ -1,14 +1,8 @@
 #include "gpt2_bpe.h"
 #include <algorithm>
-#include <cassert>
-#include <cstdio>
 #include <cstdint>
-#include <functional>
-#include <queue>
 #include <regex>
-#include <sstream>
 #include <stdexcept>
-#include <unordered_set>
 static std::unordered_map<uint8_t, std::string> build_byte_to_unicode() {
     std::unordered_map<uint8_t, std::string> m;
     auto cpt_to_utf8 = [](uint32_t cp) -> std::string {
