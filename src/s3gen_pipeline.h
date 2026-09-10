@@ -5,17 +5,15 @@
 #include <vector>
 struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
-constexpr int kSpeechHistoryTokens = 25;
 constexpr int kSpeechLookaheadTokens = 3;
 constexpr int kSamplesPerToken = 960;
 struct s3gen_piece_state {
-    int token_end = 0;
-    std::vector<float> mel, source, pending_pcm;
+    std::vector<float> source;
     std::vector<double> phase;
     double encoder_ms = 0, cfm_ms = 0, f0_ms = 0, stft_ms = 0, hift_ms = 0, pipeline_ms = 0;
     int samples = 0, prompt_tokens = 0, speech_tokens = 0;
     int history_tokens = 0, window_tokens = 0, cfm_steps_used = 0;
-    std::size_t pending_in = 0, emit_begin = 0, emit_end = 0, hold = 0, emitted = 0;
+    std::size_t emitted = 0;
 };
 struct s3gen_synthesize_opts {
     std::string s3gen_gguf_path;
@@ -24,11 +22,6 @@ struct s3gen_synthesize_opts {
     int prompt_rows = 0;
     std::vector<float> embedding;
     std::vector<int32_t> prompt_token;
-    bool last_piece = true;
-    bool first_piece = true;
-    int chunk_id = 0;
-    int token_start = 0;
-    int token_end = 0;
     s3gen_piece_state* state = nullptr;
 };
 void s3gen_synthesize(const std::vector<int32_t>&, const s3gen_synthesize_opts&);

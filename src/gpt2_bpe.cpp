@@ -7,6 +7,7 @@
 #include <queue>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_set>
 static std::unordered_map<uint8_t, std::string> build_byte_to_unicode() {
     std::unordered_map<uint8_t, std::string> m;
@@ -146,7 +147,7 @@ std::vector<int32_t> gpt2_bpe::tokenize(const std::string & text) const {
     return ids;
 }
 std::string gpt2_bpe::punc_norm(const std::string & text) {
-    if (text.empty()) return "You need to add some text for me to talk.";
+    if (text.empty()) throw std::runtime_error("empty text");
     std::string t = text;
     if (t[0] >= 'a' && t[0] <= 'z') t[0] = t[0] - 'a' + 'A';
     {
@@ -179,10 +180,9 @@ std::string gpt2_bpe::punc_norm(const std::string & text) {
         if (b == ' ' || b == '\t' || b == '\n' || b == '\r') t.pop_back();
         else break;
     }
-    if (!t.empty()) {
-        char last = t.back();
-        if (last != '.' && last != '!' && last != '?' && last != '-' && last != ',')
-            t += '.';
-    }
+    if (t.empty()) throw std::runtime_error("empty text");
+    char last = t.back();
+    if (last != '.' && last != '!' && last != '?' && last != '-' && last != ',')
+        t += '.';
     return t;
 }

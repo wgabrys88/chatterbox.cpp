@@ -93,10 +93,10 @@ struct chatterbox_model {
     std::vector<std::string> tok_merges;
 };
 struct chatterbox_sampling_params {
-    int32_t top_k          = 1000;
-    float   top_p          = 0.95f;
-    float   temp           = 0.5f;
-    float   repeat_penalty = 1.2f;
+    int32_t top_k          = TOP_K;
+    float   top_p          = TOP_P;
+    float   temp           = TEMPERATURE;
+    float   repeat_penalty = REPEAT_PENALTY;
 };
 ggml_backend_t init_backend();
 bool load_model_gguf(

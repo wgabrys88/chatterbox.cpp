@@ -52,13 +52,6 @@ std::string json_escape(const std::string& s) {
     }
     return out;
 }
-bool consecutive_repeat(const std::vector<int32_t>& generated, int32_t token, int count) {
-    if (count < 2 || (int)generated.size() < count - 1) return false;
-    for (int i = 1; i < count; ++i) {
-        if (generated[generated.size() - (size_t)i] != token) return false;
-    }
-    return true;
-}
 }
 struct Engine::Impl {
     EngineOptions opts;
@@ -69,12 +62,11 @@ struct Engine::Impl {
     std::vector<float> embedding;
     std::vector<int32_t> prompt_token;
     s3gen_piece_state acoustic;
-    std::vector<int32_t> speech_history;
     std::string piece_text, piece_stop;
     std::vector<int32_t> piece_text_tokens, piece_speech;
     int piece_t3_ms = 0, piece_s3_ms = 0;
     explicit Impl(const EngineOptions& o) : opts(o) {}
-    void reset_acoustics() { acoustic = {}; speech_history.clear(); }
+    void reset_acoustics() { acoustic = {}; }
     void init() {
         if (!std::filesystem::exists(opts.t3_gguf_path)) throw std::runtime_error("T3 GGUF missing");
         if (!std::filesystem::exists(opts.s3gen_gguf_path)) throw std::runtime_error("S3Gen GGUF missing");
@@ -133,10 +125,6 @@ struct Engine::Impl {
         const auto started = std::chrono::steady_clock::now();
         std::mt19937 rng(SEED);
         chatterbox_sampling_params sp;
-        sp.top_k = TOP_K;
-        sp.top_p = TOP_P;
-        sp.temp = TEMPERATURE;
-        sp.repeat_penalty = REPEAT_PENALTY;
 
         gpt2_bpe bpe;
         bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
@@ -144,21 +132,14 @@ struct Engine::Impl {
 
         int n_past = 0;
         int32_t token = 0;
-        bool repeat_stopped = false;
         std::vector<int32_t> out, tokens;
         out.reserve((size_t)N_PREDICT + 1);
-        tokens.reserve((size_t)N_PREDICT);
+        tokens.reserve((size_t)N_PREDICT + (size_t)SILENCE_COUNT);
         const int32_t stop = model.hparams.stop_speech_token;
-        const int n_text = (int)text_tokens.size();
-        auto hold_eos = [&](std::vector<float> & logits) {
-            if ((int)out.size() < n_text * 4)
-                logits[(size_t)stop] = -INFINITY;
-        };
 
         std::vector<float> logits;
         if (!eval_prompt(model, allocr, text_tokens, logits, n_past))
             throw std::runtime_error("T3 prompt failed");
-        hold_eos(logits);
         token = sample_next_token_ex(logits, out, sp, rng);
         out.push_back(token);
         if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
@@ -166,12 +147,7 @@ struct Engine::Impl {
         for (int step = 1; step < N_PREDICT && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
             if (!eval_step(model, allocr, n_past++, token, logits))
                 throw std::runtime_error("T3 step failed");
-            hold_eos(logits);
             token = sample_next_token_ex(logits, out, sp, rng);
-            if (REPEAT_STOP >= 2 && consecutive_repeat(out, token, REPEAT_STOP)) {
-                repeat_stopped = true;
-                token = stop;
-            }
             out.push_back(token);
             if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
         }
@@ -180,8 +156,9 @@ struct Engine::Impl {
         piece_text = text;
         piece_text_tokens = std::move(text_tokens);
         piece_speech = tokens;
-        piece_stop = repeat_stopped ? "repeat" : "eos";
+        piece_stop = "eos";
         piece_t3_ms = (int)(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count() + .5);
+        tokens.insert(tokens.end(), (size_t)SILENCE_COUNT, SILENCE_TOKEN);
         return tokens;
     }
     void emit_piece_ledger(const std::vector<int32_t>& neu) {
@@ -205,11 +182,6 @@ struct Engine::Impl {
         if (tokens.empty()) throw std::runtime_error("S3Gen speech tokens empty");
         acoustic.encoder_ms = acoustic.cfm_ms = acoustic.f0_ms = acoustic.stft_ms = acoustic.hift_ms = acoustic.pipeline_ms = 0;
         acoustic.samples = acoustic.prompt_tokens = acoustic.speech_tokens = 0;
-        acoustic.token_end = (int)speech_history.size();
-        std::vector<int32_t> window;
-        window.reserve(speech_history.size() + tokens.size());
-        window.insert(window.end(), speech_history.begin(), speech_history.end());
-        window.insert(window.end(), tokens.begin(), tokens.end());
         s3gen_synthesize_opts s;
         s.s3gen_gguf_path = opts.s3gen_gguf_path;
         s.prompt_feat = prompt_feat;
@@ -217,24 +189,14 @@ struct Engine::Impl {
         s.embedding = embedding;
         s.prompt_token = prompt_token;
         s.state = &acoustic;
-        s.token_start = 0;
-        s.token_end = (int)window.size();
-        s.last_piece = true;
-        s.first_piece = true;
-        s.chunk_id = 0;
         std::vector<float> pcm;
         s.pcm_out = &pcm;
         const auto s3_started = std::chrono::steady_clock::now();
-        s3gen_synthesize(window, s);
+        s3gen_synthesize(tokens, s);
         piece_s3_ms = (int)(std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - s3_started).count() + .5);
         if (cb) cb(pcm.data(), pcm.size());
         emit_piece_ledger(tokens);
-        if ((int)window.size() > kSpeechHistoryTokens) {
-            speech_history.assign(window.end() - kSpeechHistoryTokens, window.end());
-        } else {
-            speech_history = window;
-        }
     }
 };
 Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(); }

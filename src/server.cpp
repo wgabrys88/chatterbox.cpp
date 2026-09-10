@@ -85,9 +85,10 @@ void emit_server_config() {
         + ",\"top_k\":" + std::to_string(TOP_K)
         + ",\"repeat_penalty\":" + std::to_string(REPEAT_PENALTY)
         + ",\"repeat_last_n\":" + std::to_string(REPEAT_LAST_N)
-        + ",\"repeat_stop_consecutive\":" + std::to_string(REPEAT_STOP)
         + ",\"max_tokens\":" + std::to_string(N_PREDICT)
         + ",\"cfm_steps\":" + std::to_string(CFM_STEPS)
+        + ",\"silence_token\":" + std::to_string(SILENCE_TOKEN)
+        + ",\"silence_count\":" + std::to_string(SILENCE_COUNT)
         + "}");
 }
 
