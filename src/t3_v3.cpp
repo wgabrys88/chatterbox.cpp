@@ -167,9 +167,12 @@ static ggml_tensor * perceiver_attn(ggml_context * ctx, const perceiver_w & w, g
     ggml_tensor * q = linear(ctx, w.to_q_w, n1, w.to_q_b);
     ggml_tensor * k = linear(ctx, w.to_k_w, n2, w.to_k_b);
     ggml_tensor * v = linear(ctx, w.to_v_w, n2, w.to_v_b);
-    q = ggml_reshape_3d(ctx, q, HD, n_q, n_head);
-    k = ggml_reshape_3d(ctx, k, HD, n_kv, n_head);
-    v = ggml_reshape_3d(ctx, v, HD, n_kv, n_head);
+    q = ggml_reshape_3d(ctx, q, HD, n_head, n_q);
+    k = ggml_reshape_3d(ctx, k, HD, n_head, n_kv);
+    v = ggml_reshape_3d(ctx, v, HD, n_head, n_kv);
+    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
     ggml_tensor * attn = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
     ggml_tensor * flat = ggml_reshape_2d(ctx, attn, n_embd, n_q);
     return ggml_add(ctx, x1, linear(ctx, w.proj_w, flat, w.proj_b));

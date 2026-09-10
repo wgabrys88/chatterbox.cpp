@@ -1,6 +1,7 @@
 #include "tts-cpp/chatterbox/engine.h"
 #include "tts-cpp/chatterbox/v3.h"
 #include <algorithm>
+#include <fstream>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -72,7 +73,26 @@ struct Engine::Impl {
             eval_step(model, allocr, n_past++, token, i + 1, logits);
         }
         if (predicted.empty() || predicted.back() != stop) throw std::runtime_error("T3 stopped without EOS");
-        return drop_invalid_tokens(predicted, sos, stop);
+        auto dropped = drop_invalid_tokens(predicted, sos, stop);
+        {
+            std::string p = opts.t3_gguf_path;
+            auto slash = p.find_last_of("\\/");
+            if (slash == std::string::npos) throw std::runtime_error("dump path");
+            std::ofstream f(p.substr(0, slash) + "/v3_t3_dump.txt");
+            if (!f) throw std::runtime_error("dump");
+            f << "bpe";
+            for (int32_t id : ids) f << " " << id;
+            f << "\ntext";
+            for (int32_t id : text_tokens) f << " " << id;
+            f << "\npredicted";
+            for (int32_t id : predicted) f << " " << id;
+            f << "\ndropped";
+            for (int32_t id : dropped) f << " " << id;
+            f << "\npredicted_count " << predicted.size();
+            f << "\ndropped_count " << dropped.size() << "\n";
+            if (!f) throw std::runtime_error("dump write");
+        }
+        return dropped;
     }
 };
 Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(); }
