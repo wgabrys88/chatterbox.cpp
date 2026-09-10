@@ -1,9 +1,9 @@
 #include "s3gen_pipeline.h"
+#include "tts-cpp/chatterbox/nano.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "gguf.h"
-#include "ggml-vulkan.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -19,7 +19,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-static int g_n_threads = 1;
 static double now_ms() {
     using clock = std::chrono::steady_clock;
     return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
@@ -85,15 +84,9 @@ struct model_ctx {
     std::unique_ptr<time_mixed_cache> time_mixed;
     std::unique_ptr<cfm_estimator_cache> first_cfm;
 };
-static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
-    if (n_gpu_layers <= 0) throw std::runtime_error("GPU layers required");
-    auto * b = ggml_backend_vk_init(0);
-    if (!b) throw std::runtime_error("Vulkan S3Gen backend init failed");
-    return b;
-}
-static model_ctx load_s3gen_gguf(const std::string&, int, bool);
+static model_ctx load_s3gen_gguf(const std::string&, ggml_backend_t);
 namespace {
-struct s3gen_cache_entry { std::string path; int gpu = 0; bool fastconv = false; std::unique_ptr<model_ctx> m; };
+struct s3gen_cache_entry { std::string path; std::unique_ptr<model_ctx> m; };
 static std::mutex                            g_s3gen_cache_mu;
 static std::unique_ptr<s3gen_cache_entry>    g_s3gen_cache_entry;
 }
@@ -105,22 +98,19 @@ static void s3gen_model_cache_release() {
         m->first_cfm.reset(); m->time_mixed.reset(); m->time_mlp.reset(); m->first_encoder.reset();
         if (m->buffer_w) { ggml_backend_buffer_free(m->buffer_w); m->buffer_w = nullptr; }
         if (m->ctx_w)    { ggml_free(m->ctx_w);                   m->ctx_w    = nullptr; }
-        if (m->backend)  { ggml_backend_free(m->backend);         m->backend  = nullptr; }
+        m->backend = nullptr;
         m->tensors.clear();
     }
     g_s3gen_cache_entry.reset();
 }
-static model_ctx * s3gen_model_cache_get(const std::string& path, int n_gpu_layers, bool fastconv) {
+static model_ctx * s3gen_model_cache_get(const std::string& path, ggml_backend_t backend) {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
-    if (g_s3gen_cache_entry &&
-        g_s3gen_cache_entry->path == path &&
-        g_s3gen_cache_entry->gpu  == n_gpu_layers &&
-        g_s3gen_cache_entry->fastconv == fastconv) {
+    if (g_s3gen_cache_entry && g_s3gen_cache_entry->path == path) {
         return g_s3gen_cache_entry->m.get();
     }
-    auto m = std::make_unique<model_ctx>(load_s3gen_gguf(path, n_gpu_layers, fastconv));
+    auto m = std::make_unique<model_ctx>(load_s3gen_gguf(path, backend));
     g_s3gen_cache_entry = std::make_unique<s3gen_cache_entry>(
-        s3gen_cache_entry{path, n_gpu_layers, fastconv, std::move(m)});
+        s3gen_cache_entry{path, std::move(m)});
     static bool registered = false;
     if (!registered) {
         std::atexit(s3gen_model_cache_release);
@@ -128,20 +118,21 @@ static model_ctx * s3gen_model_cache_get(const std::string& path, int n_gpu_laye
     }
     return g_s3gen_cache_entry->m.get();
 }
-static model_ctx load_s3gen_gguf(const std::string& path, int n_gpu_layers, bool fastconv) {
+static model_ctx load_s3gen_gguf(const std::string& path, ggml_backend_t backend) {
+    if (!backend) throw std::runtime_error("Vulkan backend required");
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = {  false,  &tmp_ctx };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) throw std::runtime_error("gguf_init_from_file failed: " + path);
-    m.backend = s3gen_init_backend(n_gpu_layers);
+    m.backend = backend;
     int64_t n_tensors = gguf_get_n_tensors(g);
     ggml_init_params p = { ggml_tensor_overhead() * (size_t)n_tensors, nullptr, true };
     m.ctx_w = ggml_init(p);
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(g, i);
         ggml_tensor * src = ggml_get_tensor(tmp_ctx, name);
-        ggml_tensor * dst = fastconv && src->type == GGML_TYPE_F16 && ggml_is_3d(src)
+        ggml_tensor * dst = src->type == GGML_TYPE_F16 && ggml_is_3d(src)
             ? ggml_new_tensor(m.ctx_w, GGML_TYPE_F32, ggml_n_dims(src), src->ne)
             : ggml_dup_tensor(m.ctx_w, src);
         ggml_set_name(dst, name);
@@ -1007,7 +998,6 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     ggml_free(ctx);
     return wav;
 }
-#include "s3gen_pipeline.h"
 void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_synthesize_opts& opts) {
     if (speech_tokens.empty()) throw std::runtime_error("S3Gen speech tokens empty");
     if (!opts.pcm_out) throw std::runtime_error("S3Gen PCM output missing");
@@ -1016,17 +1006,16 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     const int history_tokens = state.token_end - opts.token_start;
     const int output_tokens = opts.token_end - opts.token_start;
     if (history_tokens < 0 || history_tokens > kSpeechHistoryTokens || output_tokens <= history_tokens ||
-        (int)speech_tokens.size() != output_tokens + (opts.final ? 0 : kSpeechLookaheadTokens)) {
+        (int)speech_tokens.size() != output_tokens) {
         fprintf(stderr, "s3gen.history_check: history_tokens=%d kSpeechHistoryTokens=%d output_tokens=%d speech_tokens_size=%zu\n",
                 history_tokens, kSpeechHistoryTokens, output_tokens, speech_tokens.size());
         throw std::runtime_error("S3Gen token range invalid");
     }
     if (opts.prompt_token.empty() || opts.embedding.empty() || opts.prompt_feat.empty() || opts.prompt_rows <= 0)
         throw std::runtime_error("S3Gen voice conditioning missing");
-    g_n_threads = opts.n_threads;
     constexpr int sr = 24000;
     constexpr int pre_lookahead_len = kSpeechLookaheadTokens;
-    const int seed = opts.seed;
+    const int seed = tts_cpp::chatterbox::SEED;
     std::vector<float> emb_data = opts.embedding;
     std::vector<int32_t> pt_data = opts.prompt_token;
     std::vector<float> pf_data = opts.prompt_feat;
@@ -1034,8 +1023,8 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     std::vector<int32_t> padded;
     for (int32_t token : speech_tokens) if (token >= 0 && token < 6561) padded.push_back(token);
     if (padded.empty()) throw std::runtime_error("S3Gen speech tokens invalid");
-    if (opts.final) padded.insert(padded.end(), pre_lookahead_len, 4299);
-    model_ctx& m = *s3gen_model_cache_get(opts.s3gen_gguf_path, opts.n_gpu_layers, opts.fastconv);
+    padded.insert(padded.end(), pre_lookahead_len, 4299);
+    model_ctx& m = *s3gen_model_cache_get(opts.s3gen_gguf_path, nullptr);
     const model_ctx& m_hift = m;
     double pipeline_t0 = now_ms();
     double encoder_ms = 0, cfm_ms = 0, f0_ms = 0, stft_ms = 0, hift_ms = 0;
@@ -1095,7 +1084,7 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
             const int64_t frame = generated ? t - mel_len1 + 2 * opts.token_start : t;
             z[m2 * T_mu + t] = positioned_noise(seed + (generated ? 2 : 0), frame * MEL + m2);
         }
-    const int cfm_steps = opts.cfm_steps;
+    const int cfm_steps = tts_cpp::chatterbox::CFM_STEPS;
     std::vector<float> t_span;
     t_span.reserve(cfm_steps + 1);
     for (int i = 0; i <= cfm_steps; ++i)
@@ -1188,8 +1177,8 @@ void s3gen_synthesize(const std::vector<int32_t>& speech_tokens, const s3gen_syn
     state.emitted = wav.size();
     *opts.pcm_out = std::move(wav);
 }
-void s3gen_preload(const std::string& path, int n_gpu_layers, bool fastconv) {
-    (void)s3gen_model_cache_get(path, n_gpu_layers, fastconv);
+void s3gen_preload(const std::string& path, ggml_backend_t backend) {
+    (void)s3gen_model_cache_get(path, backend);
 }
 void s3gen_unload() {
     s3gen_model_cache_release();

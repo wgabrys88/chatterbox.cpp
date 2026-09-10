@@ -22,13 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt-dir", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--quant", choices=QUANT_CHOICES, default="f16",
-                        help=("Weight dtype for attention + MLP + speech_head projections. "
-                              "f16 (default, ~730 MB), q8_0 (~385 MB), q5_0 (~250 MB), "
-                              "q4_0 (~205 MB). Biases, layer norms, embeddings and "
-                              "positional embeddings always stay at their original dtype. "
-                              "For K-quants (q4_k / q5_k / q6_k), run the resulting f16 "
-                              "GGUF through llama.cpp's llama-quantize instead — the "
-                              "Python gguf package doesn't implement them yet."))
+                        help="Weight dtype for attention + MLP + speech_head projections.")
     return parser.parse_args()
 def as_numpy(tensor: torch.Tensor, *, dtype=None, transpose: bool = False) -> np.ndarray:
     if dtype is not None:

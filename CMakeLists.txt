@@ -13,7 +13,7 @@ endif()
 find_package(OpenMP)
 add_library(tts-cpp STATIC
     src/main.cpp
-    src/t3_turbo.cpp
+    src/t3_nano.cpp
     src/gpt2_bpe.cpp
     src/chatterbox_tts.cpp
     src/chatterbox_engine.cpp

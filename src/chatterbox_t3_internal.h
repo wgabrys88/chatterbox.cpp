@@ -9,26 +9,16 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "tts-cpp/chatterbox/nano.h"
 namespace tts_cpp::chatterbox::detail {
 constexpr int CHBX_MAX_NODES = 8192;
-constexpr int REPEAT_PENALTY_LAST_N = 4;
-constexpr int REPEAT_STOP_CONSECUTIVE = 16;
-
-inline void apply_min_p(float * scores, int vocab, float min_p) {
-    if (min_p <= 0.0f || vocab <= 0) return;
-    float maxl = -INFINITY;
-    for (int i = 0; i < vocab; ++i) if (scores[i] != -INFINITY && scores[i] > maxl) maxl = scores[i];
-    if (maxl == -INFINITY) return;
-    const float thresh = maxl + std::log(min_p);
-    for (int i = 0; i < vocab; ++i) if (scores[i] < thresh) scores[i] = -INFINITY;
-}
 
 inline void apply_speech_repeat_penalty(float * scores, int vocab,
                                         const std::vector<int32_t> & generated,
                                         float penalty) {
     if (penalty == 1.0f || generated.empty() || vocab <= 0) return;
-    const size_t start = generated.size() > (size_t)REPEAT_PENALTY_LAST_N
-        ? generated.size() - (size_t)REPEAT_PENALTY_LAST_N : 0;
+    const size_t start = generated.size() > (size_t)REPEAT_LAST_N
+        ? generated.size() - (size_t)REPEAT_LAST_N : 0;
     std::set<int32_t> seen;
     for (size_t i = start; i < generated.size(); ++i) seen.insert(generated[i]);
     for (int32_t t : seen) {
@@ -108,14 +98,12 @@ struct chatterbox_sampling_params {
     float   top_p          = 0.95f;
     float   temp           = 0.5f;
     float   repeat_penalty = 1.2f;
-    float   min_p          = 0.0f;
 };
-ggml_backend_t init_backend(int n_gpu_layers);
+ggml_backend_t init_backend();
 bool load_model_gguf(
     const std::string & path,
     chatterbox_model &  model,
-    int                 requested_ctx,
-    int                 n_gpu_layers);
+    int                 requested_ctx);
 bool eval_prompt(
     const chatterbox_model &     model,
     ggml_gallocr_t               allocr,

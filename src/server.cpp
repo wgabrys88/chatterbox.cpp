@@ -9,7 +9,7 @@
 #include <ws2tcpip.h>
 #include "tts-cpp/chatterbox/engine.h"
 #include "tts-cpp/chatterbox/log.h"
-#include "chatterbox_t3_internal.h"
+#include "tts-cpp/chatterbox/nano.h"
 
 using args_t = std::unordered_map<std::string, std::string>;
 
@@ -70,56 +70,26 @@ struct wire_writer {
 
 tts_cpp::chatterbox::Engine make_engine(const args_t& args) {
     tts_cpp::chatterbox::EngineOptions o;
-    auto s = [&](const char* k) -> const std::string& { return args.at(k); };
-    auto i = [&](const char* k) { return std::stoi(s(k)); };
-    auto f = [&](const char* k) { return std::stof(s(k)); };
-    o.t3_gguf_path = s("--model"); o.s3gen_gguf_path = s("--s3gen-gguf");
-    o.reference_audio = s("--reference");
-    o.n_gpu_layers = i("--n-gpu-layers"); o.n_threads = i("--threads"); o.seed = i("--seed");
-    o.n_predict = i("--max-tokens"); o.n_ctx = i("--context"); o.top_k = i("--top-k");
-    o.top_p = f("--top-p"); o.min_p = f("--min-p"); o.temperature = f("--temperature");
-    o.repeat_penalty = f("--repeat-penalty");
-    o.repeat_stop_consecutive = i("--repeat-stop");
-    o.cfm_steps = i("--cfm-steps");
-    o.fastconv = i("--fastconv") != 0; o.audit_dir = s("--audit-dir");
+    o.t3_gguf_path = args.at("--model");
+    o.s3gen_gguf_path = args.at("--s3gen-gguf");
+    o.reference_audio = args.at("--reference");
     return tts_cpp::chatterbox::Engine(o);
 }
 
-std::string json_escape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (unsigned char c : s) {
-        if (c == '"' || c == '\\') { out += '\\'; out += (char)c; }
-        else if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else if (c == '\t') out += "\\t";
-        else if (c < 0x20) {
-            char b[8];
-            std::snprintf(b, sizeof(b), "\\u%04x", c);
-            out += b;
-        } else out += (char)c;
-    }
-    return out;
-}
-
-void emit_server_config(const args_t& args) {
-    auto s = [&](const char* k) -> const std::string& { return args.at(k); };
-    const std::string json =
-        std::string("{\"event\":\"server.config\"")
-        + ",\"family\":\"" + json_escape(s("--family")) + "\""
-        + ",\"seed\":" + s("--seed")
-        + ",\"temperature\":" + s("--temperature")
-        + ",\"min_p\":" + s("--min-p")
-        + ",\"top_p\":" + s("--top-p")
-        + ",\"top_k\":" + s("--top-k")
-        + ",\"repeat_penalty\":" + s("--repeat-penalty")
-        + ",\"repeat_last_n\":" + std::to_string(tts_cpp::chatterbox::detail::REPEAT_PENALTY_LAST_N)
-        + ",\"repeat_stop_consecutive\":" + s("--repeat-stop")
-        + ",\"max_tokens\":" + s("--max-tokens")
-        + ",\"context\":" + s("--context")
-        + ",\"cfm_steps\":" + s("--cfm-steps")
-        + "}";
-    tts_jsonl(json);
+void emit_server_config() {
+    using namespace tts_cpp::chatterbox;
+    tts_jsonl(std::string("{\"event\":\"server.config\",\"family\":\"nano\"")
+        + ",\"seed\":" + std::to_string(SEED)
+        + ",\"temperature\":" + std::to_string(TEMPERATURE)
+        + ",\"top_p\":" + std::to_string(TOP_P)
+        + ",\"top_k\":" + std::to_string(TOP_K)
+        + ",\"repeat_penalty\":" + std::to_string(REPEAT_PENALTY)
+        + ",\"repeat_last_n\":" + std::to_string(REPEAT_LAST_N)
+        + ",\"repeat_stop_consecutive\":" + std::to_string(REPEAT_STOP)
+        + ",\"max_tokens\":" + std::to_string(N_PREDICT)
+        + ",\"context\":" + std::to_string(N_CTX)
+        + ",\"cfm_steps\":" + std::to_string(CFM_STEPS)
+        + "}");
 }
 
 void emit_synthesis_begin(const std::vector<request_t>& requests) {
@@ -237,7 +207,7 @@ int main(int argc, char** argv) {
         tts_emit("server.start", "port=" + args.at("--port"));
         auto tts = make_engine(args);
         tts.warm_up();
-        emit_server_config(args);
+        emit_server_config();
 
         WSADATA wsa{};
         if (WSAStartup(MAKEWORD(2, 2), &wsa)) throw std::runtime_error("WSAStartup failed");
@@ -254,8 +224,7 @@ int main(int argc, char** argv) {
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address))) throw std::runtime_error("bind failed");
         if (listen(listener, 1)) throw std::runtime_error("listen failed");
-        tts_emit("server.ready", "port=" + std::to_string(ntohs(address.sin_port)) +
-            " family=" + args.at("--family"));
+        tts_emit("server.ready", "port=" + std::to_string(ntohs(address.sin_port)));
 
         unsigned long long connection = 0;
         for (;;) {

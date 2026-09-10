@@ -10,20 +10,6 @@ struct EngineOptions {
     std::string t3_gguf_path;
     std::string s3gen_gguf_path;
     std::string reference_audio;
-    int n_gpu_layers = 99;
-    int n_threads = 4;
-    int seed = 42;
-    int n_predict = 1000;
-    int n_ctx = 2048;
-    int top_k = 1000;
-    float top_p = .95f;
-    float min_p = 0.f;
-    float temperature = .5f;
-    float repeat_penalty = 1.2f;
-    int repeat_stop_consecutive = 16;
-    int cfm_steps = 1;
-    bool fastconv = true;
-    std::string audit_dir;
 };
 struct SynthesisPiece {
     std::uint32_t id = 0;

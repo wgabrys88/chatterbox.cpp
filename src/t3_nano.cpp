@@ -29,13 +29,12 @@ static ggml_tensor * require_tensor(const chatterbox_model & m, const char * nam
     if (it == m.tensors.end() || !it->second) throw std::runtime_error(std::string("missing tensor: ") + name);
     return it->second;
 }
-ggml_backend_t init_backend(int n_gpu_layers) {
-    if (n_gpu_layers <= 0) throw std::runtime_error("GPU layers required");
+ggml_backend_t init_backend() {
     auto * b = ggml_backend_vk_init(0);
     if (!b) throw std::runtime_error("Vulkan backend init failed");
     return b;
 }
-bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
+bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx) {
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gguf_params = {  false,  &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
@@ -54,8 +53,8 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
         hp.n_head  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_HEAD));
         hp.n_layer = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_LAYER));
         if (requested_ctx <= 0) throw std::runtime_error("context required");
+        if (!model.backend) throw std::runtime_error("Vulkan backend required");
         hp.n_ctx = requested_ctx;
-        model.backend = init_backend(n_gpu_layers);
         const int64_t num_tensors = gguf_get_n_tensors(gguf_ctx);
         ggml_init_params params = { ggml_tensor_overhead() * (size_t) num_tensors, nullptr, true };
         model.ctx_w = ggml_init(params);
@@ -323,7 +322,6 @@ int32_t sample_next_token_ex(
         float inv_t = 1.0f / params.temp;
         for (float & s : scores) s *= inv_t;
     }
-    apply_min_p(scores.data(), n, params.min_p);
     if (params.top_k > 0 && params.top_k < n) {
         std::vector<float> tmp(scores);
         std::nth_element(tmp.begin(), tmp.begin() + params.top_k, tmp.end(), std::greater<float>());

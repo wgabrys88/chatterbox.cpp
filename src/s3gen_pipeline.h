@@ -3,12 +3,13 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+struct ggml_backend;
+typedef struct ggml_backend * ggml_backend_t;
 constexpr int kSpeechHistoryTokens = 25;
 constexpr int kSpeechLookaheadTokens = 3;
 constexpr int kSamplesPerToken = 960;
 struct s3gen_piece_state {
     int token_end = 0;
-    // Channel-major mel and sample-major excitation for the preceding history tokens.
     std::vector<float> mel, source, pending_pcm;
     std::vector<double> phase;
     double encoder_ms = 0, cfm_ms = 0, f0_ms = 0, stft_ms = 0, hift_ms = 0, pipeline_ms = 0;
@@ -23,12 +24,6 @@ struct s3gen_synthesize_opts {
     int prompt_rows = 0;
     std::vector<float> embedding;
     std::vector<int32_t> prompt_token;
-    int seed = 42;
-    int n_threads = 4;
-    int n_gpu_layers = 99;
-    int cfm_steps = 1;
-    bool fastconv = true;
-    bool final = true;
     bool last_piece = true;
     bool first_piece = true;
     int chunk_id = 0;
@@ -37,5 +32,5 @@ struct s3gen_synthesize_opts {
     s3gen_piece_state* state = nullptr;
 };
 void s3gen_synthesize(const std::vector<int32_t>&, const s3gen_synthesize_opts&);
-void s3gen_preload(const std::string&, int, bool);
+void s3gen_preload(const std::string&, ggml_backend_t);
 void s3gen_unload();

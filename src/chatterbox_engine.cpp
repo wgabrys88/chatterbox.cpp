@@ -1,16 +1,15 @@
 #include "tts-cpp/chatterbox/engine.h"
 #include "tts-cpp/chatterbox/log.h"
+#include "tts-cpp/chatterbox/nano.h"
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 #include "chatterbox_t3_internal.h"
 #include "gpt2_bpe.h"
@@ -60,19 +59,11 @@ bool consecutive_repeat(const std::vector<int32_t>& generated, int32_t token, in
     }
     return true;
 }
-void join(std::thread& t) { if (t.joinable()) t.join(); }
-void ledger_append(const std::string& dir, const char* name, const std::string& line) {
-    if (dir.empty()) return;
-    std::ofstream out(std::filesystem::path(dir) / name, std::ios::app);
-    if (!out) throw std::runtime_error(std::string("cannot append ledger ") + name);
-    out << line << '\n';
-}
 }
 struct Engine::Impl {
     EngineOptions opts;
     chatterbox_model model{};
     ggml_gallocr_t allocr = nullptr;
-    std::thread preload;
     std::vector<float> prompt_feat;
     int prompt_rows = 0;
     std::vector<float> embedding;
@@ -82,42 +73,8 @@ struct Engine::Impl {
     std::string piece_text, piece_stop;
     std::vector<int32_t> piece_text_tokens, piece_speech;
     int piece_t3_ms = 0, piece_s3_ms = 0;
-    static std::string json_i32(const std::vector<int32_t>& v) {
-        std::string s = "[";
-        for (size_t i = 0; i < v.size(); ++i) {
-            if (i) s += ',';
-            s += std::to_string(v[i]);
-        }
-        return s + "]";
-    }
-    void emit_t3_text_tokens(const std::vector<int32_t>& ids) {
-        if (opts.audit_dir.empty()) return;
-        const auto ctx = tts_get_context();
-        tts_jsonl(std::string("{\"event\":\"t3.text_tokens\",\"run_id\":\"") + json_escape(tts_run_identity()) +
-            "\",\"response\":" + std::to_string(ctx.response) + ",\"piece\":" + std::to_string(ctx.piece) +
-            ",\"ids\":" + json_i32(ids) + "}");
-    }
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void reset_acoustics() { acoustic = {}; speech_history.clear(); }
-    void write_meta() {
-        if (opts.audit_dir.empty()) return;
-        std::filesystem::create_directories(opts.audit_dir);
-        std::ofstream out(std::filesystem::path(opts.audit_dir) / "00-meta.json", std::ios::trunc);
-        if (!out) throw std::runtime_error("cannot write 00-meta.json");
-        out << "{\"run\":\"" << json_escape(tts_run_identity())
-            << "\",\"seed\":" << opts.seed
-            << ",\"min_p\":" << opts.min_p
-            << ",\"repeat_penalty\":" << opts.repeat_penalty
-            << ",\"repeat_last_n\":" << REPEAT_PENALTY_LAST_N
-            << ",\"repeat_stop\":" << opts.repeat_stop_consecutive
-            << ",\"cfm_steps\":" << opts.cfm_steps
-            << ",\"n_ctx\":" << opts.n_ctx
-            << ",\"max_tokens\":" << opts.n_predict
-            << ",\"temperature\":" << opts.temperature
-            << ",\"top_k\":" << opts.top_k
-            << ",\"top_p\":" << opts.top_p
-            << "}\n";
-    }
     void init() {
         if (!std::filesystem::exists(opts.t3_gguf_path)) throw std::runtime_error("T3 GGUF missing");
         if (!std::filesystem::exists(opts.s3gen_gguf_path)) throw std::runtime_error("S3Gen GGUF missing");
@@ -125,16 +82,14 @@ struct Engine::Impl {
         ggml_time_init();
         g_log_verbose = 0;
         ggml_log_set(chatterbox_log_cb, nullptr);
-        if (!load_model_gguf(opts.t3_gguf_path, model, opts.n_ctx, opts.n_gpu_layers)) throw std::runtime_error("T3 load failed");
+        model.backend = init_backend();
+        if (!load_model_gguf(opts.t3_gguf_path, model, N_CTX)) throw std::runtime_error("T3 load failed");
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         if (!allocr) throw std::runtime_error("T3 allocator failed");
-        preload = std::thread([this] { s3gen_preload(opts.s3gen_gguf_path, opts.n_gpu_layers, opts.fastconv); });
         bake_voice();
-        join(preload);
-        write_meta();
+        s3gen_preload(opts.s3gen_gguf_path, model.backend);
     }
     ~Impl() {
-        join(preload);
         s3gen_unload();
         if (allocr) ggml_gallocr_free(allocr);
         free_model();
@@ -150,7 +105,7 @@ struct Engine::Impl {
         model = {};
     }
     void bake_voice() {
-        const int n_threads = opts.n_threads;
+        const int n_threads = N_THREADS;
         voice_encoder_weights ve;
         if (!voice_encoder_load(opts.t3_gguf_path, ve)) throw std::runtime_error("VoiceEncoder weights missing");
         std::vector<float> wav, speaker;
@@ -183,26 +138,24 @@ struct Engine::Impl {
         if (session_index >= 0) { synthesis_context.valid = true; synthesis_context.piece = external_piece; }
         tts_context_scope context_scope(synthesis_context);
         const auto started = std::chrono::steady_clock::now();
-        const int n_threads = opts.n_threads;
-        std::mt19937 rng(opts.seed);
+        const int n_threads = N_THREADS;
+        std::mt19937 rng(SEED);
         chatterbox_sampling_params sp;
-        sp.top_k = opts.top_k;
-        sp.top_p = opts.top_p;
-        sp.min_p = opts.min_p;
-        sp.temp = opts.temperature;
-        sp.repeat_penalty = opts.repeat_penalty;
+        sp.top_k = TOP_K;
+        sp.top_p = TOP_P;
+        sp.temp = TEMPERATURE;
+        sp.repeat_penalty = REPEAT_PENALTY;
 
         gpt2_bpe bpe;
         bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
         std::vector<int32_t> text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
-        emit_t3_text_tokens(text_tokens);
 
         int n_past = 0;
         int32_t token = 0;
         bool repeat_stopped = false;
         std::vector<int32_t> out, tokens;
-        out.reserve((size_t)opts.n_predict + 1);
-        tokens.reserve((size_t)opts.n_predict);
+        out.reserve((size_t)N_PREDICT + 1);
+        tokens.reserve((size_t)N_PREDICT);
         const int32_t stop = model.hparams.stop_speech_token;
         const int n_text = (int)text_tokens.size();
         auto hold_eos = [&](std::vector<float> & logits) {
@@ -218,12 +171,12 @@ struct Engine::Impl {
         out.push_back(token);
         if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
 
-        for (int step = 1; step < opts.n_predict && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
+        for (int step = 1; step < N_PREDICT && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
             if (!eval_step(model, allocr, n_threads, n_past++, token, logits))
                 throw std::runtime_error("T3 step failed");
             hold_eos(logits);
             token = sample_next_token_ex(logits, out, sp, rng);
-            if (opts.repeat_stop_consecutive >= 2 && consecutive_repeat(out, token, opts.repeat_stop_consecutive)) {
+            if (REPEAT_STOP >= 2 && consecutive_repeat(out, token, REPEAT_STOP)) {
                 repeat_stopped = true;
                 token = stop;
             }
@@ -255,14 +208,6 @@ struct Engine::Impl {
             ",\"s3_history\":" + std::to_string(acoustic.history_tokens) +
             ",\"s3_new\":" + std::to_string(neu.size()) +
             ",\"emitted_samples\":" + std::to_string(acoustic.emitted) + "}");
-        if (opts.audit_dir.empty()) return;
-        ledger_append(opts.audit_dir, "01-pieces.jsonl",
-            "{\"piece\":" + std::to_string(piece) + ",\"response\":" + std::to_string(response) +
-            ",\"text\":\"" + json_escape(piece_text) + "\",\"chars\":" + std::to_string(piece_text.size()) + "}");
-        ledger_append(opts.audit_dir, "02-text-tokens.jsonl",
-            "{\"piece\":" + std::to_string(piece) + ",\"ids\":" + json_i32(piece_text_tokens) + "}");
-        ledger_append(opts.audit_dir, "04-speech-ids.jsonl",
-            "{\"piece\":" + std::to_string(piece) + ",\"ids\":" + json_i32(piece_speech) + "}");
     }
     void run_s3(const std::vector<int32_t>& tokens, int session_index, std::uint32_t external_piece, bool last_piece, const PieceCallback& cb) {
         auto synthesis_context = tts_get_context();
@@ -278,11 +223,6 @@ struct Engine::Impl {
         window.insert(window.end(), tokens.begin(), tokens.end());
         s3gen_synthesize_opts s;
         s.s3gen_gguf_path = opts.s3gen_gguf_path;
-        s.seed = opts.seed;
-        s.n_threads = opts.n_threads;
-        s.n_gpu_layers = opts.n_gpu_layers;
-        s.fastconv = opts.fastconv;
-        s.cfm_steps = opts.cfm_steps;
         s.prompt_feat = prompt_feat;
         s.prompt_rows = prompt_rows;
         s.embedding = embedding;
@@ -290,7 +230,6 @@ struct Engine::Impl {
         s.state = &acoustic;
         s.token_start = 0;
         s.token_end = (int)window.size();
-        s.final = true;
         s.last_piece = last_piece;
         s.first_piece = (session_index <= 0);
         s.chunk_id = 0;
