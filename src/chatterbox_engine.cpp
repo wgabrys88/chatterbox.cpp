@@ -60,6 +60,14 @@ struct Engine::Impl {
         const int32_t stop = model.hparams.stop_speech_token;
         const int32_t sos = model.hparams.start_speech_token;
         std::vector<float> logits;
+        std::string p = opts.t3_gguf_path;
+        auto slash = p.find_last_of("\\/");
+        if (slash == std::string::npos) throw std::runtime_error("dump path");
+        std::ofstream slog(p.substr(0, slash) + "/v3_sample_dump.csv");
+        g_sampler_log = slog.is_open() ? &slog : nullptr;
+        g_sampler_step = 0;
+        if (g_sampler_log)
+            *g_sampler_log << "step,chosen,chosen_prob,sil4299_prob,sil4299_rank,sil4299_seen,gen_len,top0_id,top0_prob,top1_id,top1_prob,top2_id,top2_prob,top3_id,top3_prob,top4_id,top4_prob,top5_id,top5_prob,top6_id,top6_prob,top7_id,top7_prob,top8_id,top8_prob,top9_id,top9_prob\n";
         eval_prompt(model, allocr, text_tokens, logits, n_past);
         std::vector<int32_t> generated;
         generated.push_back(sos);
@@ -74,10 +82,8 @@ struct Engine::Impl {
         }
         if (predicted.empty() || predicted.back() != stop) throw std::runtime_error("T3 stopped without EOS");
         auto dropped = drop_invalid_tokens(predicted, sos, stop);
+        g_sampler_log = nullptr;
         {
-            std::string p = opts.t3_gguf_path;
-            auto slash = p.find_last_of("\\/");
-            if (slash == std::string::npos) throw std::runtime_error("dump path");
             std::ofstream f(p.substr(0, slash) + "/v3_t3_dump.txt");
             if (!f) throw std::runtime_error("dump");
             f << "bpe";
