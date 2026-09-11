@@ -1,5 +1,6 @@
 #include "tts-cpp/chatterbox/engine.h"
 #include "tts-cpp/chatterbox/turbo.h"
+#include <fstream>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -59,6 +60,33 @@ struct Engine::Impl {
         }
         if (token != stop) throw std::runtime_error("T3 stopped without EOS");
         tokens.insert(tokens.end(), (size_t)SILENCE_COUNT, SILENCE_TOKEN);
+        {
+            std::string p = opts.t3_gguf_path;
+            auto slash = p.find_last_of("\\/");
+            if (slash == std::string::npos) throw std::runtime_error("dump path");
+            std::ofstream f(p.substr(0, slash) + "/turbo_t3_dump.txt");
+            if (!f) throw std::runtime_error("dump");
+            f << "bpe";
+            for (int32_t id : text_tokens) f << " " << id;
+            f << "\ntext";
+            for (int32_t id : text_tokens) f << " " << id;
+            f << "\npredicted";
+            for (int32_t id : out) f << " " << id;
+            f << "\ndropped";
+            for (int32_t id : tokens) f << " " << id;
+            f << "\npredicted_count " << out.size();
+            f << "\ndropped_count " << tokens.size();
+            f << "\nn_embd " << model.hparams.n_embd;
+            f << "\nn_head " << model.hparams.n_head;
+            f << "\nn_layer " << model.hparams.n_layer;
+            f << "\nn_ctx " << model.hparams.n_ctx;
+            f << "\ntext_vocab " << model.hparams.n_text_vocab;
+            f << "\nspeech_vocab " << model.hparams.n_speech_vocab;
+            f << "\nstart_speech " << model.hparams.start_speech_token;
+            f << "\nstop_speech " << model.hparams.stop_speech_token;
+            f << "\ncond_prompt_len " << model.hparams.cond_prompt_len << "\n";
+            if (!f) throw std::runtime_error("dump write");
+        }
         return tokens;
     }
 };
