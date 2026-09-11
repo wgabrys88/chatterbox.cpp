@@ -48,10 +48,13 @@ struct Engine::Impl {
         tokens.reserve((size_t)N_PREDICT + (size_t)SILENCE_COUNT);
         const int32_t stop = model.hparams.stop_speech_token;
         std::vector<float> logits;
-        std::string p = opts.t3_gguf_path;
-        auto slash = p.find_last_of("\\/");
-        if (slash == std::string::npos) throw std::runtime_error("dump path");
-        std::ofstream slog(p.substr(0, slash) + "/nano_sample_dump.csv");
+        std::ofstream slog;
+        if (sampler_log_enabled()) {
+            std::string p = opts.t3_gguf_path;
+            auto slash = p.find_last_of("\\/");
+            if (slash != std::string::npos)
+                slog.open(p.substr(0, slash) + "/nano_sample_dump.csv");
+        }
         g_sampler_log = slog.is_open() ? &slog : nullptr;
         g_sampler_step = 0;
         if (g_sampler_log)
@@ -66,32 +69,36 @@ struct Engine::Impl {
             out.push_back(token);
             if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
         }
-        if (token != stop) throw std::runtime_error("T3 stopped without EOS");
         tokens.insert(tokens.end(), (size_t)SILENCE_COUNT, SILENCE_TOKEN);
         g_sampler_log = nullptr;
-        {
-            std::ofstream f(p.substr(0, slash) + "/nano_t3_dump.txt");
-            if (!f) throw std::runtime_error("dump");
-            f << "bpe";
-            for (int32_t id : text_tokens) f << " " << id;
-            f << "\ntext";
-            for (int32_t id : text_tokens) f << " " << id;
-            f << "\npredicted";
-            for (int32_t id : out) f << " " << id;
-            f << "\ndropped";
-            for (int32_t id : tokens) f << " " << id;
-            f << "\npredicted_count " << out.size();
-            f << "\ndropped_count " << tokens.size();
-            f << "\nn_embd " << model.hparams.n_embd;
-            f << "\nn_head " << model.hparams.n_head;
-            f << "\nn_layer " << model.hparams.n_layer;
-            f << "\nn_ctx " << model.hparams.n_ctx;
-            f << "\ntext_vocab " << model.hparams.n_text_vocab;
-            f << "\nspeech_vocab " << model.hparams.n_speech_vocab;
-            f << "\nstart_speech " << model.hparams.start_speech_token;
-            f << "\nstop_speech " << model.hparams.stop_speech_token;
-            f << "\ncond_prompt_len " << model.hparams.cond_prompt_len << "\n";
-            if (!f) throw std::runtime_error("dump write");
+        if (sampler_log_enabled()) {
+            std::string p = opts.t3_gguf_path;
+            auto slash = p.find_last_of("\\/");
+            if (slash != std::string::npos) {
+                std::ofstream f(p.substr(0, slash) + "/nano_t3_dump.txt");
+                if (f) {
+                    f << "bpe";
+                    for (int32_t id : text_tokens) f << " " << id;
+                    f << "\ntext";
+                    for (int32_t id : text_tokens) f << " " << id;
+                    f << "\npredicted";
+                    for (int32_t id : out) f << " " << id;
+                    f << "\ndropped";
+                    for (int32_t id : tokens) f << " " << id;
+                    f << "\npredicted_count " << out.size();
+                    f << "\ndropped_count " << tokens.size();
+                    f << "\neos " << (token == stop ? 1 : 0);
+                    f << "\nn_embd " << model.hparams.n_embd;
+                    f << "\nn_head " << model.hparams.n_head;
+                    f << "\nn_layer " << model.hparams.n_layer;
+                    f << "\nn_ctx " << model.hparams.n_ctx;
+                    f << "\ntext_vocab " << model.hparams.n_text_vocab;
+                    f << "\nspeech_vocab " << model.hparams.n_speech_vocab;
+                    f << "\nstart_speech " << model.hparams.start_speech_token;
+                    f << "\nstop_speech " << model.hparams.stop_speech_token;
+                    f << "\ncond_prompt_len " << model.hparams.cond_prompt_len << "\n";
+                }
+            }
         }
         return tokens;
     }
