@@ -17,6 +17,8 @@
 
 using namespace tts_cpp::chatterbox::detail;
 namespace tts_cpp::chatterbox::detail {
+std::ostream * g_sampler_log = nullptr;
+int g_sampler_step = 0;
 
 static int64_t require_key(const gguf_context * ctx, const char * key) {
     int64_t id = gguf_find_key(ctx, key);
@@ -344,7 +346,26 @@ int32_t sample_next_token_ex(
     if (psum == 0.0f) throw std::runtime_error("sampler produced empty distribution");
     for (float & p : probs) p /= psum;
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    return (int32_t)dist(rng);
+    int32_t chosen = (int32_t)dist(rng);
+    if (g_sampler_log) {
+        constexpr int SIL = 4299;
+        int sil_rank = 1;
+        for (int i = 0; i < n; ++i) if (probs[i] > probs[SIL] + 1e-12f) ++sil_rank;
+        bool sil_seen = std::find(generated.begin(), generated.end(), SIL) != generated.end();
+        std::vector<std::pair<float, int>> ps;
+        ps.reserve((size_t)n);
+        for (int i = 0; i < n; ++i) ps.emplace_back(probs[i], i);
+        std::partial_sort(ps.begin(), ps.begin() + std::min<int>(10, n), ps.end(),
+            [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
+        *g_sampler_log << g_sampler_step << "," << chosen
+            << "," << probs[chosen] << "," << probs[SIL] << "," << sil_rank << "," << (sil_seen ? 1 : 0)
+            << "," << generated.size();
+        for (int k = 0; k < 10 && k < n; ++k)
+            *g_sampler_log << "," << ps[k].second << "," << ps[k].first;
+        *g_sampler_log << "\n";
+        ++g_sampler_step;
+    }
+    return chosen;
 }
 
 }
