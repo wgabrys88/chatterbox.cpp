@@ -60,10 +60,13 @@ struct Engine::Impl {
         const int32_t stop = model.hparams.stop_speech_token;
         const int32_t sos = model.hparams.start_speech_token;
         std::vector<float> logits;
-        std::string p = opts.t3_gguf_path;
-        auto slash = p.find_last_of("\\/");
-        if (slash == std::string::npos) throw std::runtime_error("dump path");
-        std::ofstream slog(p.substr(0, slash) + "/v3_sample_dump.csv");
+        std::ofstream slog;
+        if (sampler_log_enabled()) {
+            std::string p = opts.t3_gguf_path;
+            auto slash = p.find_last_of("\\/");
+            if (slash != std::string::npos)
+                slog.open(p.substr(0, slash) + "/v3_sample_dump.csv");
+        }
         g_sampler_log = slog.is_open() ? &slog : nullptr;
         g_sampler_step = 0;
         if (g_sampler_log)
@@ -80,23 +83,28 @@ struct Engine::Impl {
             if (token == stop) break;
             eval_step(model, allocr, n_past++, token, i + 1, logits);
         }
-        if (predicted.empty() || predicted.back() != stop) throw std::runtime_error("T3 stopped without EOS");
+        if (predicted.empty()) throw std::runtime_error("T3 produced no tokens");
         auto dropped = drop_invalid_tokens(predicted, sos, stop);
         g_sampler_log = nullptr;
-        {
-            std::ofstream f(p.substr(0, slash) + "/v3_t3_dump.txt");
-            if (!f) throw std::runtime_error("dump");
-            f << "bpe";
-            for (int32_t id : ids) f << " " << id;
-            f << "\ntext";
-            for (int32_t id : text_tokens) f << " " << id;
-            f << "\npredicted";
-            for (int32_t id : predicted) f << " " << id;
-            f << "\ndropped";
-            for (int32_t id : dropped) f << " " << id;
-            f << "\npredicted_count " << predicted.size();
-            f << "\ndropped_count " << dropped.size() << "\n";
-            if (!f) throw std::runtime_error("dump write");
+        if (sampler_log_enabled()) {
+            std::string p = opts.t3_gguf_path;
+            auto slash = p.find_last_of("\\/");
+            if (slash != std::string::npos) {
+                std::ofstream f(p.substr(0, slash) + "/v3_t3_dump.txt");
+                if (f) {
+                    f << "bpe";
+                    for (int32_t id : ids) f << " " << id;
+                    f << "\ntext";
+                    for (int32_t id : text_tokens) f << " " << id;
+                    f << "\npredicted";
+                    for (int32_t id : predicted) f << " " << id;
+                    f << "\ndropped";
+                    for (int32_t id : dropped) f << " " << id;
+                    f << "\npredicted_count " << predicted.size();
+                    f << "\ndropped_count " << dropped.size();
+                    f << "\neos " << (predicted.back() == stop ? 1 : 0) << "\n";
+                }
+            }
         }
         return dropped;
     }

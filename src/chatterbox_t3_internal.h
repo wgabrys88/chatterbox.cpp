@@ -1,6 +1,7 @@
 #pragma once
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <ostream>
 #include <random>
@@ -14,9 +15,23 @@
 namespace tts_cpp::chatterbox::detail {
 constexpr int CHBX_MAX_NODES = 8192;
 constexpr int CFG_BATCH = 2;
+inline bool sampler_log_enabled() {
+    const char * v = std::getenv("CHATTERBOX_SAMPLER_LOG");
+    return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
+}
+inline float effective_repeat_penalty() {
+    const char * v = std::getenv("CHATTERBOX_REPEAT_PENALTY");
+    if (v && *v) {
+        char * end = nullptr;
+        const float f = std::strtof(v, &end);
+        if (end != v && f > 0.f) return f;
+    }
+    return REPEAT_PENALTY;
+}
 inline void apply_speech_repeat_penalty(float * scores, int vocab,
                                         const std::vector<int32_t> & generated) {
     if (generated.empty() || vocab <= 0) return;
+    const float penalty = effective_repeat_penalty();
     const size_t start = generated.size() > (size_t)REPEAT_LAST_N
         ? generated.size() - (size_t)REPEAT_LAST_N : 0;
     std::set<int32_t> seen;
@@ -25,7 +40,7 @@ inline void apply_speech_repeat_penalty(float * scores, int vocab,
         if (t < 0 || t >= vocab) continue;
         float & s = scores[t];
         if (s == -INFINITY) continue;
-        s = s > 0.0f ? s / REPEAT_PENALTY : s * REPEAT_PENALTY;
+        s = s > 0.0f ? s / penalty : s * penalty;
     }
 }
 constexpr const char * KEY_TEXT_VOCAB_SIZE   = "chatterbox.text_vocab_size";
