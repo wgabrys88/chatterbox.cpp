@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <ostream>
 #include <random>
 #include <set>
 #include <string>
@@ -67,4 +68,6 @@ void load_model_gguf(const std::string & path, chatterbox_model & model);
 void eval_prompt(const chatterbox_model &, ggml_gallocr_t, const std::vector<int32_t> &, std::vector<float> &, int &);
 void eval_step(const chatterbox_model &, ggml_gallocr_t, int, int32_t, std::vector<float> &);
 int32_t sample_next_token_ex(const std::vector<float> &, const std::vector<int32_t> &, std::mt19937 &);
+extern std::ostream * g_sampler_log;
+extern int g_sampler_step;
 }
