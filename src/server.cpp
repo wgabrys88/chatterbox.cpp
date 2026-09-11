@@ -36,18 +36,20 @@ static std::string read_line(HANDLE h) {
     return {};
 }
 
-int main(int, char** argv) {
+int main(int argc, char** argv) {
+    if (argc < 4) throw std::runtime_error("argv");
     tts_cpp::chatterbox::Engine tts({argv[1], argv[2]});
-    HANDLE h = CreateNamedPipeA(argv[4], PIPE_ACCESS_DUPLEX,
+    HANDLE h = CreateNamedPipeA(argv[3], PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
         1, 4096, 4096, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("pipe");
     for (;;) {
         if (!ConnectNamedPipe(h, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
             throw std::runtime_error("pipe connect");
-        std::string line = read_line(h);
-        if (!line.empty()) {
-            write_wav(argv[3], tts.synthesize(line));
+        std::string path = read_line(h);
+        std::string text = read_line(h);
+        if (!path.empty() && !text.empty()) {
+            write_wav(path.c_str(), tts.synthesize(text));
             DWORD n = 0;
             WriteFile(h, "ok\n", 3, &n, nullptr);
             FlushFileBuffers(h);
