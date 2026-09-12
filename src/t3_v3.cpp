@@ -333,8 +333,9 @@ static void cfg_last_logits(ggml_tensor * logits, int N, int vocab, std::vector<
     ggml_backend_tensor_get(logits, cond.data(), (size_t)(N - 1) * logits->nb[1], (size_t)vocab * sizeof(float));
     ggml_backend_tensor_get(logits, uncond.data(), logits->nb[2] + (size_t)(N - 1) * logits->nb[1], (size_t)vocab * sizeof(float));
     out.resize((size_t)vocab);
+    const float w = effective_cfg_weight();
     for (int i = 0; i < vocab; ++i)
-        out[i] = cond[i] + CFG_WEIGHT * (cond[i] - uncond[i]);
+        out[i] = cond[i] + w * (cond[i] - uncond[i]);
 }
 void eval_prompt(
     const chatterbox_model & model, ggml_gallocr_t allocr,
@@ -393,10 +394,15 @@ int32_t sample_next_token_ex(
     const std::vector<int32_t> & generated,
     std::mt19937 & rng) {
     const int n = (int)logits.size();
+    const float temperature = effective_temperature();
+    const float min_p = effective_min_p();
+    const int top_k = effective_top_k();
+    const float top_p = effective_top_p();
+    const int sil = effective_silence_token();
     std::vector<float> scores(logits.begin(), logits.end());
     apply_speech_repeat_penalty(scores.data(), n, generated);
-    if (TEMPERATURE > 0.0f && TEMPERATURE != 1.0f) {
-        float inv_t = 1.0f / TEMPERATURE;
+    if (temperature > 0.0f && temperature != 1.0f) {
+        float inv_t = 1.0f / temperature;
         for (float & s : scores) s *= inv_t;
     }
     {
@@ -412,19 +418,19 @@ int32_t sample_next_token_ex(
         for (float & p : probs) p /= psum;
         float pmax = 0;
         for (float p : probs) pmax = std::max(pmax, p);
-        const float limit = MIN_P * pmax;
+        const float limit = min_p * pmax;
         for (int i = 0; i < n; ++i) if (probs[i] < limit) scores[i] = -INFINITY;
     }
-    if (TOP_K > 0 && TOP_K < n) {
+    if (top_k > 0 && top_k < n) {
         std::vector<float> tmp(scores);
-        std::nth_element(tmp.begin(), tmp.begin() + TOP_K, tmp.end(), std::greater<float>());
-        float threshold = tmp[TOP_K];
+        std::nth_element(tmp.begin(), tmp.begin() + top_k, tmp.end(), std::greater<float>());
+        float threshold = tmp[top_k];
         int kept = 0;
         for (float s : scores) if (s > threshold) ++kept;
-        if (kept < TOP_K) threshold -= 1e-10f;
+        if (kept < top_k) threshold -= 1e-10f;
         for (float & s : scores) if (s <= threshold) s = -INFINITY;
     }
-    if (TOP_P < 1.0f) {
+    if (top_p < 1.0f) {
         struct IS { int idx; float s; };
         std::vector<IS> sorted;
         sorted.reserve(n);
@@ -440,7 +446,7 @@ int32_t sample_next_token_ex(
         for (size_t i = 0; i < sorted.size(); ++i) {
             cum += probs[i];
             keep_set.insert(sorted[i].idx);
-            if (cum >= TOP_P) break;
+            if (cum >= top_p) break;
         }
         for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
@@ -457,17 +463,16 @@ int32_t sample_next_token_ex(
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
     int32_t chosen = (int32_t)dist(rng);
     if (g_sampler_log) {
-        constexpr int SIL = 4299;
         int sil_rank = 1;
-        for (int i = 0; i < n; ++i) if (probs[i] > probs[SIL] + 1e-12f) ++sil_rank;
-        bool sil_seen = std::find(generated.begin(), generated.end(), SIL) != generated.end();
+        for (int i = 0; i < n; ++i) if (probs[i] > probs[sil] + 1e-12f) ++sil_rank;
+        bool sil_seen = std::find(generated.begin(), generated.end(), sil) != generated.end();
         std::vector<std::pair<float, int>> ps;
         ps.reserve((size_t)n);
         for (int i = 0; i < n; ++i) ps.emplace_back(probs[i], i);
         std::partial_sort(ps.begin(), ps.begin() + std::min<int>(10, n), ps.end(),
             [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
         *g_sampler_log << g_sampler_step << "," << chosen
-            << "," << probs[chosen] << "," << probs[SIL] << "," << sil_rank << "," << (sil_seen ? 1 : 0)
+            << "," << probs[chosen] << "," << probs[sil] << "," << sil_rank << "," << (sil_seen ? 1 : 0)
             << "," << generated.size();
         for (int k = 0; k < 10 && k < n; ++k)
             *g_sampler_log << "," << ps[k].second << "," << ps[k].first;

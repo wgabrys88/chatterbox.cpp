@@ -19,21 +19,42 @@ inline bool sampler_log_enabled() {
     const char * v = std::getenv("CHATTERBOX_SAMPLER_LOG");
     return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
 }
-inline float effective_repeat_penalty() {
-    const char * v = std::getenv("CHATTERBOX_REPEAT_PENALTY");
-    if (v && *v) {
-        char * end = nullptr;
-        const float f = std::strtof(v, &end);
-        if (end != v && f > 0.f) return f;
-    }
-    return REPEAT_PENALTY;
+inline float envf(const char * n, float d) {
+    const char * v = std::getenv(n);
+    if (!v || !*v) return d;
+    char * e = nullptr;
+    float f = std::strtof(v, &e);
+    return e != v ? f : d;
 }
+inline int envi(const char * n, int d) {
+    const char * v = std::getenv(n);
+    if (!v || !*v) return d;
+    char * e = nullptr;
+    long x = std::strtol(v, &e, 10);
+    return e != v ? (int)x : d;
+}
+inline float effective_repeat_penalty() {
+    float f = envf("CHATTERBOX_REPEAT_PENALTY", REPEAT_PENALTY);
+    return f > 0.f ? f : REPEAT_PENALTY;
+}
+inline float effective_temperature() { return envf("CHATTERBOX_TEMPERATURE", TEMPERATURE); }
+inline int effective_top_k() { return envi("CHATTERBOX_TOP_K", TOP_K); }
+inline float effective_top_p() { return envf("CHATTERBOX_TOP_P", TOP_P); }
+inline float effective_min_p() { return envf("CHATTERBOX_MIN_P", MIN_P); }
+inline float effective_cfg_weight() { return envf("CHATTERBOX_CFG_WEIGHT", CFG_WEIGHT); }
+inline float effective_cfm_cfg() { return envf("CHATTERBOX_CFM_CFG", CFM_CFG); }
+inline int effective_repeat_last_n() { return envi("CHATTERBOX_REPEAT_LAST_N", REPEAT_LAST_N); }
+inline int effective_seed() { return envi("CHATTERBOX_SEED", SEED); }
+inline int effective_n_predict() { return envi("CHATTERBOX_N_PREDICT", N_PREDICT); }
+inline int effective_cfm_steps() { return envi("CHATTERBOX_CFM_STEPS", CFM_STEPS); }
+inline int effective_silence_token() { return envi("CHATTERBOX_SILENCE_TOKEN", SILENCE_TOKEN); }
 inline void apply_speech_repeat_penalty(float * scores, int vocab,
                                         const std::vector<int32_t> & generated) {
     if (generated.empty() || vocab <= 0) return;
     const float penalty = effective_repeat_penalty();
-    const size_t start = generated.size() > (size_t)REPEAT_LAST_N
-        ? generated.size() - (size_t)REPEAT_LAST_N : 0;
+    const int last_n = effective_repeat_last_n();
+    const size_t start = generated.size() > (size_t)last_n
+        ? generated.size() - (size_t)last_n : 0;
     std::set<int32_t> seen;
     for (size_t i = start; i < generated.size(); ++i) seen.insert(generated[i]);
     for (int32_t t : seen) {

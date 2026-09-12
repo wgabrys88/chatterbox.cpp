@@ -1,4 +1,5 @@
 #include "s3gen_pipeline.h"
+#include "chatterbox_t3_internal.h"
 #include "tts-cpp/chatterbox/v3.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -1006,10 +1007,10 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
     const int output_tokens = (int)speech_tokens.size();
     constexpr int sr = 24000;
     constexpr int pre_lookahead_len = 3;
-    const int seed = tts_cpp::chatterbox::SEED;
+    const int seed = tts_cpp::chatterbox::detail::effective_seed();
     std::vector<int32_t> padded;
     for (int32_t token : speech_tokens) if (token >= 0 && token < 6561) padded.push_back(token);
-    padded.insert(padded.end(), pre_lookahead_len, tts_cpp::chatterbox::SILENCE_TOKEN);
+    padded.insert(padded.end(), pre_lookahead_len, tts_cpp::chatterbox::detail::effective_silence_token());
     model_ctx& m = *g_s3gen_cache_entry->m;
     const int D = 512;
     const int MEL = 80;
@@ -1056,8 +1057,8 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
             const int64_t frame = generated ? t - mel_len1 : t;
             z[m2 * T_mu + t] = positioned_noise(seed + (generated ? 2 : 0), frame * MEL + m2);
         }
-    const int cfm_steps = tts_cpp::chatterbox::CFM_STEPS;
-    const float cfm_cfg = tts_cpp::chatterbox::CFM_CFG;
+    const int cfm_steps = tts_cpp::chatterbox::detail::effective_cfm_steps();
+    const float cfm_cfg = tts_cpp::chatterbox::detail::effective_cfm_cfg();
     std::vector<float> t_span;
     t_span.reserve(cfm_steps + 1);
     for (int i = 0; i <= cfm_steps; ++i) {

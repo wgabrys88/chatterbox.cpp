@@ -46,7 +46,7 @@ struct Engine::Impl {
     }
     std::vector<int32_t> generate_t3(const std::string& text) {
         if (opts.language_id.empty()) throw std::runtime_error("language");
-        std::mt19937 rng(SEED);
+        std::mt19937 rng(effective_seed());
         mtl_bpe bpe;
         if (!bpe.load_from_arrays(model.tok_tokens, model.tok_types, model.tok_merges))
             throw std::runtime_error("tokenizer");
@@ -75,8 +75,9 @@ struct Engine::Impl {
         std::vector<int32_t> generated;
         generated.push_back(sos);
         std::vector<int32_t> predicted;
-        predicted.reserve((size_t)N_PREDICT);
-        for (int i = 0; i < N_PREDICT && n_past + 1 <= model.hparams.n_ctx; ++i) {
+        const int n_predict = effective_n_predict();
+        predicted.reserve((size_t)n_predict);
+        for (int i = 0; i < n_predict && n_past + 1 <= model.hparams.n_ctx; ++i) {
             int32_t token = sample_next_token_ex(logits, generated, rng);
             predicted.push_back(token);
             generated.push_back(token);
