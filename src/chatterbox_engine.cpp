@@ -37,15 +37,18 @@ struct Engine::Impl {
         if (model.ctx_kv) ggml_free(model.ctx_kv);
     }
     std::vector<int32_t> generate_t3(const std::string& text) {
-        std::mt19937 rng(SEED);
+        const int n_predict = effective_n_predict();
+        const int sil_n = effective_silence_count();
+        const int sil = effective_silence_token();
+        std::mt19937 rng(effective_seed());
         gpt2_bpe bpe;
         bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
         auto text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
         int n_past = 0;
         int32_t token = 0;
         std::vector<int32_t> out, tokens;
-        out.reserve((size_t)N_PREDICT + 1);
-        tokens.reserve((size_t)N_PREDICT + (size_t)SILENCE_COUNT);
+        out.reserve((size_t)n_predict + 1);
+        tokens.reserve((size_t)n_predict + (size_t)sil_n);
         const int32_t stop = model.hparams.stop_speech_token;
         std::vector<float> logits;
         std::ofstream slog;
@@ -63,13 +66,13 @@ struct Engine::Impl {
         token = sample_next_token_ex(logits, out, rng);
         out.push_back(token);
         if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
-        for (int step = 1; step < N_PREDICT && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
+        for (int step = 1; step < n_predict && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
             eval_step(model, allocr, n_past++, token, logits);
             token = sample_next_token_ex(logits, out, rng);
             out.push_back(token);
             if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
         }
-        tokens.insert(tokens.end(), (size_t)SILENCE_COUNT, SILENCE_TOKEN);
+        tokens.insert(tokens.end(), (size_t)sil_n, sil);
         g_sampler_log = nullptr;
         if (sampler_log_enabled()) {
             std::string p = opts.t3_gguf_path;
