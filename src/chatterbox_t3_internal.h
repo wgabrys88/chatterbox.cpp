@@ -54,7 +54,7 @@ constexpr const char * KEY_N_HEAD            = "chatterbox.n_head";
 constexpr const char * KEY_N_LAYER           = "chatterbox.n_layer";
 struct chatterbox_hparams {
     int32_t n_text_vocab = 0, n_speech_vocab = 0, start_speech_token = 0, stop_speech_token = 0;
-    int32_t n_ctx = 0, n_embd = 0, n_head = 0, n_layer = 0, speaker_embed_size = 0, cond_prompt_len = 0;
+    int32_t n_ctx = 0, n_embd = 0, n_head = 0, n_layer = 0, cond_prompt_len = 0;
     float eps = 1e-5f;
 };
 struct gpt2_layer {
