@@ -12,5 +12,4 @@ inline constexpr float CFG_WEIGHT = 0.5f;
 inline constexpr int CFM_STEPS = 10;
 inline constexpr float CFM_CFG = 0.7f;
 inline constexpr int SILENCE_TOKEN = 4299;
-inline constexpr float EXAGGERATION = 0.5f;
 }

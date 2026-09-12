@@ -86,7 +86,7 @@ struct chatterbox_hparams {
     int32_t start_text_token = 0, stop_text_token = 0;
     int32_t start_speech_token = 0, stop_speech_token = 0;
     int32_t n_ctx = 0, n_embd = 0, n_head = 0, n_layer = 0, n_ff = 0;
-    int32_t speaker_embed_size = 0, cond_prompt_len = 0, perceiver_len = 0;
+    int32_t cond_prompt_len = 0, perceiver_len = 0;
     int32_t rope_orig_ctx = 0;
     float eps = 1e-5f, rope_theta = 0.0f;
 };

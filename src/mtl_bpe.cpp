@@ -77,7 +77,6 @@ bool mtl_bpe::load_from_arrays(const std::vector<std::string> & tokens,
                                const std::vector<int> & types,
                                const std::vector<std::string> & merges) {
     if (tokens.empty() || types.size() != tokens.size()) return false;
-    id_to_token = tokens;
     token_to_id.clear();
     token_to_id.reserve(tokens.size());
     added.clear();

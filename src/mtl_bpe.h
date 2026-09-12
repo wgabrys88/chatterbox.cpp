@@ -5,7 +5,6 @@
 #include <vector>
 struct mtl_bpe {
     std::unordered_map<std::string, int32_t> token_to_id;
-    std::vector<std::string>                 id_to_token;
     std::unordered_map<std::string, int>     bpe_ranks;
     std::vector<std::string>                 added;
     bool load_from_arrays(const std::vector<std::string> & tokens,
