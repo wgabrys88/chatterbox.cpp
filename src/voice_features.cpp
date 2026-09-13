@@ -7,6 +7,7 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -53,17 +54,103 @@ void wav_load(const std::string& path, std::vector<float>& out, int& sr) {
         out[i] = sum / channels;
     }
 }
-static double bessel_i0(double x) {
-    double sum = 1.0;
-    double term = 1.0;
-    double half = 0.5 * x;
-    for (int k = 1; k < 30; ++k) {
-        term *= (half / (double)k) * (half / (double)k);
-        sum += term;
-        if (term < 1e-12 * sum) break;
-    }
-    return sum;
+static double sinc_pi(double x) {
+    if (std::fabs(x) < 1e-20) return 1.0;
+    return std::sin(M_PI * x) / (M_PI * x);
 }
+
+// Type-I linear-phase lowpass, scipy.signal.firls with fs=2 (Nyquist=1).
+// Passband/stopband edges are fractions of that Nyquist. Matches official
+// soxr_hq cond tokens on 24 kHz -> 16 kHz when n_taps=641, f_pass=0.305, f_stop=1/3.
+static std::vector<double> firls_lowpass(int n_taps, double f_pass, double f_stop)
+{
+    if (n_taps < 3 || (n_taps % 2) == 0) throw std::runtime_error("resample firls taps");
+    if (!(f_pass > 0.0) || !(f_stop > f_pass) || !(f_stop <= 1.0)) throw std::runtime_error("resample firls bands");
+    const int M = (n_taps - 1) / 2;
+    const int nq = M + 1;
+    std::vector<double> q((size_t)n_taps, 0.0);
+    const double bands[2][2] = { { 0.0, f_pass }, { f_stop, 1.0 } };
+    for (int i = 0; i < n_taps; ++i) {
+        const double n = (double)i;
+        q[(size_t)i] =
+            (bands[0][1] * sinc_pi(bands[0][1] * n) - bands[0][0] * sinc_pi(bands[0][0] * n)) +
+            (bands[1][1] * sinc_pi(bands[1][1] * n) - bands[1][0] * sinc_pi(bands[1][0] * n));
+    }
+    std::vector<double> Q((size_t)nq * (size_t)nq, 0.0);
+    auto at = [&](int i, int j) -> double & { return Q[(size_t)i * (size_t)nq + (size_t)j]; };
+    for (int i = 0; i < nq; ++i) {
+        for (int j = 0; j < nq; ++j) {
+            at(i, j) = q[(size_t)std::abs(i - j)] + q[(size_t)(i + j)];
+        }
+    }
+    std::vector<double> b((size_t)nq);
+    for (int i = 0; i < nq; ++i) b[(size_t)i] = f_pass * sinc_pi(f_pass * (double)i);
+
+    std::vector<double> L((size_t)nq * (size_t)nq, 0.0);
+    auto Lat = [&](int i, int j) -> double & { return L[(size_t)i * (size_t)nq + (size_t)j]; };
+    bool chol = true;
+    for (int k = 0; k < nq && chol; ++k) {
+        double acc = at(k, k);
+        for (int p = 0; p < k; ++p) acc -= Lat(k, p) * Lat(k, p);
+        if (!(acc > 1e-18) || !std::isfinite(acc)) { chol = false; break; }
+        Lat(k, k) = std::sqrt(acc);
+        for (int i = k + 1; i < nq; ++i) {
+            double s = at(i, k);
+            for (int p = 0; p < k; ++p) s -= Lat(i, p) * Lat(k, p);
+            Lat(i, k) = s / Lat(k, k);
+        }
+    }
+    std::vector<double> a((size_t)nq, 0.0);
+    if (chol) {
+        std::vector<double> y((size_t)nq, 0.0);
+        for (int i = 0; i < nq; ++i) {
+            double s = b[(size_t)i];
+            for (int p = 0; p < i; ++p) s -= Lat(i, p) * y[(size_t)p];
+            y[(size_t)i] = s / Lat(i, i);
+        }
+        for (int i = nq - 1; i >= 0; --i) {
+            double s = y[(size_t)i];
+            for (int p = i + 1; p < nq; ++p) s -= Lat(p, i) * a[(size_t)p];
+            a[(size_t)i] = s / Lat(i, i);
+        }
+    } else {
+        // Gaussian elimination with partial pivot (Q is overwritten).
+        std::vector<int> piv((size_t)nq);
+        for (int i = 0; i < nq; ++i) piv[(size_t)i] = i;
+        for (int k = 0; k < nq; ++k) {
+            int best = k;
+            double bestv = std::fabs(at(k, k));
+            for (int i = k + 1; i < nq; ++i) {
+                const double v = std::fabs(at(i, k));
+                if (v > bestv) { bestv = v; best = i; }
+            }
+            if (!(bestv > 1e-18)) throw std::runtime_error("resample firls solve");
+            if (best != k) {
+                for (int j = 0; j < nq; ++j) std::swap(at(k, j), at(best, j));
+                std::swap(b[(size_t)k], b[(size_t)best]);
+            }
+            for (int i = k + 1; i < nq; ++i) {
+                const double f = at(i, k) / at(k, k);
+                at(i, k) = 0.0;
+                for (int j = k + 1; j < nq; ++j) at(i, j) -= f * at(k, j);
+                b[(size_t)i] -= f * b[(size_t)k];
+            }
+        }
+        for (int i = nq - 1; i >= 0; --i) {
+            double s = b[(size_t)i];
+            for (int j = i + 1; j < nq; ++j) s -= at(i, j) * a[(size_t)j];
+            a[(size_t)i] = s / at(i, i);
+        }
+    }
+    std::vector<double> h((size_t)n_taps);
+    h[(size_t)M] = 2.0 * a[0];
+    for (int i = 1; i <= M; ++i) {
+        h[(size_t)(M - i)] = a[(size_t)i];
+        h[(size_t)(M + i)] = a[(size_t)i];
+    }
+    return h;
+}
+
 static size_t upfirdn_len(size_t len_h, size_t in_len, int up, int down)
 {
     return (((in_len - 1) * (size_t)up + len_h) - 1) / (size_t)down + 1;
@@ -73,6 +160,7 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
                                  int sr_in, int sr_out,
                                  int taps_half)
 {
+    (void)taps_half;
     if (sr_in == sr_out) return in;
     if (in.empty()) return {};
     if (sr_in <= 0 || sr_out <= 0) throw std::runtime_error("resample");
@@ -80,29 +168,14 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
     const int up = sr_out / g;
     const int down = sr_in / g;
     if (up == 1 && down == 1) return in;
-    const int th = taps_half > 0 ? taps_half : 256;
-    const double beta = 8.6;
-    const double fc_scale = 0.96;
-    const double fc = fc_scale / (double)std::max(up, down);
-    const int n_taps = 2 * th + 1;
-    const double mid = (double)(n_taps - 1) / 2.0;
-    const double inv_i0_beta = 1.0 / bessel_i0(beta);
-    std::vector<double> h((size_t)n_taps);
-    double hsum = 0.0;
-    for (int i = 0; i < n_taps; ++i) {
-        const double m = (double)i - mid;
-        const double hs = (std::fabs(m) < 1e-12)
-            ? fc
-            : std::sin(M_PI * fc * m) / (M_PI * m);
-        const double wrel = (mid == 0.0) ? 0.0 : m / mid;
-        const double win = (std::fabs(wrel) <= 1.0)
-            ? bessel_i0(beta * std::sqrt(std::max(0.0, 1.0 - wrel * wrel))) * inv_i0_beta
-            : 0.0;
-        h[(size_t)i] = hs * win;
-        hsum += h[(size_t)i];
-    }
-    if (!(hsum > 0.0) || !std::isfinite(hsum)) throw std::runtime_error("resample fir");
-    for (double & v : h) v = v / hsum * (double)up;
+    // Least-squares FIR (not Kaiser). 641 taps / 0.915 of output Nyquist is the
+    // MIT family that matches soxr_hq cond tokens on 24 kHz -> 16 kHz (2/3).
+    const int n_taps = 641;
+    const int th = (n_taps - 1) / 2;
+    const double f_stop = 1.0 / (double)down;
+    const double f_pass = 0.915 * f_stop;
+    std::vector<double> h = firls_lowpass(n_taps, f_pass, f_stop);
+    for (double & v : h) v *= (double)up;
 
     const int n_pre_pad = down - (th % down);
     int n_post_pad = 0;
