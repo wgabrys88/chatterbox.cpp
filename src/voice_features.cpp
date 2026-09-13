@@ -5,8 +5,12 @@
 #include <iterator>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 static uint16_t u16(const unsigned char* p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t u32(const unsigned char* p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 void wav_load(const std::string& path, std::vector<float>& out, int& sr) {
@@ -60,39 +64,72 @@ static double bessel_i0(double x) {
     }
     return sum;
 }
+static size_t upfirdn_len(size_t len_h, size_t in_len, int up, int down)
+{
+    return (((in_len - 1) * (size_t)up + len_h) - 1) / (size_t)down + 1;
+}
+
 std::vector<float> resample_sinc(const std::vector<float> & in,
                                  int sr_in, int sr_out,
                                  int taps_half)
 {
     if (sr_in == sr_out) return in;
     if (in.empty()) return {};
-    const double fc  = 0.5 * std::min(sr_in, sr_out) / (double)sr_in;
+    if (sr_in <= 0 || sr_out <= 0) throw std::runtime_error("resample");
+    const int g = std::gcd(sr_in, sr_out);
+    const int up = sr_out / g;
+    const int down = sr_in / g;
+    if (up == 1 && down == 1) return in;
+    const int th = taps_half > 0 ? taps_half : 256;
     const double beta = 8.6;
+    const double fc_scale = 0.96;
+    const double fc = fc_scale / (double)std::max(up, down);
+    const int n_taps = 2 * th + 1;
+    const double mid = (double)(n_taps - 1) / 2.0;
     const double inv_i0_beta = 1.0 / bessel_i0(beta);
-    const double rate  = (double)sr_out / (double)sr_in;
-    const size_t L_in  = in.size();
-    const size_t L_out = (size_t)std::floor((double)L_in * rate);
-    std::vector<float> out(L_out, 0.0f);
-    for (size_t n = 0; n < L_out; ++n) {
-        const double t_in  = (double)n / rate;
-        const long long center = (long long)std::floor(t_in);
-        const double frac  = t_in - (double)center;
-        float acc = 0.0f;
-        for (int k = -taps_half; k <= taps_half; ++k) {
-            const long long idx = center + k;
-            if (idx < 0 || idx >= (long long)L_in) continue;
-            const double offset = frac - (double)k;
-            const double sinc_arg = 2.0 * M_PI * fc * offset;
-            const double sinc = (std::fabs(offset) < 1e-12)
-                ? 1.0
-                : std::sin(sinc_arg) / sinc_arg;
-            const double wrel = offset / (double)taps_half;
-            const double win  = (std::fabs(wrel) <= 1.0)
-                ? bessel_i0(beta * std::sqrt(1.0 - wrel * wrel)) * inv_i0_beta
-                : 0.0;
-            acc += (float)(2.0 * fc * sinc * win) * in[(size_t)idx];
+    std::vector<double> h((size_t)n_taps);
+    double hsum = 0.0;
+    for (int i = 0; i < n_taps; ++i) {
+        const double m = (double)i - mid;
+        const double hs = (std::fabs(m) < 1e-12)
+            ? fc
+            : std::sin(M_PI * fc * m) / (M_PI * m);
+        const double wrel = (mid == 0.0) ? 0.0 : m / mid;
+        const double win = (std::fabs(wrel) <= 1.0)
+            ? bessel_i0(beta * std::sqrt(std::max(0.0, 1.0 - wrel * wrel))) * inv_i0_beta
+            : 0.0;
+        h[(size_t)i] = hs * win;
+        hsum += h[(size_t)i];
+    }
+    if (!(hsum > 0.0) || !std::isfinite(hsum)) throw std::runtime_error("resample fir");
+    for (double & v : h) v = v / hsum * (double)up;
+
+    const int n_pre_pad = down - (th % down);
+    int n_post_pad = 0;
+    const size_t n_in = in.size();
+    const size_t n_up = n_in * (size_t)up;
+    const size_t n_out = n_up / (size_t)down + ((n_up % (size_t)down) ? 1u : 0u);
+    const size_t n_pre_remove = (size_t)((th + n_pre_pad) / down);
+    while (upfirdn_len(h.size() + (size_t)n_pre_pad + (size_t)n_post_pad, n_in, up, down)
+           < n_out + n_pre_remove) {
+        ++n_post_pad;
+    }
+    std::vector<double> hpad((size_t)n_pre_pad + h.size() + (size_t)n_post_pad, 0.0);
+    std::copy(h.begin(), h.end(), hpad.begin() + n_pre_pad);
+
+    std::vector<float> out(n_out, 0.0f);
+    for (size_t n = 0; n < n_out; ++n) {
+        const long long i = (long long)(n + n_pre_remove);
+        const long long t = i * (long long)down;
+        double acc = 0.0;
+        for (size_t k = 0; k < hpad.size(); ++k) {
+            const long long idx_up = t - (long long)k;
+            if (idx_up < 0 || (idx_up % (long long)up) != 0) continue;
+            const long long xi = idx_up / (long long)up;
+            if (xi >= (long long)n_in) continue;
+            acc += hpad[k] * (double)in[(size_t)xi];
         }
-        out[n] = acc;
+        out[n] = (float)acc;
     }
     return out;
 }
