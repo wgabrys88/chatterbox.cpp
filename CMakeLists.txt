@@ -10,15 +10,38 @@ set(GGML_VULKAN ON CACHE BOOL "" FORCE)
 set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 set(GGML_CPU OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+set(TTS_FAMILY "nano" CACHE STRING "nano, turbo, or v3")
+set_property(CACHE TTS_FAMILY PROPERTY STRINGS nano turbo v3)
+if(TTS_FAMILY STREQUAL "v3")
+    set(TTS_FAMILY_DEFINE TTS_FAMILY_V3)
+    set(TTS_T3_SOURCES
+        src/t3_v3.cpp
+        src/mtl_bpe.cpp
+        src/chatterbox_tts_v3.cpp
+        src/chatterbox_engine_v3.cpp)
+elseif(TTS_FAMILY STREQUAL "turbo")
+    set(TTS_FAMILY_DEFINE TTS_FAMILY_TURBO)
+    set(TTS_T3_SOURCES
+        src/t3_nano.cpp
+        src/gpt2_bpe.cpp
+        src/chatterbox_tts.cpp
+        src/chatterbox_engine_gpt2.cpp)
+elseif(TTS_FAMILY STREQUAL "nano")
+    set(TTS_FAMILY_DEFINE TTS_FAMILY_NANO)
+    set(TTS_T3_SOURCES
+        src/t3_nano.cpp
+        src/gpt2_bpe.cpp
+        src/chatterbox_tts.cpp
+        src/chatterbox_engine_gpt2.cpp)
+else()
+    message(FATAL_ERROR "TTS_FAMILY must be nano, turbo, or v3")
+endif()
 add_subdirectory(ggml)
 if(NOT GGML_VULKAN OR GGML_CUDA OR GGML_CPU)
     message(FATAL_ERROR "tts-cpp requires GGML_VULKAN=ON, GGML_CUDA=OFF, GGML_CPU=OFF")
 endif()
-add_library(tts-cpp STATIC
-    src/t3_nano.cpp
-    src/gpt2_bpe.cpp
-    src/chatterbox_tts.cpp
-    src/chatterbox_engine.cpp)
+add_compile_definitions(${TTS_FAMILY_DEFINE})
+add_library(tts-cpp STATIC ${TTS_T3_SOURCES})
 target_include_directories(tts-cpp PUBLIC include PRIVATE src ggml/include)
 target_link_libraries(tts-cpp PUBLIC ggml)
 target_compile_definitions(tts-cpp PRIVATE GGML_USE_VULKAN)

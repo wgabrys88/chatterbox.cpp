@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,22 +37,49 @@ static std::string read_line(HANDLE h) {
     return {};
 }
 
-int main(int, char** argv) {
-    tts_cpp::chatterbox::Engine tts({argv[1], argv[2]});
-    HANDLE h = CreateNamedPipeA(argv[4], PIPE_ACCESS_DUPLEX,
+static bool read_exact(HANDLE h, char* buf, DWORD need) {
+    DWORD got = 0;
+    while (got < need) {
+        DWORD n = 0;
+        if (!ReadFile(h, buf + got, need - got, &n, nullptr) || n == 0) return false;
+        got += n;
+    }
+    return true;
+}
+
+int main(int argc, char** argv) {
+#if defined(TTS_FAMILY_V3)
+    if (argc < 5) throw std::runtime_error("argv");
+#else
+    if (argc < 4) throw std::runtime_error("argv");
+#endif
+    HANDLE h = CreateNamedPipeA(argv[3], PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
         1, 4096, 4096, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("pipe");
+    if (!ConnectNamedPipe(h, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
+        throw std::runtime_error("pipe connect");
+#if defined(TTS_FAMILY_V3)
+    tts_cpp::chatterbox::Engine tts({argv[1], argv[2], argv[4]});
+#else
+    tts_cpp::chatterbox::Engine tts({argv[1], argv[2]});
+#endif
     for (;;) {
-        if (!ConnectNamedPipe(h, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
-            throw std::runtime_error("pipe connect");
-        std::string line = read_line(h);
-        if (!line.empty()) {
-            write_wav(argv[3], tts.synthesize(line));
-            DWORD n = 0;
-            WriteFile(h, "ok\n", 3, &n, nullptr);
-            FlushFileBuffers(h);
+        std::string path = read_line(h);
+        std::string len_s = read_line(h);
+        char* end = nullptr;
+        unsigned long nbytes = std::strtoul(len_s.c_str(), &end, 10);
+        if (!path.empty() && end != len_s.c_str() && nbytes > 0 && nbytes <= 1u << 20) {
+            std::string text(nbytes, '\0');
+            if (read_exact(h, text.data(), (DWORD)nbytes)) {
+                write_wav(path.c_str(), tts.synthesize(text));
+                DWORD n = 0;
+                WriteFile(h, "ok\n", 3, &n, nullptr);
+                FlushFileBuffers(h);
+            }
         }
         DisconnectNamedPipe(h);
+        if (!ConnectNamedPipe(h, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
+            throw std::runtime_error("pipe connect");
     }
 }

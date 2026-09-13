@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-import re, sys
+import json, re, sys
 from pathlib import Path
 import gguf, numpy as np, torch
 from safetensors.torch import load_file
 from quant_policy import QUANT_TYPE, should_quantize
 QUANT = "q4_0"
+TEXT_VOCAB_SIZE = 2454
 def as_numpy(tensor, *, dtype=None):
     if dtype is not None: tensor = tensor.to(dtype)
     return np.ascontiguousarray(tensor.detach().cpu().numpy())
@@ -52,7 +53,12 @@ def export_conformer_block(writer, state, prefix, gguf_prefix):
 def main():
     ckpt_dir, out = Path(sys.argv[1]), Path(sys.argv[2])
     out.parent.mkdir(parents=True, exist_ok=True)
-    raw = load_file(ckpt_dir / "s3gen_meanflow.safetensors")
+    tok = json.loads((ckpt_dir / "grapheme_mtl_merged_expanded_v1.json").read_text(encoding="utf-8"))
+    vocab = tok["model"]["vocab"]
+    n_tok = max(int(i) for i in vocab.values()) + 1
+    if n_tok != TEXT_VOCAB_SIZE:
+        raise SystemExit(f"tokenizer {n_tok} != {TEXT_VOCAB_SIZE}")
+    raw = load_file(ckpt_dir / "s3gen.safetensors")
     allowed = ("flow.", "mel2wav.", "speaker_encoder.", "tokenizer.")
     for name in sorted(raw):
         print(f"{name}\t{tuple(raw[name].shape)}", flush=True)
@@ -61,7 +67,10 @@ def main():
         print("STOP unknown s3gen keys:", file=sys.stderr)
         for name in unknown:
             print(f"  {name}\t{tuple(raw[name].shape)}", file=sys.stderr)
-        raise SystemExit("s3gen meanflow keys differ")
+        raise SystemExit("s3gen keys differ")
+    mixer = [name for name in raw if "time_embed_mixer" in name]
+    if mixer:
+        raise SystemExit("time_embed_mixer present")
     state = expand_weight_norm(raw)
     gen = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)["gen"]
     writer = gguf.GGUFWriter(str(out), "chatterbox-s3gen")

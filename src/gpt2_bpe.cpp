@@ -38,7 +38,6 @@ static std::string bytes_to_unicode_str(const std::string & raw) {
 bool gpt2_bpe::load_from_arrays(const std::vector<std::string> & tokens,
                                 const std::vector<std::string> & merges) {
     if (tokens.empty()) return false;
-    id_to_token = tokens;
     token_to_id.clear();
     token_to_id.reserve(tokens.size());
     for (size_t i = 0; i < tokens.size(); ++i) {

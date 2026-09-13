@@ -14,9 +14,14 @@
 #include <string>
 #include <vector>
 #include "chatterbox_t3_internal.h"
+#if defined(TTS_FAMILY_V3)
+#error t3_nano.cpp is the GPT-2 T3 backend; configure -DTTS_FAMILY=nano or turbo
+#endif
 
 using namespace tts_cpp::chatterbox::detail;
 namespace tts_cpp::chatterbox::detail {
+std::ostream * g_sampler_log = nullptr;
+int g_sampler_step = 0;
 
 static int64_t require_key(const gguf_context * ctx, const char * key) {
     int64_t id = gguf_find_key(ctx, key);
@@ -44,7 +49,7 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
         hp.n_speech_vocab     = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_SPEECH_VOCAB_SIZE));
         hp.start_speech_token = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_START_SPEECH));
         hp.stop_speech_token  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_STOP_SPEECH));
-        hp.speaker_embed_size = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_SPEAKER_EMBED));
+        require_key(gguf_ctx, KEY_SPEAKER_EMBED);
         hp.cond_prompt_len    = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_COND_PROMPT_LEN));
         hp.eps                = gguf_get_val_f32(gguf_ctx, require_key(gguf_ctx, KEY_LAYER_NORM_EPS));
         hp.n_embd  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_EMBD));
@@ -298,21 +303,28 @@ int32_t sample_next_token_ex(
     const std::vector<int32_t> & generated,
     std::mt19937 & rng) {
     const int n = (int)logits.size();
+    const float temperature = effective_temperature();
+    const int top_k = effective_top_k();
+    const float top_p = effective_top_p();
+    const int sil = effective_silence_token();
     std::vector<float> scores(logits.begin(), logits.end());
-    if (TEMPERATURE > 0.0f && TEMPERATURE != 1.0f) {
-        float inv_t = 1.0f / TEMPERATURE;
+#if defined(TTS_FAMILY_NANO)
+    apply_speech_repeat_penalty(scores.data(), n, generated);
+#endif
+    if (temperature > 0.0f && temperature != 1.0f) {
+        float inv_t = 1.0f / temperature;
         for (float & s : scores) s *= inv_t;
     }
-    if (TOP_K > 0 && TOP_K < n) {
+    if (top_k > 0 && top_k < n) {
         std::vector<float> tmp(scores);
-        std::nth_element(tmp.begin(), tmp.begin() + TOP_K, tmp.end(), std::greater<float>());
-        float threshold = tmp[TOP_K];
+        std::nth_element(tmp.begin(), tmp.begin() + top_k, tmp.end(), std::greater<float>());
+        float threshold = tmp[top_k];
         int kept = 0;
         for (float s : scores) if (s > threshold) ++kept;
-        if (kept < TOP_K) threshold -= 1e-10f;
+        if (kept < top_k) threshold -= 1e-10f;
         for (float & s : scores) if (s <= threshold) s = -INFINITY;
     }
-    if (TOP_P < 1.0f) {
+    if (top_p < 1.0f) {
         struct IS { int idx; float s; };
         std::vector<IS> sorted;
         sorted.reserve(n);
@@ -328,10 +340,52 @@ int32_t sample_next_token_ex(
         for (size_t i = 0; i < sorted.size(); ++i) {
             cum += probs[i];
             keep_set.insert(sorted[i].idx);
-            if (cum >= TOP_P) break;
+            if (cum >= top_p) break;
         }
         for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
+#if defined(TTS_FAMILY_NANO)
+    auto softmax_sample = [&](const std::vector<float> & sc) -> int32_t {
+        float mx = -INFINITY;
+        for (float s : sc) if (s != -INFINITY) mx = std::max(mx, s);
+        std::vector<float> pr(n);
+        float psum = 0;
+        for (int i = 0; i < n; ++i) {
+            pr[i] = (sc[i] == -INFINITY) ? 0.0f : std::exp(sc[i] - mx);
+            psum += pr[i];
+        }
+        if (psum == 0.0f) throw std::runtime_error("sampler produced empty distribution");
+        for (float & p : pr) p /= psum;
+        std::discrete_distribution<int> dist(pr.begin(), pr.end());
+        return (int32_t)dist(rng);
+    };
+    int32_t chosen = softmax_sample(scores);
+    if (chosen != sil && !generated.empty()) {
+        const size_t start = generated.size() > (size_t)RAS_WINDOW
+            ? generated.size() - (size_t)RAS_WINDOW : 0;
+        int rep = 0;
+        for (size_t i = start; i < generated.size(); ++i)
+            if (generated[i] == chosen) ++rep;
+        if ((float)rep >= (float)RAS_WINDOW * RAS_TAU) {
+            scores[chosen] = -INFINITY;
+            bool any = false;
+            for (float s : scores) if (s != -INFINITY) { any = true; break; }
+            if (any) chosen = softmax_sample(scores);
+        }
+    }
+    std::vector<float> probs(n);
+    {
+        float mx = -INFINITY;
+        for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
+        float psum = 0;
+        for (int i = 0; i < n; ++i) {
+            probs[i] = (scores[i] == -INFINITY) ? 0.0f : std::exp(scores[i] - mx);
+            psum += probs[i];
+        }
+        if (psum == 0.0f) throw std::runtime_error("sampler produced empty distribution");
+        for (float & p : probs) p /= psum;
+    }
+#else
     apply_speech_repeat_penalty(scores.data(), n, generated);
     float mx = -INFINITY;
     for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
@@ -344,7 +398,26 @@ int32_t sample_next_token_ex(
     if (psum == 0.0f) throw std::runtime_error("sampler produced empty distribution");
     for (float & p : probs) p /= psum;
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
-    return (int32_t)dist(rng);
+    int32_t chosen = (int32_t)dist(rng);
+#endif
+    if (g_sampler_log) {
+        int sil_rank = 1;
+        for (int i = 0; i < n; ++i) if (probs[i] > probs[sil] + 1e-12f) ++sil_rank;
+        bool sil_seen = std::find(generated.begin(), generated.end(), sil) != generated.end();
+        std::vector<std::pair<float, int>> ps;
+        ps.reserve((size_t)n);
+        for (int i = 0; i < n; ++i) ps.emplace_back(probs[i], i);
+        std::partial_sort(ps.begin(), ps.begin() + std::min<int>(10, n), ps.end(),
+            [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
+        *g_sampler_log << g_sampler_step << "," << chosen
+            << "," << probs[chosen] << "," << probs[sil] << "," << sil_rank << "," << (sil_seen ? 1 : 0)
+            << "," << generated.size();
+        for (int k = 0; k < 10 && k < n; ++k)
+            *g_sampler_log << "," << ps[k].second << "," << ps[k].first;
+        *g_sampler_log << "\n";
+        ++g_sampler_step;
+    }
+    return chosen;
 }
 
 }
