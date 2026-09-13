@@ -2,7 +2,11 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#ifdef TTS_CPU_BACKEND
+#include "ggml-cpu.h"
+#else
 #include "ggml-vulkan.h"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -34,8 +38,13 @@ static ggml_tensor * require_tensor(const chatterbox_model & m, const char * nam
     return it->second;
 }
 ggml_backend_t init_backend() {
+#ifdef TTS_CPU_BACKEND
+    auto * b = ggml_backend_cpu_init();
+    if (!b) throw std::runtime_error("CPU backend init failed");
+#else
     auto * b = ggml_backend_vk_init(0);
     if (!b) throw std::runtime_error("Vulkan backend init failed");
+#endif
     return b;
 }
 void load_model_gguf(const std::string & path, chatterbox_model & model) {
