@@ -47,7 +47,6 @@ def map_name(name):
     }
     if name in table: return table[name]
     if name == "tfmr.wte.weight": return None
-    # official T3 3f35dfc8: text_head is training forward()/loss only; inference_turbo never reads it
     if name == "text_head.weight": return None
     m = LAYER_RE.match(name)
     if not m: return None
@@ -72,8 +71,6 @@ def main():
     ckpt_dir, out = Path(sys.argv[1]), Path(sys.argv[2])
     out.parent.mkdir(parents=True, exist_ok=True)
     state = load_file(ckpt_dir / "t3_turbo_v1.safetensors")
-    for name in sorted(state):
-        print(f"{name}\t{tuple(state[name].shape)}", flush=True)
     skip = {"tfmr.wte.weight", "text_head.weight"}
     unknown = [name for name in state if name not in skip and map_name(name) is None]
     if unknown:

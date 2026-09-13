@@ -33,10 +33,7 @@ inline int envi(const char * n, int d) {
     long x = std::strtol(v, &e, 10);
     return e != v ? (int)x : d;
 }
-inline float effective_repeat_penalty() {
-    float f = envf("CHATTERBOX_REPEAT_PENALTY", REPEAT_PENALTY);
-    return f > 0.f ? f : REPEAT_PENALTY;
-}
+inline float effective_repeat_penalty() { return envf("CHATTERBOX_REPEAT_PENALTY", REPEAT_PENALTY); }
 inline float effective_temperature() { return envf("CHATTERBOX_TEMPERATURE", TEMPERATURE); }
 inline int effective_top_k() { return envi("CHATTERBOX_TOP_K", TOP_K); }
 inline float effective_top_p() { return envf("CHATTERBOX_TOP_P", TOP_P); }

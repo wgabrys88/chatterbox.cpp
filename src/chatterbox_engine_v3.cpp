@@ -56,6 +56,7 @@ struct Engine::Impl {
         text_tokens.push_back(model.hparams.start_text_token);
         text_tokens.insert(text_tokens.end(), ids.begin(), ids.end());
         text_tokens.push_back(model.hparams.stop_text_token);
+        if (model.buffer_kv) ggml_backend_buffer_clear(model.buffer_kv, 0);
         int n_past = 0;
         const int32_t stop = model.hparams.stop_speech_token;
         const int32_t sos = model.hparams.start_speech_token;

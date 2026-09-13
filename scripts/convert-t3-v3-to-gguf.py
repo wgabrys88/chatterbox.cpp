@@ -113,8 +113,6 @@ def main():
     ckpt_dir, out = Path(sys.argv[1]), Path(sys.argv[2])
     out.parent.mkdir(parents=True, exist_ok=True)
     state = load_file(ckpt_dir / "t3_mtl23ls_v3.safetensors")
-    for name in sorted(state):
-        print(f"{name}\t{tuple(state[name].shape)}", flush=True)
     unknown = [name for name in state if name not in SKIP and map_name(name) is None]
     if unknown:
         print("STOP unknown keys:", file=sys.stderr)

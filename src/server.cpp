@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
         std::string len_s = read_line(h);
         char* end = nullptr;
         unsigned long nbytes = std::strtoul(len_s.c_str(), &end, 10);
-        if (!path.empty() && end != len_s.c_str() && nbytes > 0 && nbytes <= 1u << 20) {
+        if (!path.empty() && end != len_s.c_str() && nbytes > 0) {
             std::string text(nbytes, '\0');
             if (read_exact(h, text.data(), (DWORD)nbytes)) {
                 write_wav(path.c_str(), tts.synthesize(text));

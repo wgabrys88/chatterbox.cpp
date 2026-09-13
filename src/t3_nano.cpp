@@ -308,9 +308,6 @@ int32_t sample_next_token_ex(
     const float top_p = effective_top_p();
     const int sil = effective_silence_token();
     std::vector<float> scores(logits.begin(), logits.end());
-#if defined(TTS_FAMILY_NANO)
-    apply_speech_repeat_penalty(scores.data(), n, generated);
-#endif
     if (temperature > 0.0f && temperature != 1.0f) {
         float inv_t = 1.0f / temperature;
         for (float & s : scores) s *= inv_t;
@@ -344,48 +341,6 @@ int32_t sample_next_token_ex(
         }
         for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
-#if defined(TTS_FAMILY_NANO)
-    auto softmax_sample = [&](const std::vector<float> & sc) -> int32_t {
-        float mx = -INFINITY;
-        for (float s : sc) if (s != -INFINITY) mx = std::max(mx, s);
-        std::vector<float> pr(n);
-        float psum = 0;
-        for (int i = 0; i < n; ++i) {
-            pr[i] = (sc[i] == -INFINITY) ? 0.0f : std::exp(sc[i] - mx);
-            psum += pr[i];
-        }
-        if (psum == 0.0f) throw std::runtime_error("sampler produced empty distribution");
-        for (float & p : pr) p /= psum;
-        std::discrete_distribution<int> dist(pr.begin(), pr.end());
-        return (int32_t)dist(rng);
-    };
-    int32_t chosen = softmax_sample(scores);
-    if (chosen != sil && !generated.empty()) {
-        const size_t start = generated.size() > (size_t)RAS_WINDOW
-            ? generated.size() - (size_t)RAS_WINDOW : 0;
-        int rep = 0;
-        for (size_t i = start; i < generated.size(); ++i)
-            if (generated[i] == chosen) ++rep;
-        if ((float)rep >= (float)RAS_WINDOW * RAS_TAU) {
-            scores[chosen] = -INFINITY;
-            bool any = false;
-            for (float s : scores) if (s != -INFINITY) { any = true; break; }
-            if (any) chosen = softmax_sample(scores);
-        }
-    }
-    std::vector<float> probs(n);
-    {
-        float mx = -INFINITY;
-        for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
-        float psum = 0;
-        for (int i = 0; i < n; ++i) {
-            probs[i] = (scores[i] == -INFINITY) ? 0.0f : std::exp(scores[i] - mx);
-            psum += probs[i];
-        }
-        if (psum == 0.0f) throw std::runtime_error("sampler produced empty distribution");
-        for (float & p : probs) p /= psum;
-    }
-#else
     apply_speech_repeat_penalty(scores.data(), n, generated);
     float mx = -INFINITY;
     for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
@@ -399,7 +354,6 @@ int32_t sample_next_token_ex(
     for (float & p : probs) p /= psum;
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
     int32_t chosen = (int32_t)dist(rng);
-#endif
     if (g_sampler_log) {
         int sil_rank = 1;
         for (int i = 0; i < n; ++i) if (probs[i] > probs[sil] + 1e-12f) ++sil_rank;
