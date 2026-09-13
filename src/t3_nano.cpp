@@ -199,6 +199,9 @@ static ggml_tensor * build_transformer_core(
             kv_pos_stride,
             kv_head_stride,
             layer_off);
+        Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
+        K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
+        V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
         ggml_tensor * attn = ggml_flash_attn_ext(ctx, Q, K, V, kq_mask,
             1.0f / std::sqrt((float) HD), 0.0f, 0.0f);
         cur = ggml_reshape_2d(ctx, attn, n_embd, N);

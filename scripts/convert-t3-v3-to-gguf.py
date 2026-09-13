@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, math, re, sys
+import argparse, json, math, re, sys
 from pathlib import Path
 import gguf, numpy as np, torch
 from safetensors.torch import load_file
@@ -11,6 +11,7 @@ ROPE_THETA, ROPE_ORIG_CTX = 500000.0, 8192
 ROPE_FACTOR, ROPE_HIGH, ROPE_LOW = 8.0, 4.0, 1.0
 LAYER_RE = re.compile(r"^tfmr\.layers\.(\d+)\.(.+)$")
 QTYPE = gguf.GGMLQuantizationType.Q8_0
+F16 = False
 SKIP = {"tfmr.embed_tokens.weight", "text_head.weight"}
 def as_numpy(tensor, *, dtype=None):
     if dtype is not None: tensor = tensor.to(dtype)
@@ -33,6 +34,7 @@ def llama3_freq_factors(n_dims, base, factor, low_freq_factor, high_freq_factor,
         out[i] = np.float32(inv / new_inv)
     return out
 def quantizable(name):
+    if F16: return False
     if name == "chatterbox/speech_head": return True
     if not name.startswith("model/h"): return False
     return name.endswith(("/attn/q/w", "/attn/k/w", "/attn/v/w", "/attn/o/w", "/ffn/gate/w", "/ffn/up/w", "/ffn/down/w"))
@@ -110,7 +112,14 @@ def map_name(name):
     if m.group(2) not in layers: return None
     return layers[m.group(2)].format(int(m.group(1))), torch.float16
 def main():
-    ckpt_dir, out = Path(sys.argv[1]), Path(sys.argv[2])
+    global F16
+    p = argparse.ArgumentParser()
+    p.add_argument("ckpt_dir")
+    p.add_argument("out")
+    p.add_argument("--f16", action="store_true", help="store weights as F16 instead of Q8_0")
+    a = p.parse_args()
+    F16 = a.f16
+    ckpt_dir, out = Path(a.ckpt_dir), Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     state = load_file(ckpt_dir / "t3_mtl23ls_v3.safetensors")
     unknown = [name for name in state if name not in SKIP and map_name(name) is None]

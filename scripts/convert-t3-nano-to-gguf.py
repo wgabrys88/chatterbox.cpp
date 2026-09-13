@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, re, sys
+import argparse, json, re, sys
 from pathlib import Path
 import gguf, numpy as np, torch
 from safetensors.torch import load_file
@@ -7,12 +7,14 @@ TEXT_VOCAB_SIZE, SPEECH_VOCAB_SIZE = 50276, 6563
 START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, SPEAKER_EMBED_SIZE = 6561, 6562, 256
 LAYER_RE = re.compile(r"^tfmr\.h\.(\d+)\.(.+)$")
 QTYPE = gguf.GGMLQuantizationType.Q8_0
+F16 = False
 def as_numpy(tensor, *, dtype=None, transpose=False):
     if dtype is not None: tensor = tensor.to(dtype)
     array = tensor.detach().cpu().numpy()
     if transpose: array = array.T
     return np.ascontiguousarray(array)
 def quantizable(name):
+    if F16: return False
     if name == "chatterbox/speech_head": return True
     return name.startswith("model/h") and name.endswith(("/attn/c_attn/w", "/attn/c_proj/w", "/mlp/c_fc/w", "/mlp/c_proj/w"))
 def add(writer, name, array):
@@ -67,7 +69,14 @@ def map_name(name):
     fmt, dtype, transpose = layers[m.group(2)]
     return fmt.format(int(m.group(1))), dtype, transpose
 def main():
-    ckpt_dir, out = Path(sys.argv[1]), Path(sys.argv[2])
+    global F16
+    p = argparse.ArgumentParser()
+    p.add_argument("ckpt_dir")
+    p.add_argument("out")
+    p.add_argument("--f16", action="store_true", help="store weights as F16 instead of Q8_0")
+    a = p.parse_args()
+    F16 = a.f16
+    ckpt_dir, out = Path(a.ckpt_dir), Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     state = load_file(ckpt_dir / "t3_nano_v1.safetensors")
     conds = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)
