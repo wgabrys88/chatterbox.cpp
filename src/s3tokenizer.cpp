@@ -314,10 +314,10 @@ static ggml_tensor * build_encoder_graph(encoder_ctx & ec,
 {
     ggml_tensor * x = conv1d_f32(ctx, ec.conv1_w, ec.mel_in, w.conv_stride, 1, 1);
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, ec.conv1_b, 1, w.n_state));
-    x = ggml_gelu(ctx, x);
+    x = ggml_gelu_erf(ctx, x);
     ggml_tensor * y = conv1d_f32(ctx, ec.conv2_w, x, w.conv_stride, 1, 1);
     y = ggml_add(ctx, y, ggml_reshape_2d(ctx, ec.conv2_b, 1, w.n_state));
-    y = ggml_gelu(ctx, y);
+    y = ggml_gelu_erf(ctx, y);
     ggml_tensor * h = ggml_cont(ctx, ggml_transpose(ctx, y));
     const int n_head   = w.n_head;
     const int head_dim = w.head_dim;
@@ -360,7 +360,7 @@ static ggml_tensor * build_encoder_graph(encoder_ctx & ec,
         h = ggml_add(ctx, h, ggml_add(ctx, out_proj, fsmn_memory));
         ggml_tensor * ln2 = layer_norm(ctx, h, B.mlp_ln_w, B.mlp_ln_b);
         ggml_tensor * m = linear(ctx, ln2, B.mlp0_w, B.mlp0_b);
-        m = ggml_gelu(ctx, m);
+        m = ggml_gelu_erf(ctx, m);
         m = linear(ctx, m, B.mlp2_w, B.mlp2_b);
         h = ggml_add(ctx, h, m);
     }
