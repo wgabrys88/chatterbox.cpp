@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,6 +37,16 @@ static std::string read_line(HANDLE h) {
     return {};
 }
 
+static bool read_exact(HANDLE h, char* buf, DWORD need) {
+    DWORD got = 0;
+    while (got < need) {
+        DWORD n = 0;
+        if (!ReadFile(h, buf + got, need - got, &n, nullptr) || n == 0) return false;
+        got += n;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     if (argc < 5) throw std::runtime_error("argv");
     HANDLE h = CreateNamedPipeA(argv[3], PIPE_ACCESS_DUPLEX,
@@ -47,12 +58,17 @@ int main(int argc, char** argv) {
     tts_cpp::chatterbox::Engine tts({argv[1], argv[2], argv[4]});
     for (;;) {
         std::string path = read_line(h);
-        std::string text = read_line(h);
-        if (!path.empty() && !text.empty()) {
-            write_wav(path.c_str(), tts.synthesize(text));
-            DWORD n = 0;
-            WriteFile(h, "ok\n", 3, &n, nullptr);
-            FlushFileBuffers(h);
+        std::string len_s = read_line(h);
+        char* end = nullptr;
+        unsigned long nbytes = std::strtoul(len_s.c_str(), &end, 10);
+        if (!path.empty() && end != len_s.c_str() && nbytes > 0 && nbytes <= 1u << 20) {
+            std::string text(nbytes, '\0');
+            if (read_exact(h, text.data(), (DWORD)nbytes)) {
+                write_wav(path.c_str(), tts.synthesize(text));
+                DWORD n = 0;
+                WriteFile(h, "ok\n", 3, &n, nullptr);
+                FlushFileBuffers(h);
+            }
         }
         DisconnectNamedPipe(h);
         if (!ConnectNamedPipe(h, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
