@@ -133,6 +133,57 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
     }
     return out;
 }
+
+std::vector<float> trim_silence(const std::vector<float> & wav, float top_db,
+                                int frame_length, int hop_length)
+{
+    // librosa.effects.trim defaults: top_db=20 (VE), frame_length=2048, hop_length=512,
+    // centered RMS, amplitude_to_db amin=1e-5, ref=np.max.
+    if (wav.empty()) return {};
+    if (frame_length <= 0 || hop_length <= 0) throw std::runtime_error("trim");
+    const int n = (int)wav.size();
+    const int pad = frame_length / 2;
+    const int n_padded = n + 2 * pad;
+    if (n_padded < frame_length) return {};
+    const int n_frames = 1 + (n_padded - frame_length) / hop_length;
+    if (n_frames <= 0) return {};
+    std::vector<float> padded((size_t)n_padded, 0.0f);
+    std::copy(wav.begin(), wav.end(), padded.begin() + pad);
+    std::vector<float> rms((size_t)n_frames);
+    const float inv_len = 1.0f / (float)frame_length;
+    for (int i = 0; i < n_frames; ++i) {
+        const float * sl = padded.data() + (size_t)i * (size_t)hop_length;
+        float acc = 0.0f;
+        for (int k = 0; k < frame_length; ++k) {
+            const float v = sl[k];
+            acc += v * v;
+        }
+        rms[(size_t)i] = std::sqrt(acc * inv_len);
+    }
+    const float amin2 = 1e-5f * 1e-5f;
+    float ref = 0.0f;
+    for (float v : rms) {
+        const float a = std::fabs(v);
+        if (a > ref) ref = a;
+    }
+    const float log_ref = 10.0f * std::log10(std::max(amin2, ref * ref));
+    int first = -1;
+    int last = -1;
+    for (int i = 0; i < n_frames; ++i) {
+        const float mag = std::fabs(rms[(size_t)i]);
+        const float db = 10.0f * std::log10(std::max(amin2, mag * mag)) - log_ref;
+        if (db > -top_db) {
+            if (first < 0) first = i;
+            last = i;
+        }
+    }
+    if (first < 0) return {};
+    const int start = first * hop_length;
+    const int end = std::min(n, (last + 1) * hop_length);
+    if (start >= end || start < 0) return {};
+    return std::vector<float>(wav.begin() + start, wav.begin() + end);
+}
+
 std::vector<float> mel_extract_24k_80(const std::vector<float> & wav_24k,
                                       const std::vector<float> & mel_filterbank,
                                       ggml_backend_t backend)

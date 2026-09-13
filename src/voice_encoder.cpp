@@ -50,6 +50,7 @@ bool voice_encoder_load(const std::string & t3_gguf_path,
     out.hidden         = (int)get_u32("voice_encoder.hidden_size");
     out.embedding      = (int)get_u32("voice_encoder.embedding_size");
     out.partial_frames = (int)get_u32("voice_encoder.partial_frames");
+    out.sample_rate    = (int)get_u32("voice_encoder.sample_rate");
     out.overlap        = get_f32("voice_encoder.overlap");
     out.rate           = get_f32("voice_encoder.rate");
     out.min_coverage   = get_f32("voice_encoder.min_coverage");
@@ -275,7 +276,7 @@ bool voice_encoder_embed(const std::vector<float> & wav_16k,
     if (mel.empty()) throw std::runtime_error("VE mel");
     const int T_mel = (int)(mel.size() / w.n_mels);
     int n_wins, step, target_n;
-    compute_partials(T_mel, w.partial_frames, w.rate, w.partial_frames,
+    compute_partials(T_mel, w.partial_frames, w.rate, w.sample_rate,
                      w.min_coverage, n_wins, step, target_n);
     if (target_n > T_mel) mel.resize((size_t) target_n * w.n_mels, 0.0f);
     else if (target_n < T_mel) mel.resize((size_t) target_n * w.n_mels);

@@ -23,6 +23,7 @@ struct voice_encoder_weights {
     std::vector<float> proj_b;
     std::vector<float> mel_fb;
     int   partial_frames = 160;
+    int   sample_rate    = 16000;
     float overlap        = 0.5f;
     float rate           = 1.3f;
     float min_coverage   = 0.8f;

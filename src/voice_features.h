@@ -5,6 +5,8 @@ struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
 void wav_load(const std::string & path, std::vector<float> & out_samples, int & out_sr);
 std::vector<float> resample_sinc(const std::vector<float> & in, int sr_in, int sr_out, int taps_half = 256);
+std::vector<float> trim_silence(const std::vector<float> & wav, float top_db = 20.0f,
+                                int frame_length = 2048, int hop_length = 512);
 void normalise_lufs(std::vector<float> & wav, int sr, double target_lufs = -27.0);
 std::vector<float> mel_graph_run(const std::vector<float> & frames_TC, const std::vector<float> & mel_fb,
                                  int T, int n_fft, int F, int n_mels, float power_exp, float log_floor,
