@@ -68,7 +68,8 @@ struct Engine::Impl {
         if (g_sampler_log)
             *g_sampler_log << "step,chosen,chosen_prob,sil4299_prob,sil4299_rank,sil4299_seen,gen_len,top0_id,top0_prob,top1_id,top1_prob,top2_id,top2_prob,top3_id,top3_prob,top4_id,top4_prob,top5_id,top5_prob,top6_id,top6_prob,top7_id,top7_prob,top8_id,top8_prob,top9_id,top9_prob\n";
         eval_prompt(model, allocr, text_tokens, logits, n_past);
-        token = sample_next_token_ex(logits, out, rng);
+        const std::vector<int32_t> first_pen = { model.hparams.start_speech_token };
+        token = sample_next_token_ex(logits, first_pen, rng);
         out.push_back(token);
         if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
         for (int step = 1; step < n_predict && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
