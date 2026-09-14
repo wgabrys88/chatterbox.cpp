@@ -791,11 +791,11 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
     ggml_free(ctx);
     return f0;
 }
-static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int sr,
-                                         int harmonic_num, float sine_amp, float noise_std,
-                                         float voiced_threshold,
-                                         const std::vector<float> & l_w, float l_b,
-                                         uint32_t seed) {
+static void sinegen_source(const std::vector<float> & f0_wav, int sr,
+                           int harmonic_num, float sine_amp, float noise_std,
+                           float voiced_threshold,
+                           const std::vector<float> & l_w, float l_b,
+                           uint32_t seed, std::vector<float> & src) {
     int T_wav = (int)f0_wav.size();
     int H = harmonic_num + 1;
     std::mt19937 rng(seed);
@@ -817,13 +817,12 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
             sine_waves[(size_t)h * T_wav + t] = sine * uv + namp * positioned_noise(seed, (uint64_t)t * H + h);
         }
     }
-    std::vector<float> src(T_wav, 0.0f);
+    src.assign((size_t)T_wav, 0.0f);
     for (int t = 0; t < T_wav; ++t) {
         float s = l_b;
         for (int h = 0; h < H; ++h) s += l_w[h] * sine_waves[(size_t)h * T_wav + t];
         src[t] = std::tanh(s);
     }
-    return src;
 }
 static std::vector<float> run_stft(const model_ctx & m, const std::vector<float> & src) {
     const int n_fft = 16, hop = 4;
@@ -856,9 +855,10 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
     ggml_free(ctx);
     return out;
 }
-static std::vector<float> run_hift_decode(const model_ctx & m,
-                                          const std::vector<float> & mel, int T_mel,
-                                          const std::vector<float> & s_stft, int T_stft) {
+static void run_hift_decode(const model_ctx & m,
+                            const std::vector<float> & mel, int T_mel,
+                            const std::vector<float> & s_stft, int T_stft,
+                            std::vector<float> & wav) {
     const int MEL = 80, NFFT2 = 18, BASE_CH = 512, n_fft = 16, hop = 4;
     const int F = n_fft / 2 + 1;
     std::vector<int> ups_rates  = {8, 5, 3};
@@ -991,11 +991,10 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     for (auto & ia : inv_alphas)
         s3_tensor_set(ggml_graph_get_tensor(gf, ia.gn.c_str()), ia.data.data(), 0, ia.data.size()*sizeof(float));
     compute(m.backend, gf);
-    std::vector<float> wav(ggml_nelements(y_trim));
+    wav.resize((size_t)ggml_nelements(y_trim));
     s3_tensor_get(y_trim, wav.data(), 0, ggml_nbytes(y_trim));
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
-    return wav;
 }
 static void s3gen_synthesize_meanflow(
     const std::vector<int32_t>& speech_tokens,
@@ -1086,16 +1085,17 @@ static void s3gen_synthesize_meanflow(
     std::vector<float> f0_up(T_wav);
     for (int i = 0; i < T_mel; ++i)
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
-    auto source = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, m.hift_linear_w, m.hift_linear_b, (uint32_t)(seed + 1));
+    std::vector<float> source_local;
+    std::vector<float> & source = source_out ? *source_out : source_local;
+    sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, m.hift_linear_w, m.hift_linear_b, (uint32_t)(seed + 1), source);
     if (source_cache && !source_cache->empty()) {
         const size_t n = std::min(source_cache->size(), source.size());
         std::memcpy(source.data(), source_cache->data(), n * sizeof(float));
     }
     auto s_stft = run_stft(m, source);
     int T_stft = (int)(s_stft.size() / 18);
-    wav = run_hift_decode(m, mel, T_mel, s_stft, T_stft);
+    run_hift_decode(m, mel, T_mel, s_stft, T_stft, wav);
     if ((int)wav.size() != output_tokens * kSamplesPerToken) throw std::runtime_error("S3Gen waveform range mismatch");
-    if (source_out) *source_out = std::move(source);
 }
 #if defined(TTS_FAMILY_NANO)
 void s3gen_synthesize_stream(

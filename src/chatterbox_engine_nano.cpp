@@ -19,7 +19,10 @@ using namespace detail;
 namespace {
 struct NanoAudioStream {
     std::vector<float> source_cache;
+    std::vector<float> source_scratch;
+    std::vector<float> wav_scratch;
     std::vector<float> pending_tail;
+    std::vector<float> cross_scratch;
     std::size_t emitted_samples = 0;
 
     static void emit(Engine::AudioCallback cb, void * user, const float * data, std::size_t n) {
@@ -39,23 +42,23 @@ struct NanoAudioStream {
         if (pending_tail.size() > overlap)
             emit(cb, user, pending_tail.data(), pending_tail.size() - overlap);
         if (overlap) {
-            std::vector<float> crossed(overlap);
+            cross_scratch.resize(overlap);
             for (std::size_t i = 0; i < overlap; ++i) {
                 const float in = overlap == 1 ? 1.0f : (float)i / (float)(overlap - 1);
-                crossed[i] = pending_tail[pending_tail.size() - overlap + i] * (1.0f - in) + body[i] * in;
+                cross_scratch[i] = pending_tail[pending_tail.size() - overlap + i] * (1.0f - in) + body[i] * in;
             }
-            emit(cb, user, crossed.data(), crossed.size());
+            emit(cb, user, cross_scratch.data(), cross_scratch.size());
         }
         if (n > overlap) emit(cb, user, body + overlap, n - overlap);
     }
 
     void flush(const std::vector<int32_t>& tokens, bool final, Engine::AudioCallback cb, void * user) {
-        std::vector<float> wav, source;
-        s3gen_synthesize_stream(tokens, final, source_cache, wav, source);
-        source_cache = std::move(source);
-        if (wav.size() <= emitted_samples) return;
-        const float * chunk = wav.data() + emitted_samples;
-        const std::size_t chunk_len = wav.size() - emitted_samples;
+        s3gen_synthesize_stream(tokens, final, source_cache, wav_scratch, source_scratch);
+        source_cache.swap(source_scratch);
+        source_scratch.clear();
+        if (wav_scratch.size() <= emitted_samples) return;
+        const float * chunk = wav_scratch.data() + emitted_samples;
+        const std::size_t chunk_len = wav_scratch.size() - emitted_samples;
         if (final) {
             emit_body(chunk, chunk_len, cb, user);
             pending_tail.clear();
