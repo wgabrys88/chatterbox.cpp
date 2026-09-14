@@ -57,13 +57,13 @@ def map_name(name):
         "ln_1.bias": ("model/h{}/ln_1/b", torch.float32, False),
         "ln_2.weight": ("model/h{}/ln_2/g", torch.float32, False),
         "ln_2.bias": ("model/h{}/ln_2/b", torch.float32, False),
-        "attn.c_attn.weight": ("model/h{}/attn/c_attn/w", torch.float16, True),
+        "attn.c_attn.weight": ("model/h{}/attn/c_attn/w", torch.float32, True),
         "attn.c_attn.bias": ("model/h{}/attn/c_attn/b", torch.float32, False),
-        "attn.c_proj.weight": ("model/h{}/attn/c_proj/w", torch.float16, True),
+        "attn.c_proj.weight": ("model/h{}/attn/c_proj/w", torch.float32, True),
         "attn.c_proj.bias": ("model/h{}/attn/c_proj/b", torch.float32, False),
-        "mlp.c_fc.weight": ("model/h{}/mlp/c_fc/w", torch.float16, True),
+        "mlp.c_fc.weight": ("model/h{}/mlp/c_fc/w", torch.float32, True),
         "mlp.c_fc.bias": ("model/h{}/mlp/c_fc/b", torch.float32, False),
-        "mlp.c_proj.weight": ("model/h{}/mlp/c_proj/w", torch.float16, True),
+        "mlp.c_proj.weight": ("model/h{}/mlp/c_proj/w", torch.float32, True),
         "mlp.c_proj.bias": ("model/h{}/mlp/c_proj/b", torch.float32, False),
     }
     if m.group(2) not in layers: return None
