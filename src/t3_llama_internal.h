@@ -1,11 +1,11 @@
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <ostream>
 #include <random>
-#include <set>
 #include <string>
 #include <vector>
 #include "ggml-alloc.h"
@@ -40,7 +40,6 @@ inline float effective_top_p() { return envf("CHATTERBOX_TOP_P", TOP_P); }
 inline float effective_min_p() { return envf("CHATTERBOX_MIN_P", MIN_P); }
 inline float effective_cfg_weight() { return envf("CHATTERBOX_CFG_WEIGHT", CFG_WEIGHT); }
 inline float effective_cfm_cfg() { return envf("CHATTERBOX_CFM_CFG", CFM_CFG); }
-inline int effective_repeat_last_n() { return envi("CHATTERBOX_REPEAT_LAST_N", REPEAT_LAST_N); }
 inline int effective_seed() { return envi("CHATTERBOX_SEED", SEED); }
 inline int effective_n_predict() { return envi("CHATTERBOX_N_PREDICT", N_PREDICT); }
 inline int effective_cfm_steps() { return envi("CHATTERBOX_CFM_STEPS", CFM_STEPS); }
@@ -49,13 +48,16 @@ inline void apply_speech_repeat_penalty(float * scores, int vocab,
                                         const std::vector<int32_t> & generated) {
     if (generated.empty() || vocab <= 0) return;
     const float penalty = effective_repeat_penalty();
-    const int last_n = effective_repeat_last_n();
-    const size_t start = generated.size() > (size_t)last_n
-        ? generated.size() - (size_t)last_n : 0;
-    std::set<int32_t> seen;
-    for (size_t i = start; i < generated.size(); ++i) seen.insert(generated[i]);
-    for (int32_t t : seen) {
-        if (t < 0 || t >= vocab) continue;
+    thread_local std::vector<uint32_t> marks;
+    thread_local uint32_t epoch = 0;
+    if (marks.size() < (size_t)vocab) marks.resize((size_t)vocab, 0);
+    if (++epoch == 0) {
+        std::fill(marks.begin(), marks.end(), 0);
+        epoch = 1;
+    }
+    for (int32_t t : generated) {
+        if (t < 0 || t >= vocab || marks[(size_t)t] == epoch) continue;
+        marks[(size_t)t] = epoch;
         float & s = scores[t];
         if (s == -INFINITY) continue;
         s = s > 0.0f ? s / penalty : s * penalty;

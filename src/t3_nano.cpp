@@ -10,7 +10,6 @@
 #include <iomanip>
 #include <map>
 #include <random>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -331,32 +330,27 @@ int32_t sample_next_token_ex(
     }
     if (top_k > 0 && top_k < n) {
         std::vector<float> tmp(scores);
-        std::nth_element(tmp.begin(), tmp.begin() + top_k, tmp.end(), std::greater<float>());
-        float threshold = tmp[top_k];
-        int kept = 0;
-        for (float s : scores) if (s > threshold) ++kept;
-        if (kept < top_k) threshold -= 1e-10f;
-        for (float & s : scores) if (s <= threshold) s = -INFINITY;
+        std::nth_element(tmp.begin(), tmp.begin() + (top_k - 1), tmp.end(), std::greater<float>());
+        const float threshold = tmp[top_k - 1];
+        for (float & s : scores) if (s < threshold) s = -INFINITY;
     }
     if (top_p < 1.0f) {
         struct IS { int idx; float s; };
         std::vector<IS> sorted;
-        sorted.reserve(n);
+        sorted.reserve((size_t)n);
         for (int i = 0; i < n; ++i) if (scores[i] != -INFINITY) sorted.push_back({i, scores[i]});
-        std::sort(sorted.begin(), sorted.end(), [](const IS& a, const IS& b){ return a.s > b.s; });
-        float mx = sorted[0].s;
+        std::sort(sorted.begin(), sorted.end(), [](const IS& a, const IS& b){ return a.s < b.s; });
+        const float mx = sorted.back().s;
         std::vector<float> probs(sorted.size());
-        float psum = 0;
+        float psum = 0.0f;
         for (size_t i = 0; i < sorted.size(); ++i) { probs[i] = std::exp(sorted[i].s - mx); psum += probs[i]; }
         for (float & p : probs) p /= psum;
-        float cum = 0;
-        std::set<int> keep_set;
-        for (size_t i = 0; i < sorted.size(); ++i) {
+        float cum = 0.0f;
+        const float cutoff = 1.0f - top_p;
+        for (size_t i = 0; i + 1 < sorted.size(); ++i) {
             cum += probs[i];
-            keep_set.insert(sorted[i].idx);
-            if (cum >= top_p) break;
+            if (cum <= cutoff) scores[sorted[i].idx] = -INFINITY;
         }
-        for (int i = 0; i < n; ++i) if (keep_set.find(i) == keep_set.end()) scores[i] = -INFINITY;
     }
     apply_speech_repeat_penalty(scores.data(), n, generated);
     float mx = -INFINITY;
