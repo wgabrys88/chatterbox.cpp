@@ -74,7 +74,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("ckpt_dir")
     p.add_argument("out")
-    p.add_argument("--f16", action="store_true", help="store weights as F16 instead of Q8_0")
+    p.add_argument("--f16", action="store_true", help="skip Q8_0; store mapped tensors as F32 (Nano/Turbo product dtype; flag name is historical)")
     a = p.parse_args()
     F16 = a.f16
     ckpt_dir, out = Path(a.ckpt_dir), Path(a.out)
@@ -94,6 +94,10 @@ def main():
     n_head = n_embd // 64
     if n_embd % 64:
         raise SystemExit(f"n_head {n_embd}//64")
+    # Official GPT2_MEDIUM_CONFIG: n_embd=1024 n_layer=24 n_head=16 n_ctx=8196.
+    # Nano delta: generate cap follows wpe (n_ctx), T3 stored F32 under --f16. Do not accept a nano-sized checkpoint.
+    if n_embd != 1024 or n_layer != 24 or n_head != 16 or n_ctx != 8196:
+        raise SystemExit(f"turbo expected GPT2_medium 1024/24/16/8196, got {n_embd}/{n_layer}/{n_head}/{n_ctx}")
     writer = gguf.GGUFWriter(str(out), "chatterbox")
     writer.add_uint32("chatterbox.n_ctx", n_ctx)
     writer.add_uint32("chatterbox.n_embd", n_embd)
