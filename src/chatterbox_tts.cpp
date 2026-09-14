@@ -328,27 +328,25 @@ static ggml_tensor * conformer_block(ggml_context * ctx, const conformer_w & w,
     return ggml_add(ctx, residual, ff);
 }
 static void compute_pos_emb(std::vector<float> & pe, int T, int D) {
-    int L = 2 * T - 1;
-    pe.assign(L * D, 0.0f);
+    pe.resize((size_t)(2 * T - 1) * D);
     const float log10000 = std::log(10000.0f);
-    std::vector<float> div_term(D / 2);
-    for (int i = 0; i < D / 2; ++i) div_term[i] = std::exp(-((float)(2*i) * log10000 / (float)D));
-    std::vector<std::vector<float>> pos_pe(T, std::vector<float>(D, 0.0f));
-    std::vector<std::vector<float>> neg_pe(T, std::vector<float>(D, 0.0f));
-    for (int i = 0; i < T; ++i) {
+    std::vector<float> div_term((size_t)D / 2);
+    for (int k = 0; k < D / 2; ++k)
+        div_term[k] = std::exp(-((float)(2*k) * log10000 / (float)D));
+    for (int t = 0; t < T; ++t) {
+        const float pos = (float)(T - 1 - t);
         for (int k = 0; k < D / 2; ++k) {
-            pos_pe[i][2*k]     = std::sin((float)i * div_term[k]);
-            pos_pe[i][2*k + 1] = std::cos((float)i * div_term[k]);
-            neg_pe[i][2*k]     = std::sin(-(float)i * div_term[k]);
-            neg_pe[i][2*k + 1] = std::cos(-(float)i * div_term[k]);
+            pe[(size_t)t * D + 2*k]     = std::sin(pos * div_term[k]);
+            pe[(size_t)t * D + 2*k + 1] = std::cos(pos * div_term[k]);
         }
     }
-    for (int t = 0; t < T; ++t) {
-        int src = T - 1 - t;
-        for (int d = 0; d < D; ++d) pe[t*D + d] = pos_pe[src][d];
-    }
     for (int t = 1; t < T; ++t) {
-        for (int d = 0; d < D; ++d) pe[(T - 1 + t)*D + d] = neg_pe[t][d];
+        const float pos = -(float)t;
+        const size_t row = (size_t)(T - 1 + t) * D;
+        for (int k = 0; k < D / 2; ++k) {
+            pe[row + 2*k]     = std::sin(pos * div_term[k]);
+            pe[row + 2*k + 1] = std::cos(pos * div_term[k]);
+        }
     }
 }
 static void build_encoder_cache(const model_ctx & m, encoder_cache & cache, int T, int D) {
@@ -420,14 +418,16 @@ static void build_encoder_cache(const model_ctx & m, encoder_cache & cache, int 
     cache.mu = mu; ggml_build_forward_expand(gf, cache.mu);
     cache.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
     s3_reserve(cache.allocr, gf); s3_alloc_graph(cache.allocr, gf);
+    std::vector<float> pe1, pe2;
+    compute_pos_emb(pe1, T, D); compute_pos_emb(pe2, 2*T, D);
+    s3_tensor_set(cache.pos1, pe1.data(), 0, pe1.size()*sizeof(float));
+    s3_tensor_set(cache.pos2, pe2.data(), 0, pe2.size()*sizeof(float));
 }
 static std::vector<float> run_encoder(model_ctx & m, const std::vector<float> & input_embed, int T, int D) {
     if (!m.first_encoder) m.first_encoder = std::make_unique<encoder_cache>();
     encoder_cache & cache = *m.first_encoder;
     if (!cache.ctx || cache.backend != m.backend || cache.T != T || cache.D != D) build_encoder_cache(m, cache, T, D);
     s3_tensor_set(cache.x_in, input_embed.data(), 0, input_embed.size()*sizeof(float));
-    std::vector<float> pe1, pe2; compute_pos_emb(pe1, T, D); compute_pos_emb(pe2, 2*T, D);
-    s3_tensor_set(cache.pos1, pe1.data(), 0, pe1.size()*sizeof(float)); s3_tensor_set(cache.pos2, pe2.data(), 0, pe2.size()*sizeof(float));
     compute(m.backend, cache.gf);
     std::vector<float> out((size_t)ggml_nelements(cache.mu)); s3_tensor_get(cache.mu, out.data(), 0, ggml_nbytes(cache.mu)); return out;
 }
