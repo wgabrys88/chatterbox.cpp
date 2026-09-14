@@ -102,11 +102,8 @@ int main(int, char ** argv) {
     normalise_lufs(wav, sr, -27.0);
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
     wav = trim_silence(wav);
-#if defined(TTS_FAMILY_V3)
     if (wav.empty()) throw std::runtime_error("reference wav");
-#else
     if (wav.size() > 30u * 16000u) wav.resize(30u * 16000u);
-#endif
     if (wav.empty()) throw std::runtime_error("reference wav");
     if (!voice_encoder_embed(wav, ve, backend, speaker)) throw std::runtime_error("VE embed");
     if (speaker.size() != 256) throw std::runtime_error("speaker_emb size");

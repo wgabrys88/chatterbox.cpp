@@ -6,7 +6,7 @@ from safetensors.torch import load_file
 TEXT_VOCAB_SIZE, SPEECH_VOCAB_SIZE = 2454, 8194
 START_TEXT_TOKEN, STOP_TEXT_TOKEN = 255, 0
 START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, SPEAKER_EMBED_SIZE = 6561, 6562, 256
-N_PREDICT = 1000
+N_PREDICT = 4096
 ROPE_THETA, ROPE_ORIG_CTX = 500000.0, 8192
 ROPE_FACTOR, ROPE_HIGH, ROPE_LOW = 8.0, 4.0, 1.0
 LAYER_RE = re.compile(r"^tfmr\.layers\.(\d+)\.(.+)$")
@@ -74,9 +74,9 @@ def tokenizer(ckpt_dir):
 def map_name(name):
     table = {
         "tfmr.norm.weight": ("model/norm/g", torch.float32),
-        "text_emb.weight": ("chatterbox/text_emb", torch.float16),
-        "speech_emb.weight": ("chatterbox/speech_emb", torch.float16),
-        "speech_head.weight": ("chatterbox/speech_head", torch.float16),
+        "text_emb.weight": ("chatterbox/text_emb", torch.float32),
+        "speech_emb.weight": ("chatterbox/speech_emb", torch.float32),
+        "speech_head.weight": ("chatterbox/speech_head", torch.float32),
         "text_pos_emb.emb.weight": ("chatterbox/text_pos_emb", torch.float32),
         "speech_pos_emb.emb.weight": ("chatterbox/speech_pos_emb", torch.float32),
         "cond_enc.spkr_enc.weight": ("chatterbox/cond_spkr/w", torch.float32),
@@ -110,13 +110,13 @@ def map_name(name):
         "mlp.down_proj.weight": "model/h{}/ffn/down/w",
     }
     if m.group(2) not in layers: return None
-    return layers[m.group(2)].format(int(m.group(1))), torch.float16
+    return layers[m.group(2)].format(int(m.group(1))), torch.float32
 def main():
     global F16
     p = argparse.ArgumentParser()
     p.add_argument("ckpt_dir")
     p.add_argument("out")
-    p.add_argument("--f16", action="store_true", help="store weights as F16 instead of Q8_0")
+    p.add_argument("--f16", action="store_true", help="skip Q8_0; store mapped tensors as F32 (same Nano/Turbo product dtype; flag name is historical). Without this flag Llama layers were Q8_0 and embeddings F16.")
     a = p.parse_args()
     F16 = a.f16
     ckpt_dir, out = Path(a.ckpt_dir), Path(a.out)
@@ -137,6 +137,16 @@ def main():
     n_ff = int(state["tfmr.layers.0.mlp.gate_proj.weight"].shape[0])
     perceiver_len = int(state["cond_enc.perceiver.pre_attention_query"].shape[1])
     text_pos_len = int(state["text_pos_emb.emb.weight"].shape[0])
+    speech_pos_len = int(state["speech_pos_emb.emb.weight"].shape[0])
+    # Official Llama_520M + max_speech_tokens=4096. Nano analog: generate cap follows
+    # the model's speech_pos table (4100), not internet max_new_tokens=1000.
+    # Keep N_PREDICT at 4096 (documented ceiling) so speech_pos index i+1 stays in 0..4099.
+    if n_embd != 1024 or n_layer != 30 or n_head != 16 or n_ff != 4096:
+        raise SystemExit(f"v3 expected Llama_520M 1024/30/16/4096, got {n_embd}/{n_layer}/{n_head}/{n_ff}")
+    if perceiver_len != 32 or text_pos_len != 2050 or speech_pos_len != 4100:
+        raise SystemExit(f"v3 pos tables expected perceiver=32 text=2050 speech=4100, got {perceiver_len}/{text_pos_len}/{speech_pos_len}")
+    if speech_pos_len <= N_PREDICT:
+        raise SystemExit(f"speech_pos {speech_pos_len} must exceed N_PREDICT {N_PREDICT}")
     n_ctx = 1 + perceiver_len + 1 + text_pos_len + 2 + N_PREDICT
     tokens, types, merges = tokenizer(ckpt_dir)
     writer = gguf.GGUFWriter(str(out), "chatterbox")
