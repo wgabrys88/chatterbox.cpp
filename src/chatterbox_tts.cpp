@@ -1008,13 +1008,24 @@ static void s3gen_synthesize_meanflow(
     const int seed = tts_cpp::chatterbox::detail::effective_seed();
     std::vector<int32_t> padded;
     for (int32_t token : speech_tokens) if (token >= 0 && token < 6561) padded.push_back(token);
+#if defined(TTS_FAMILY_NANO)
+    // Native streaming owns the end-of-utterance silence exactly once in the
+    // Nano controller.  Non-final prefixes keep the model's three-token
+    // right-context withheld; the final prefix is decoded in full.
     const int output_tokens = finalize ? (int)padded.size() : (int)padded.size() - pre_lookahead_len;
+    const int trim_tokens = finalize ? 0 : pre_lookahead_len;
+#else
+    // Preserve the established Turbo batch contract: its controller supplies
+    // the product silence and the batch decoder adds/crops hidden right-context.
+    const int output_tokens = (int)padded.size();
+    const int trim_tokens = pre_lookahead_len;
+    padded.insert(padded.end(), pre_lookahead_len, tts_cpp::chatterbox::detail::effective_silence_token());
+#endif
     if (output_tokens <= 0) {
         wav.clear();
         if (source_out) source_out->clear();
         return;
     }
-    if (finalize) padded.insert(padded.end(), pre_lookahead_len, tts_cpp::chatterbox::detail::effective_silence_token());
     model_ctx& m = *g_s3gen_cache_entry->m;
     const int D = 512;
     const int MEL = 80;
@@ -1028,7 +1039,7 @@ static void s3gen_synthesize_meanflow(
     for (int i = 0; i < n_total; ++i)
         std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)flow_tokens[i] * D, D * sizeof(float));
     mu_T = run_encoder(m, input_embed, n_total, D);
-    int T_mu = 2 * n_total - 2 * pre_lookahead_len;
+    int T_mu = 2 * n_total - 2 * trim_tokens;
     mu_T.resize((size_t)T_mu * MEL);
     std::vector<float> mu(T_mu * MEL);
     for (int m2 = 0; m2 < MEL; ++m2)
