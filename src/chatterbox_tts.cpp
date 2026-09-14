@@ -353,7 +353,7 @@ static void compute_pos_emb(std::vector<float> & pe, int T, int D) {
 }
 static void build_encoder_cache(const model_ctx & m, encoder_cache & cache, int T, int D) {
     const int H = 8, HEAD_DIM = 64;
-    cache.reset(); cache.backend = m.backend; cache.T = T; cache.D = D; cache.buf.assign(64 * 1024 * 1024, 0);
+    cache.reset(); cache.backend = m.backend; cache.T = T; cache.D = D; cache.buf.resize(64 * 1024 * 1024);
     ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true }; cache.ctx = ggml_init(gp);
     ggml_context * ctx = cache.ctx; cache.gf = ggml_new_graph_custom(ctx, 32768, false); ggml_cgraph * gf = cache.gf;
     cache.x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T); ggml_set_name(cache.x_in, "x_in"); ggml_set_input(cache.x_in);
