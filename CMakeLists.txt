@@ -31,14 +31,14 @@ elseif("${TTS_FAMILY}" STREQUAL "turbo")
         src/t3_nano.cpp
         src/gpt2_bpe.cpp
         src/chatterbox_tts.cpp
-        src/chatterbox_engine_gpt2.cpp)
+        src/chatterbox_engine_turbo.cpp)
 elseif("${TTS_FAMILY}" STREQUAL "nano")
     set(TTS_FAMILY_DEFINE TTS_FAMILY_NANO)
     set(TTS_T3_SOURCES
         src/t3_nano.cpp
         src/gpt2_bpe.cpp
         src/chatterbox_tts.cpp
-        src/chatterbox_engine_gpt2.cpp)
+        src/chatterbox_engine_nano.cpp)
 else()
     message(FATAL_ERROR "TTS_FAMILY must be nano, turbo, or v3 (got '${TTS_FAMILY}')")
 endif()

@@ -1,13 +1,14 @@
 #include "tts-cpp/chatterbox/engine.h"
 #include <algorithm>
 #include <cstdint>
-#include <fstream>
 #include <cstdlib>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include <windows.h>
 
+#if !defined(TTS_FAMILY_NANO)
 static void write_wav(const char* path, const std::vector<float>& pcm) {
     const std::string tmp = std::string(path) + ".tmp";
     const uint32_t data = (uint32_t)(pcm.size() * 2), riff = 36 + data, sr = 24000;
@@ -25,6 +26,7 @@ static void write_wav(const char* path, const std::vector<float>& pcm) {
     if (!MoveFileExA(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING))
         throw std::runtime_error("WAV replace");
 }
+#endif
 
 static std::string read_line(HANDLE h) {
     std::string line;
@@ -47,15 +49,48 @@ static bool read_exact(HANDLE h, char* buf, DWORD need) {
     return true;
 }
 
+#if defined(TTS_FAMILY_NANO)
+static void write_exact(HANDLE h, const void* src, DWORD need) {
+    const char* p = (const char*)src;
+    DWORD sent = 0;
+    while (sent < need) {
+        DWORD n = 0;
+        if (!WriteFile(h, p + sent, need - sent, &n, nullptr) || n == 0)
+            throw std::runtime_error("pipe write");
+        sent += n;
+    }
+}
+
+struct NanoPipe {
+    HANDLE handle;
+    std::vector<int16_t> pcm;
+};
+
+static void stream_pcm(const float* pcm, std::size_t samples, void* user) {
+    auto& pipe = *(NanoPipe*)user;
+    pipe.pcm.resize(samples);
+    for (std::size_t i = 0; i < samples; ++i)
+        pipe.pcm[i] = (int16_t)(std::clamp(pcm[i], -1.f, 1.f) * 32767.f);
+    const uint32_t bytes = (uint32_t)(pipe.pcm.size() * sizeof(int16_t));
+    write_exact(pipe.handle, &bytes, sizeof(bytes));
+    if (bytes) write_exact(pipe.handle, pipe.pcm.data(), bytes);
+}
+#endif
+
 int main(int argc, char** argv) {
 #if defined(TTS_FAMILY_V3)
     if (argc < 5) throw std::runtime_error("argv");
 #else
     if (argc < 4) throw std::runtime_error("argv");
 #endif
+#if defined(TTS_FAMILY_NANO)
+    constexpr DWORD pipe_out_bytes = 65536;
+#else
+    constexpr DWORD pipe_out_bytes = 4096;
+#endif
     HANDLE h = CreateNamedPipeA(argv[3], PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-        1, 4096, 4096, 0, nullptr);
+        1, pipe_out_bytes, 4096, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("pipe");
     if (!ConnectNamedPipe(h, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
         throw std::runtime_error("pipe connect");
@@ -64,7 +99,24 @@ int main(int argc, char** argv) {
 #else
     tts_cpp::chatterbox::Engine tts({argv[1], argv[2]});
 #endif
+#if defined(TTS_FAMILY_NANO)
+    NanoPipe nano_pipe{h, {}};
+#endif
     for (;;) {
+#if defined(TTS_FAMILY_NANO)
+        std::string len_s = read_line(h);
+        char* end = nullptr;
+        unsigned long nbytes = std::strtoul(len_s.c_str(), &end, 10);
+        if (end != len_s.c_str() && nbytes > 0) {
+            std::string text(nbytes, '\0');
+            if (read_exact(h, text.data(), (DWORD)nbytes)) {
+                tts.synthesize(text, stream_pcm, &nano_pipe);
+                const uint32_t done = 0;
+                write_exact(h, &done, sizeof(done));
+                FlushFileBuffers(h);
+            }
+        }
+#else
         std::string path = read_line(h);
         std::string len_s = read_line(h);
         char* end = nullptr;
@@ -78,6 +130,7 @@ int main(int argc, char** argv) {
                 FlushFileBuffers(h);
             }
         }
+#endif
         DisconnectNamedPipe(h);
         if (!ConnectNamedPipe(h, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
             throw std::runtime_error("pipe connect");

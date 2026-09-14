@@ -754,8 +754,8 @@ static const std::vector<float>& invert_alpha_cpu(const model_ctx & m, const std
     return it->second;
 }
 static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vector<float> & mel, int T_mel) {
-    static size_t buf_size = 8 * 1024 * 1024;
-    std::vector<uint8_t> buf(buf_size);
+    static constexpr size_t buf_size = 8 * 1024 * 1024;
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params gp = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(gp);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
@@ -831,8 +831,8 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
     int T_src = (int)src.size();
     auto window = build_hann_window(n_fft, true);
     auto kernel = build_stft_kernel(n_fft, window);
-    static size_t buf_size = 4 * 1024 * 1024;
-    std::vector<uint8_t> buf(buf_size);
+    static constexpr size_t buf_size = 4 * 1024 * 1024;
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params gp = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(gp);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
@@ -997,15 +997,25 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     ggml_free(ctx);
     return wav;
 }
-std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
+static void s3gen_synthesize_meanflow(
+    const std::vector<int32_t>& speech_tokens,
+    bool finalize,
+    const std::vector<float>* source_cache,
+    std::vector<float>& wav,
+    std::vector<float>* source_out) {
     if (!g_s3gen_cache_entry) throw std::runtime_error("S3Gen not loaded");
-    const int output_tokens = (int)speech_tokens.size();
     constexpr int sr = 24000;
     constexpr int pre_lookahead_len = 3;
     const int seed = tts_cpp::chatterbox::detail::effective_seed();
     std::vector<int32_t> padded;
     for (int32_t token : speech_tokens) if (token >= 0 && token < 6561) padded.push_back(token);
-    padded.insert(padded.end(), pre_lookahead_len, tts_cpp::chatterbox::detail::effective_silence_token());
+    const int output_tokens = finalize ? (int)padded.size() : (int)padded.size() - pre_lookahead_len;
+    if (output_tokens <= 0) {
+        wav.clear();
+        if (source_out) source_out->clear();
+        return;
+    }
+    if (finalize) padded.insert(padded.end(), pre_lookahead_len, tts_cpp::chatterbox::detail::effective_silence_token());
     model_ctx& m = *g_s3gen_cache_entry->m;
     const int D = 512;
     const int MEL = 80;
@@ -1076,13 +1086,33 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
     std::vector<float> f0_up(T_wav);
     for (int i = 0; i < T_mel; ++i)
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
-    auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, m.hift_linear_w, m.hift_linear_b, (uint32_t)(seed + 1));
-    auto s_stft = run_stft(m, src);
+    auto source = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, m.hift_linear_w, m.hift_linear_b, (uint32_t)(seed + 1));
+    if (source_cache && !source_cache->empty()) {
+        const size_t n = std::min(source_cache->size(), source.size());
+        std::memcpy(source.data(), source_cache->data(), n * sizeof(float));
+    }
+    auto s_stft = run_stft(m, source);
     int T_stft = (int)(s_stft.size() / 18);
-    auto wav = run_hift_decode(m, mel, T_mel, s_stft, T_stft);
+    wav = run_hift_decode(m, mel, T_mel, s_stft, T_stft);
     if ((int)wav.size() != output_tokens * kSamplesPerToken) throw std::runtime_error("S3Gen waveform range mismatch");
+    if (source_out) *source_out = std::move(source);
+}
+#if defined(TTS_FAMILY_NANO)
+void s3gen_synthesize_stream(
+    const std::vector<int32_t>& speech_tokens,
+    bool finalize,
+    const std::vector<float>& source_cache,
+    std::vector<float>& wav,
+    std::vector<float>& source) {
+    s3gen_synthesize_meanflow(speech_tokens, finalize, &source_cache, wav, &source);
+}
+#else
+std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
+    std::vector<float> wav;
+    s3gen_synthesize_meanflow(speech_tokens, true, nullptr, wav, nullptr);
     return wav;
 }
+#endif
 void s3gen_preload(const std::string& path, ggml_backend_t backend) {
     (void)s3gen_model_cache_get(path, backend);
 }

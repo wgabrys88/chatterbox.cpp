@@ -10,4 +10,6 @@ inline constexpr int REPEAT_LAST_N = 1000;
 inline constexpr int CFM_STEPS = 2;
 inline constexpr int SILENCE_TOKEN = 4299;
 inline constexpr int SILENCE_COUNT = 3;
+inline constexpr int STREAM_TOKENS = 24;
+inline constexpr int STREAM_CROSSFADE_SAMPLES = 288;
 }

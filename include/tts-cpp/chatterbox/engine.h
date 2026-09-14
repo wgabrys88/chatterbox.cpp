@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -10,7 +11,12 @@ class Engine {
 public:
     explicit Engine(const EngineOptions&);
     ~Engine();
+#if defined(TTS_FAMILY_NANO)
+    using AudioCallback = void (*)(const float *, std::size_t, void *);
+    void synthesize(const std::string&, AudioCallback, void *);
+#else
     std::vector<float> synthesize(const std::string&);
+#endif
 private:
     struct Impl;
     std::unique_ptr<Impl> pimpl_;

@@ -56,13 +56,8 @@ struct Engine::Impl {
         if (sampler_log_enabled()) {
             std::string p = opts.t3_gguf_path;
             auto slash = p.find_last_of("\\/");
-            if (slash != std::string::npos) {
-#if defined(TTS_FAMILY_TURBO)
+            if (slash != std::string::npos)
                 slog.open(p.substr(0, slash) + "/turbo_sample_dump.csv");
-#else
-                slog.open(p.substr(0, slash) + "/nano_sample_dump.csv");
-#endif
-            }
         }
         g_sampler_log = slog.is_open() ? &slog : nullptr;
         g_sampler_step = 0;
@@ -86,11 +81,7 @@ struct Engine::Impl {
             std::string p = opts.t3_gguf_path;
             auto slash = p.find_last_of("\\/");
             if (slash != std::string::npos) {
-#if defined(TTS_FAMILY_TURBO)
                 std::ofstream f(p.substr(0, slash) + "/turbo_t3_dump.txt");
-#else
-                std::ofstream f(p.substr(0, slash) + "/nano_t3_dump.txt");
-#endif
                 if (f) {
                     std::vector<int32_t> cond((size_t)model.hparams.cond_prompt_len);
                     ggml_backend_tensor_get(model.builtin_cond_prompt_tokens, cond.data(), 0, cond.size() * sizeof(int32_t));
