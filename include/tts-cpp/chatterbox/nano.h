@@ -1,7 +1,7 @@
 #pragma once
 namespace tts_cpp::chatterbox {
 inline constexpr int SEED = 42;
-inline constexpr int N_PREDICT = 1000;
+inline constexpr int N_PREDICT = 8196;
 inline constexpr int TOP_K = 1000;
 inline constexpr float TOP_P = 0.95f;
 inline constexpr float TEMPERATURE = 0.8f;
