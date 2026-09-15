@@ -47,7 +47,10 @@ target_link_libraries(tts-cpp PUBLIC ggml)
 target_compile_definitions(tts-cpp PRIVATE GGML_USE_VULKAN)
 if(MSVC)
     target_compile_definitions(tts-cpp PRIVATE _USE_MATH_DEFINES)
-    target_compile_options(tts-cpp PRIVATE /O2 /DNDEBUG)
+    # The large inference translation units are compiled into this static
+    # library, not into chatterbox-server itself. /O2 implies /Gy on MSVC,
+    # which can exceed the classic COFF section limit without /bigobj.
+    target_compile_options(tts-cpp PRIVATE /bigobj /O2 /DNDEBUG)
 endif()
 set_target_properties(tts-cpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(TTS_CPP_BUILD_EXECUTABLES)
@@ -63,7 +66,9 @@ if(TTS_CPP_BUILD_EXECUTABLES)
     target_compile_definitions(tts-cpp-bake PRIVATE GGML_USE_VULKAN)
     if(MSVC)
         target_compile_definitions(tts-cpp-bake PRIVATE _USE_MATH_DEFINES)
-        target_compile_options(tts-cpp-bake PRIVATE /O2 /DNDEBUG)
+        # Bake also contains large ggml graph translation units. Apply
+        # /bigobj to the library that actually compiles them.
+        target_compile_options(tts-cpp-bake PRIVATE /bigobj /O2 /DNDEBUG)
     endif()
     set_target_properties(tts-cpp-bake PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_executable(chatterbox-server src/server.cpp)
