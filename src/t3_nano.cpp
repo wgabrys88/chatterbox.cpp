@@ -7,7 +7,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <iomanip>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -20,8 +19,6 @@
 
 using namespace tts_cpp::chatterbox::detail;
 namespace tts_cpp::chatterbox::detail {
-std::ostream * g_sampler_log = nullptr;
-int g_sampler_step = 0;
 
 static int64_t require_key(const gguf_context * ctx, const char * key) {
     int64_t id = gguf_find_key(ctx, key);
@@ -313,23 +310,7 @@ int32_t sample_next_token_ex(
     const float temperature = effective_temperature();
     const int top_k = effective_top_k();
     const float top_p = effective_top_p();
-    const int sil = effective_silence_token();
     std::vector<float> scores(logits.begin(), logits.end());
-    int32_t raw_argmax = 0;
-    float raw_argmax_logit = -INFINITY;
-    std::vector<std::pair<float, int>> raw_top;
-    if (g_sampler_log) {
-        raw_top.reserve((size_t)n);
-        for (int i = 0; i < n; ++i) {
-            raw_top.emplace_back(logits[i], i);
-            if (logits[i] > raw_argmax_logit) {
-                raw_argmax_logit = logits[i];
-                raw_argmax = (int32_t)i;
-            }
-        }
-        std::partial_sort(raw_top.begin(), raw_top.begin() + std::min<int>(10, n), raw_top.end(),
-            [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
-    }
     if (temperature > 0.0f && temperature != 1.0f) {
         float inv_t = 1.0f / temperature;
         for (float & s : scores) s *= inv_t;
@@ -371,26 +352,6 @@ int32_t sample_next_token_ex(
     for (float & p : probs) p /= psum;
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
     int32_t chosen = (int32_t)dist(rng);
-    if (g_sampler_log) {
-        int sil_rank = 1;
-        for (int i = 0; i < n; ++i) if (probs[i] > probs[sil] + 1e-12f) ++sil_rank;
-        bool sil_seen = std::find(generated.begin(), generated.end(), sil) != generated.end();
-        std::vector<std::pair<float, int>> ps;
-        ps.reserve((size_t)n);
-        for (int i = 0; i < n; ++i) ps.emplace_back(probs[i], i);
-        std::partial_sort(ps.begin(), ps.begin() + std::min<int>(10, n), ps.end(),
-            [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
-        *g_sampler_log << std::setprecision(9) << g_sampler_step << "," << chosen
-            << "," << raw_argmax << "," << raw_argmax_logit;
-        for (int k = 0; k < 10 && k < n; ++k)
-            *g_sampler_log << "," << raw_top[k].second << "," << raw_top[k].first;
-        *g_sampler_log << "," << probs[chosen] << "," << probs[sil] << "," << sil_rank << "," << (sil_seen ? 1 : 0)
-            << "," << generated.size();
-        for (int k = 0; k < 10 && k < n; ++k)
-            *g_sampler_log << "," << ps[k].second << "," << ps[k].first;
-        *g_sampler_log << "\n";
-        ++g_sampler_step;
-    }
     return chosen;
 }
 

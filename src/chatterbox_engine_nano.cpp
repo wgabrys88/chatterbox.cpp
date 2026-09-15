@@ -2,8 +2,6 @@
 #include "tts-cpp/chatterbox/nano.h"
 #include <algorithm>
 #include <cstdio>
-#include <fstream>
-#include <iomanip>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -128,26 +126,18 @@ struct Engine::Impl {
         predicted.reserve((size_t)n_predict + 1);
         speech.reserve((size_t)n_predict + (size_t)sil_n);
         const int32_t stop = model.hparams.stop_speech_token;
+        // Streaming: every STREAM_TOKENS the S3 decoder re-runs over the whole
+        // prefix (prompt + all speech so far) and emits the new tail, so audio
+        // starts early at O(n^2) decode cost. Batching: one S3 decode at EOS.
+        const bool streaming = effective_mode() == Mode::Streaming;
         std::vector<float> logits;
-        std::ofstream slog;
-        if (sampler_log_enabled()) {
-            std::string p = opts.t3_gguf_path;
-            auto slash = p.find_last_of("\\/");
-            if (slash != std::string::npos)
-                slog.open(p.substr(0, slash) + "/nano_sample_dump.csv");
-        }
-        g_sampler_log = slog.is_open() ? &slog : nullptr;
-        g_sampler_step = 0;
-        if (g_sampler_log)
-            *g_sampler_log << "step,chosen,raw_argmax,raw_argmax_logit,raw0_id,raw0_logit,raw1_id,raw1_logit,raw2_id,raw2_logit,raw3_id,raw3_logit,raw4_id,raw4_logit,raw5_id,raw5_logit,raw6_id,raw6_logit,raw7_id,raw7_logit,raw8_id,raw8_logit,raw9_id,raw9_logit,chosen_prob,sil4299_prob,sil4299_rank,sil4299_seen,gen_len,top0_id,top0_prob,top1_id,top1_prob,top2_id,top2_prob,top3_id,top3_prob,top4_id,top4_prob,top5_id,top5_prob,top6_id,top6_prob,top7_id,top7_prob,top8_id,top8_prob,top9_id,top9_prob\n";
         eval_prompt(model, allocr, text_tokens, logits, n_past);
-        const int prompt_len = n_past;
         NanoAudioStream stream;
         auto accept = [&](int32_t next) {
             predicted.push_back(next);
             if (next >= 0 && next < model.hparams.start_speech_token) {
                 speech.push_back(next);
-                if (speech.size() % (size_t)STREAM_TOKENS == 0)
+                if (streaming && speech.size() % (size_t)STREAM_TOKENS == 0)
                     stream.flush(speech, false, cb, user);
             }
         };
@@ -160,7 +150,6 @@ struct Engine::Impl {
             accept(token);
         }
         if (token != stop) {
-            g_sampler_log = nullptr;
             char msg[256];
             std::snprintf(msg, sizeof(msg), "T3 no EOS: predicted=%d n_past=%d n_predict=%d n_ctx=%d text_tokens=%d",
                 (int)predicted.size(), n_past, n_predict, model.hparams.n_ctx, (int)text_tokens.size());
@@ -168,48 +157,6 @@ struct Engine::Impl {
         }
         speech.insert(speech.end(), (size_t)sil_n, sil);
         stream.flush(speech, true, cb, user);
-        g_sampler_log = nullptr;
-        if (sampler_log_enabled()) {
-            std::string p = opts.t3_gguf_path;
-            auto slash = p.find_last_of("\\/");
-            if (slash != std::string::npos) {
-                std::ofstream f(p.substr(0, slash) + "/nano_t3_dump.txt");
-                if (f) {
-                    std::vector<int32_t> cond((size_t)model.hparams.cond_prompt_len);
-                    ggml_backend_tensor_get(model.builtin_cond_prompt_tokens, cond.data(), 0, cond.size() * sizeof(int32_t));
-                    std::vector<float> speaker((size_t)ggml_nelements(model.builtin_speaker_emb));
-                    ggml_backend_tensor_get(model.builtin_speaker_emb, speaker.data(), 0, speaker.size() * sizeof(float));
-                    f << "punc_norm " << gpt2_bpe::punc_norm(text);
-                    f << "\nbpe";
-                    for (int32_t id : text_tokens) f << " " << id;
-                    f << "\ntext";
-                    for (int32_t id : text_tokens) f << " " << id;
-                    f << "\ncond";
-                    for (int32_t id : cond) f << " " << id;
-                    f << "\nspeaker";
-                    f << std::setprecision(9);
-                    for (float v : speaker) f << " " << v;
-                    f << "\npredicted";
-                    for (int32_t id : predicted) f << " " << id;
-                    f << "\ndropped";
-                    for (int32_t id : speech) f << " " << id;
-                    f << "\npredicted_count " << predicted.size();
-                    f << "\ndropped_count " << speech.size();
-                    f << "\neos " << (token == stop ? 1 : 0);
-                    f << "\nprompt_len " << prompt_len;
-                    f << "\nn_past " << n_past;
-                    f << "\nn_embd " << model.hparams.n_embd;
-                    f << "\nn_head " << model.hparams.n_head;
-                    f << "\nn_layer " << model.hparams.n_layer;
-                    f << "\nn_ctx " << model.hparams.n_ctx;
-                    f << "\ntext_vocab " << model.hparams.n_text_vocab;
-                    f << "\nspeech_vocab " << model.hparams.n_speech_vocab;
-                    f << "\nstart_speech " << model.hparams.start_speech_token;
-                    f << "\nstop_speech " << model.hparams.stop_speech_token;
-                    f << "\ncond_prompt_len " << model.hparams.cond_prompt_len << "\n";
-                }
-            }
-        }
         if (stats) {
             stats->predicted_count = (int)predicted.size();
             stats->dropped_count = (int)speech.size();

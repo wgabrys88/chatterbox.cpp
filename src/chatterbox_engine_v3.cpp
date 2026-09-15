@@ -2,7 +2,6 @@
 #include "tts-cpp/chatterbox/v3.h"
 #include <algorithm>
 #include <cstdio>
-#include <fstream>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -84,17 +83,6 @@ struct Engine::Impl {
         const int32_t stop = model.hparams.stop_speech_token;
         const int32_t sos = model.hparams.start_speech_token;
         std::vector<float> logits;
-        std::ofstream slog;
-        if (sampler_log_enabled()) {
-            std::string p = opts.t3_gguf_path;
-            auto slash = p.find_last_of("\\/");
-            if (slash != std::string::npos)
-                slog.open(p.substr(0, slash) + "/v3_sample_dump.csv");
-        }
-        g_sampler_log = slog.is_open() ? &slog : nullptr;
-        g_sampler_step = 0;
-        if (g_sampler_log)
-            *g_sampler_log << "step,chosen,chosen_prob,sil4299_prob,sil4299_rank,sil4299_seen,gen_len,top0_id,top0_prob,top1_id,top1_prob,top2_id,top2_prob,top3_id,top3_prob,top4_id,top4_prob,top5_id,top5_prob,top6_id,top6_prob,top7_id,top7_prob,top8_id,top8_prob,top9_id,top9_prob\n";
         eval_prompt(model, allocr, text_tokens, logits, n_past);
         std::vector<int32_t> generated;
         generated.push_back(sos);
@@ -110,35 +98,12 @@ struct Engine::Impl {
         }
         if (predicted.empty()) throw std::runtime_error("T3 produced no tokens");
         if (predicted.back() != stop) {
-            g_sampler_log = nullptr;
             char msg[256];
             std::snprintf(msg, sizeof(msg), "T3 no EOS: predicted=%d n_past=%d n_predict=%d n_ctx=%d text_tokens=%d",
                 (int)predicted.size(), n_past, n_predict, model.hparams.n_ctx, (int)text_tokens.size());
             throw std::runtime_error(msg);
         }
         auto dropped = drop_invalid_tokens(predicted, sos, stop);
-        g_sampler_log = nullptr;
-        if (sampler_log_enabled()) {
-            std::string p = opts.t3_gguf_path;
-            auto slash = p.find_last_of("\\/");
-            if (slash != std::string::npos) {
-                std::ofstream f(p.substr(0, slash) + "/v3_t3_dump.txt");
-                if (f) {
-                    f << "bpe";
-                    for (int32_t id : ids) f << " " << id;
-                    f << "\ntext";
-                    for (int32_t id : text_tokens) f << " " << id;
-                    f << "\npredicted";
-                    for (int32_t id : predicted) f << " " << id;
-                    f << "\ndropped";
-                    for (int32_t id : dropped) f << " " << id;
-                    f << "\npredicted_count " << predicted.size();
-                    f << "\ndropped_count " << dropped.size();
-                    f << "\neos " << (predicted.back() == stop ? 1 : 0) << "\n";
-                    f << "n_past " << n_past << "\n";
-                }
-            }
-        }
         if (stats) {
             stats->predicted_count = (int)predicted.size();
             stats->dropped_count = (int)dropped.size();

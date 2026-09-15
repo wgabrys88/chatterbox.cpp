@@ -96,10 +96,6 @@ static std::string parse_flags(int argc, char** argv) {
     int i = 4;
     while (i < argc) {
         const char* a = argv[i++];
-        if (std::strcmp(a, "--sampler-log") == 0) {
-            k.sampler_log = true;
-            continue;
-        }
         if (i >= argc) throw std::runtime_error(a);
         const char* v = argv[i++];
         if (std::strcmp(a, "--language") == 0) {
@@ -143,16 +139,16 @@ static std::string knob_list() {
     char buf[768];
 #if defined(TTS_FAMILY_V3)
     const int n = std::snprintf(buf, sizeof(buf),
-        "mode=%s split_tokens=%d n_ctx=%d seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d silence_token=%d min_p=%g cfg_weight=%g cfm_cfg=%g sampler_log=%d",
+        "mode=%s split_tokens=%d n_ctx=%d seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d silence_token=%d min_p=%g cfg_weight=%g cfm_cfg=%g",
         mode_name(k.mode), k.split_tokens, k.n_ctx,
         k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict, k.cfm_steps, k.silence_token,
-        k.min_p, k.cfg_weight, k.cfm_cfg, k.sampler_log ? 1 : 0);
+        k.min_p, k.cfg_weight, k.cfm_cfg);
 #else
     const int n = std::snprintf(buf, sizeof(buf),
-        "mode=%s split_tokens=%d n_ctx=%d seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d silence_token=%d silence_count=%d sampler_log=%d",
+        "mode=%s split_tokens=%d n_ctx=%d seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d silence_token=%d silence_count=%d",
         mode_name(k.mode), k.split_tokens, k.n_ctx,
         k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict, k.cfm_steps, k.silence_token,
-        k.silence_count, k.sampler_log ? 1 : 0);
+        k.silence_count);
 #endif
     if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("knobs");
     return std::string(buf, (size_t)n);

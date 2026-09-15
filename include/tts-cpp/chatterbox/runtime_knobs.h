@@ -32,13 +32,11 @@ struct RuntimeKnobs {
     // KV allocation cap. 0 = architecture (wpe rows / GGUF n_ctx).
     int n_ctx = N_CTX;
     Mode mode = MODE_STREAMING ? Mode::Streaming : Mode::Batching;
-    bool sampler_log = false;
 };
 inline RuntimeKnobs& runtime_knobs() {
     static RuntimeKnobs k;
     return k;
 }
-inline bool sampler_log_enabled() { return runtime_knobs().sampler_log; }
 inline float effective_repeat_penalty() { return runtime_knobs().repeat_penalty; }
 inline float effective_temperature() { return runtime_knobs().temperature; }
 inline int effective_top_k() { return runtime_knobs().top_k; }
