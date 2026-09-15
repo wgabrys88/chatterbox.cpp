@@ -1,6 +1,7 @@
 #include "tts-cpp/chatterbox/engine.h"
 #include "tts-cpp/chatterbox/nano.h"
 #include <algorithm>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <memory>
@@ -80,7 +81,12 @@ struct Engine::Impl {
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void init() {
         ggml_time_init();
-        ggml_log_set([](ggml_log_level, const char*, void*) {}, nullptr);
+        ggml_log_set([](ggml_log_level level, const char * text, void *) {
+            if (level >= GGML_LOG_LEVEL_WARN && text) {
+                fputs(text, stderr);
+                fflush(stderr);
+            }
+        }, nullptr);
         model.backend = init_backend();
         load_model_gguf(opts.t3_gguf_path, model);
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
@@ -95,7 +101,7 @@ struct Engine::Impl {
         if (model.ctx_w) ggml_free(model.ctx_w);
         if (model.ctx_kv) ggml_free(model.ctx_kv);
     }
-    void synthesize(const std::string& text, Engine::AudioCallback cb, void * user) {
+    void synthesize(const std::string& text, Engine::AudioCallback cb, void * user, SynthesizeStats * stats) {
         if (!cb) throw std::runtime_error("audio callback");
         const int n_predict = effective_n_predict();
         const int sil_n = effective_silence_count();
@@ -186,11 +192,17 @@ struct Engine::Impl {
                 }
             }
         }
+        if (stats) {
+            stats->predicted_count = (int)predicted.size();
+            stats->dropped_count = (int)speech.size();
+            stats->eos = token == stop ? 1 : 0;
+            stats->n_past = n_past;
+        }
     }
 };
 Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(); }
 Engine::~Engine() = default;
-void Engine::synthesize(const std::string& text, Engine::AudioCallback cb, void * user) {
-    pimpl_->synthesize(text, cb, user);
+void Engine::synthesize(const std::string& text, Engine::AudioCallback cb, void * user, SynthesizeStats * stats) {
+    pimpl_->synthesize(text, cb, user, stats);
 }
 }

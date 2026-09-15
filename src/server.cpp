@@ -1,6 +1,7 @@
 #include "tts-cpp/chatterbox/engine.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
@@ -49,7 +50,6 @@ static bool read_exact(HANDLE h, char* buf, DWORD need) {
     return true;
 }
 
-#if defined(TTS_FAMILY_NANO)
 static void write_exact(HANDLE h, const void* src, DWORD need) {
     const char* p = (const char*)src;
     DWORD sent = 0;
@@ -61,6 +61,25 @@ static void write_exact(HANDLE h, const void* src, DWORD need) {
     }
 }
 
+static std::string one_line(const char* s) {
+    std::string o = s && *s ? s : "error";
+    for (char& c : o) {
+        if (c == '\n' || c == '\r') c = ' ';
+    }
+    if (o.size() > 4096) o.resize(4096);
+    return o;
+}
+
+static std::string stats_line(const tts_cpp::chatterbox::SynthesizeStats& s) {
+    char buf[256];
+    const int n = std::snprintf(buf, sizeof(buf),
+        "predicted=%d dropped=%d eos=%d n_past=%d\n",
+        s.predicted_count, s.dropped_count, s.eos, s.n_past);
+    if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("stats");
+    return std::string(buf, (size_t)n);
+}
+
+#if defined(TTS_FAMILY_NANO)
 struct NanoPipe {
     HANDLE handle;
     std::vector<int16_t> pcm;
@@ -74,6 +93,15 @@ static void stream_pcm(const float* pcm, std::size_t samples, void* user) {
     const uint32_t bytes = (uint32_t)(pipe.pcm.size() * sizeof(int16_t));
     write_exact(pipe.handle, &bytes, sizeof(bytes));
     if (bytes) write_exact(pipe.handle, pipe.pcm.data(), bytes);
+}
+
+static void write_nano_error(HANDLE h, const char* msg) {
+    const uint32_t err = 0xFFFFFFFFu;
+    write_exact(h, &err, sizeof(err));
+    const std::string m = one_line(msg);
+    const uint32_t n = (uint32_t)m.size();
+    write_exact(h, &n, sizeof(n));
+    if (n) write_exact(h, m.data(), n);
 }
 #endif
 
@@ -110,10 +138,23 @@ int main(int argc, char** argv) {
         if (end != len_s.c_str() && nbytes > 0) {
             std::string text(nbytes, '\0');
             if (read_exact(h, text.data(), (DWORD)nbytes)) {
-                tts.synthesize(text, stream_pcm, &nano_pipe);
-                const uint32_t done = 0;
-                write_exact(h, &done, sizeof(done));
-                FlushFileBuffers(h);
+                try {
+                    tts_cpp::chatterbox::SynthesizeStats stats;
+                    tts.synthesize(text, stream_pcm, &nano_pipe, &stats);
+                    const uint32_t done = 0;
+                    write_exact(h, &done, sizeof(done));
+                    const std::string line = stats_line(stats);
+                    write_exact(h, line.data(), (DWORD)line.size());
+                    FlushFileBuffers(h);
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "synthesize error: %s\n", e.what());
+                    fflush(stderr);
+                    try {
+                        write_nano_error(h, e.what());
+                        FlushFileBuffers(h);
+                    } catch (...) {
+                    }
+                }
             }
         }
 #else
@@ -124,10 +165,22 @@ int main(int argc, char** argv) {
         if (!path.empty() && end != len_s.c_str() && nbytes > 0) {
             std::string text(nbytes, '\0');
             if (read_exact(h, text.data(), (DWORD)nbytes)) {
-                write_wav(path.c_str(), tts.synthesize(text));
-                DWORD n = 0;
-                WriteFile(h, "ok\n", 3, &n, nullptr);
-                FlushFileBuffers(h);
+                try {
+                    tts_cpp::chatterbox::SynthesizeStats stats;
+                    write_wav(path.c_str(), tts.synthesize(text, &stats));
+                    const std::string line = std::string("ok ") + stats_line(stats);
+                    write_exact(h, line.data(), (DWORD)line.size());
+                    FlushFileBuffers(h);
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "synthesize error: %s\n", e.what());
+                    fflush(stderr);
+                    try {
+                        const std::string line = std::string("err ") + one_line(e.what()) + "\n";
+                        write_exact(h, line.data(), (DWORD)line.size());
+                        FlushFileBuffers(h);
+                    } catch (...) {
+                    }
+                }
             }
         }
 #endif

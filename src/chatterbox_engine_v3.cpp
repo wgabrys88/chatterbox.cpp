@@ -1,6 +1,7 @@
 #include "tts-cpp/chatterbox/engine.h"
 #include "tts-cpp/chatterbox/v3.h"
 #include <algorithm>
+#include <cstdio>
 #include <fstream>
 #include <memory>
 #include <random>
@@ -29,7 +30,12 @@ struct Engine::Impl {
     explicit Impl(const EngineOptions& o) : opts(o) {}
     void init() {
         ggml_time_init();
-        ggml_log_set([](ggml_log_level, const char*, void*) {}, nullptr);
+        ggml_log_set([](ggml_log_level level, const char * text, void *) {
+            if (level >= GGML_LOG_LEVEL_WARN && text) {
+                fputs(text, stderr);
+                fflush(stderr);
+            }
+        }, nullptr);
         model.backend = init_backend();
         load_model_gguf(opts.t3_gguf_path, model);
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
@@ -44,7 +50,7 @@ struct Engine::Impl {
         if (model.ctx_w) ggml_free(model.ctx_w);
         if (model.ctx_kv) ggml_free(model.ctx_kv);
     }
-    std::vector<int32_t> generate_t3(const std::string& text) {
+    std::vector<int32_t> generate_t3(const std::string& text, SynthesizeStats * stats) {
         if (opts.language_id.empty()) throw std::runtime_error("language");
         std::mt19937 rng(effective_seed());
         mtl_bpe bpe;
@@ -105,16 +111,23 @@ struct Engine::Impl {
                     f << "\npredicted_count " << predicted.size();
                     f << "\ndropped_count " << dropped.size();
                     f << "\neos " << (predicted.back() == stop ? 1 : 0) << "\n";
+                    f << "n_past " << n_past << "\n";
                 }
             }
+        }
+        if (stats) {
+            stats->predicted_count = (int)predicted.size();
+            stats->dropped_count = (int)dropped.size();
+            stats->eos = predicted.back() == stop ? 1 : 0;
+            stats->n_past = n_past;
         }
         return dropped;
     }
 };
 Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(); }
 Engine::~Engine() = default;
-std::vector<float> Engine::synthesize(const std::string& text) {
-    auto tokens = pimpl_->generate_t3(text);
+std::vector<float> Engine::synthesize(const std::string& text, SynthesizeStats * stats) {
+    auto tokens = pimpl_->generate_t3(text, stats);
     auto wav = s3gen_synthesize(tokens);
     const int n_tokens = (int)tokens.size();
     const int st_len = std::max(1, n_tokens - 1);
