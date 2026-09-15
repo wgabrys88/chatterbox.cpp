@@ -11,6 +11,7 @@
 #include "chatterbox_t3_internal.h"
 #include "mtl_bpe.h"
 #include "s3gen_pipeline.h"
+#include "utterance_split.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -50,12 +51,28 @@ struct Engine::Impl {
         if (model.ctx_w) ggml_free(model.ctx_w);
         if (model.ctx_kv) ggml_free(model.ctx_kv);
     }
-    std::vector<int32_t> generate_t3(const std::string& text, SynthesizeStats * stats) {
+    void synthesize(const std::string& text, Engine::AudioCallback cb, void * user, SynthesizeStats * stats) {
+        if (!cb) throw std::runtime_error("audio callback");
         if (opts.language_id.empty()) throw std::runtime_error("language");
-        std::mt19937 rng(effective_seed());
         mtl_bpe bpe;
         if (!bpe.load_from_arrays(model.tok_tokens, model.tok_types, model.tok_merges))
             throw std::runtime_error("tokenizer");
+        const TokenCount count = [&](const std::string& s) { return (int)bpe.encode(s, opts.language_id).size(); };
+        const auto units = split_utterances(text, effective_split_tokens(), count);
+        std::mt19937 rng(effective_seed());
+        if (stats) *stats = SynthesizeStats{};
+        for (size_t i = 0; i < units.size(); ++i) {
+            SynthesizeStats unit;
+            auto tokens = generate_t3(units[i], bpe, rng, &unit);
+            auto wav = s3gen_synthesize(tokens);
+            const int n_tokens = (int)tokens.size();
+            const int st_len = std::max(1, n_tokens - 1);
+            wav.resize((size_t)st_len * (size_t)kSamplesPerToken);
+            cb(wav.data(), wav.size(), user);
+            accumulate_unit(stats, unit, (int)i, (int)units.size(), units[i]);
+        }
+    }
+    std::vector<int32_t> generate_t3(const std::string& text, const mtl_bpe& bpe, std::mt19937& rng, SynthesizeStats * stats) {
         auto ids = bpe.encode(text, opts.language_id);
         std::vector<int32_t> text_tokens;
         text_tokens.reserve(ids.size() + 2);
@@ -92,6 +109,13 @@ struct Engine::Impl {
             eval_step(model, allocr, n_past++, token, i + 1, logits);
         }
         if (predicted.empty()) throw std::runtime_error("T3 produced no tokens");
+        if (predicted.back() != stop) {
+            g_sampler_log = nullptr;
+            char msg[256];
+            std::snprintf(msg, sizeof(msg), "T3 no EOS: predicted=%d n_past=%d n_predict=%d n_ctx=%d text_tokens=%d",
+                (int)predicted.size(), n_past, n_predict, model.hparams.n_ctx, (int)text_tokens.size());
+            throw std::runtime_error(msg);
+        }
         auto dropped = drop_invalid_tokens(predicted, sos, stop);
         g_sampler_log = nullptr;
         if (sampler_log_enabled()) {
@@ -120,18 +144,14 @@ struct Engine::Impl {
             stats->dropped_count = (int)dropped.size();
             stats->eos = predicted.back() == stop ? 1 : 0;
             stats->n_past = n_past;
+            stats->text_tokens = (int)text_tokens.size();
         }
         return dropped;
     }
 };
 Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(); }
 Engine::~Engine() = default;
-std::vector<float> Engine::synthesize(const std::string& text, SynthesizeStats * stats) {
-    auto tokens = pimpl_->generate_t3(text, stats);
-    auto wav = s3gen_synthesize(tokens);
-    const int n_tokens = (int)tokens.size();
-    const int st_len = std::max(1, n_tokens - 1);
-    wav.resize((size_t)st_len * (size_t)kSamplesPerToken);
-    return wav;
+void Engine::synthesize(const std::string& text, Engine::AudioCallback cb, void * user, SynthesizeStats * stats) {
+    pimpl_->synthesize(text, cb, user, stats);
 }
 }

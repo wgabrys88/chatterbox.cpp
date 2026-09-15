@@ -11,4 +11,7 @@ inline constexpr float CFG_WEIGHT = 0.5f;
 inline constexpr int CFM_STEPS = 10;
 inline constexpr float CFM_CFG = 0.7f;
 inline constexpr int SILENCE_TOKEN = 4299;
+inline constexpr int SPLIT_TOKENS = 0;
+inline constexpr int N_CTX = 0;
+inline constexpr bool MODE_STREAMING = false;
 }

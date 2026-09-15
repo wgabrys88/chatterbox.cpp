@@ -12,6 +12,7 @@
 #include "chatterbox_t3_internal.h"
 #include "gpt2_bpe.h"
 #include "s3gen_pipeline.h"
+#include "utterance_split.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -103,12 +104,22 @@ struct Engine::Impl {
     }
     void synthesize(const std::string& text, Engine::AudioCallback cb, void * user, SynthesizeStats * stats) {
         if (!cb) throw std::runtime_error("audio callback");
+        gpt2_bpe bpe;
+        bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
+        const TokenCount count = [&](const std::string& s) { return (int)bpe.tokenize(gpt2_bpe::punc_norm(s)).size(); };
+        const auto units = split_utterances(text, effective_split_tokens(), count);
+        std::mt19937 rng(effective_seed());
+        if (stats) *stats = SynthesizeStats{};
+        for (size_t i = 0; i < units.size(); ++i) {
+            SynthesizeStats unit;
+            synthesize_unit(units[i], bpe, rng, cb, user, &unit);
+            accumulate_unit(stats, unit, (int)i, (int)units.size(), units[i]);
+        }
+    }
+    void synthesize_unit(const std::string& text, const gpt2_bpe& bpe, std::mt19937& rng, Engine::AudioCallback cb, void * user, SynthesizeStats * stats) {
         const int n_predict = effective_n_predict();
         const int sil_n = effective_silence_count();
         const int sil = effective_silence_token();
-        std::mt19937 rng(effective_seed());
-        gpt2_bpe bpe;
-        bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
         auto text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
         if (model.buffer_kv) ggml_backend_buffer_clear(model.buffer_kv, 0);
         int n_past = 0;
@@ -147,6 +158,13 @@ struct Engine::Impl {
             eval_step(model, allocr, n_past++, token, logits);
             token = sample_next_token_ex(logits, predicted, rng);
             accept(token);
+        }
+        if (token != stop) {
+            g_sampler_log = nullptr;
+            char msg[256];
+            std::snprintf(msg, sizeof(msg), "T3 no EOS: predicted=%d n_past=%d n_predict=%d n_ctx=%d text_tokens=%d",
+                (int)predicted.size(), n_past, n_predict, model.hparams.n_ctx, (int)text_tokens.size());
+            throw std::runtime_error(msg);
         }
         speech.insert(speech.end(), (size_t)sil_n, sil);
         stream.flush(speech, true, cb, user);
@@ -197,6 +215,7 @@ struct Engine::Impl {
             stats->dropped_count = (int)speech.size();
             stats->eos = token == stop ? 1 : 0;
             stats->n_past = n_past;
+            stats->text_tokens = (int)text_tokens.size();
         }
     }
 };

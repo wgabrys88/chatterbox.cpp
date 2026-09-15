@@ -7,6 +7,10 @@
 #include "tts-cpp/chatterbox/nano.h"
 #endif
 namespace tts_cpp::chatterbox::detail {
+// One product flag. streaming = framed PCM emitted while T3 runs.
+// batching = one complete WAV after the whole text. Weights, knobs, GGUF
+// are identical in both modes.
+enum class Mode { Streaming, Batching };
 struct RuntimeKnobs {
     float repeat_penalty = REPEAT_PENALTY;
     float temperature = TEMPERATURE;
@@ -23,6 +27,11 @@ struct RuntimeKnobs {
 #else
     int silence_count = SILENCE_COUNT;
 #endif
+    // Utterance splitter budget in text BPE tokens per T3 KV. 0 = no split.
+    int split_tokens = SPLIT_TOKENS;
+    // KV allocation cap. 0 = architecture (wpe rows / GGUF n_ctx).
+    int n_ctx = N_CTX;
+    Mode mode = MODE_STREAMING ? Mode::Streaming : Mode::Batching;
     bool sampler_log = false;
 };
 inline RuntimeKnobs& runtime_knobs() {
@@ -38,6 +47,10 @@ inline int effective_seed() { return runtime_knobs().seed; }
 inline int effective_n_predict() { return runtime_knobs().n_predict; }
 inline int effective_cfm_steps() { return runtime_knobs().cfm_steps; }
 inline int effective_silence_token() { return runtime_knobs().silence_token; }
+inline int effective_split_tokens() { return runtime_knobs().split_tokens; }
+inline int effective_n_ctx() { return runtime_knobs().n_ctx; }
+inline Mode effective_mode() { return runtime_knobs().mode; }
+inline const char* mode_name(Mode m) { return m == Mode::Streaming ? "streaming" : "batching"; }
 #if defined(TTS_FAMILY_V3)
 inline float effective_min_p() { return runtime_knobs().min_p; }
 inline float effective_cfg_weight() { return runtime_knobs().cfg_weight; }

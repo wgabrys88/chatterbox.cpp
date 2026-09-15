@@ -76,6 +76,12 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
         if (model.wpe->ne[0] != hp.n_embd) throw std::runtime_error("wpe n_embd mismatch");
         hp.n_ctx = (int32_t) model.wpe->ne[1];
         if (hp.n_ctx <= 0) throw std::runtime_error("wpe context is empty");
+        // --n-ctx caps the KV allocation below the wpe row count; positions
+        // beyond it are never generated, so the weights are untouched.
+        if (effective_n_ctx() > 0) {
+            if (effective_n_ctx() > hp.n_ctx) throw std::runtime_error("n_ctx exceeds wpe rows");
+            hp.n_ctx = effective_n_ctx();
+        }
         model.ln_f_g           = require_tensor(model, "model/ln_f/g");
         model.ln_f_b           = require_tensor(model, "model/ln_f/b");
         model.text_emb         = require_tensor(model, "chatterbox/text_emb");

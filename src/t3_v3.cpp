@@ -59,6 +59,10 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
         hp.n_layer = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_LAYER));
         hp.n_ff    = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_FF));
         hp.n_ctx   = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_CTX));
+        if (effective_n_ctx() > 0) {
+            if (effective_n_ctx() > hp.n_ctx) throw std::runtime_error("n_ctx exceeds GGUF n_ctx");
+            hp.n_ctx = effective_n_ctx();
+        }
         hp.perceiver_len = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_PERCEIVER_LEN));
         hp.rope_theta    = gguf_get_val_f32(gguf_ctx, require_key(gguf_ctx, KEY_ROPE_THETA));
         hp.rope_orig_ctx = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_ROPE_ORIG_CTX));

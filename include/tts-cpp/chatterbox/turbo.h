@@ -9,4 +9,7 @@ inline constexpr float REPEAT_PENALTY = 1.2f;
 inline constexpr int CFM_STEPS = 2;
 inline constexpr int SILENCE_TOKEN = 4299;
 inline constexpr int SILENCE_COUNT = 3;
+inline constexpr int SPLIT_TOKENS = 0;
+inline constexpr int N_CTX = 0;
+inline constexpr bool MODE_STREAMING = false;
 }
