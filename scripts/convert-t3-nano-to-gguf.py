@@ -73,7 +73,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("ckpt_dir")
     p.add_argument("out")
-    p.add_argument("--f16", action="store_true", help="store weights as F16 instead of Q8_0")
+    p.add_argument("--f16", action="store_true", help="skip Q8_0; store mapped tensors as F32 (Nano/Turbo product dtype; flag name is historical)")
     a = p.parse_args()
     F16 = a.f16
     ckpt_dir, out = Path(a.ckpt_dir), Path(a.out)
