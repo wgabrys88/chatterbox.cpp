@@ -1,8 +1,10 @@
 #include "tts-cpp/chatterbox/engine.h"
+#include "tts-cpp/chatterbox/runtime_knobs.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -70,11 +72,95 @@ static std::string one_line(const char* s) {
     return o;
 }
 
+static int parse_int(const char* s) {
+    char* end = nullptr;
+    const long x = std::strtol(s, &end, 10);
+    if (!s || end == s || *end) throw std::runtime_error("knob int");
+    return (int)x;
+}
+
+static float parse_float(const char* s) {
+    char* end = nullptr;
+    const float x = std::strtof(s, &end);
+    if (!s || end == s || *end) throw std::runtime_error("knob float");
+    return x;
+}
+
+static std::string parse_flags(int argc, char** argv) {
+    auto& k = tts_cpp::chatterbox::detail::runtime_knobs();
+    std::string language;
+    int i = 4;
+    while (i < argc) {
+        const char* a = argv[i++];
+        if (std::strcmp(a, "--sampler-log") == 0) {
+            k.sampler_log = true;
+            continue;
+        }
+        if (i >= argc) throw std::runtime_error(a);
+        const char* v = argv[i++];
+        if (std::strcmp(a, "--language") == 0) {
+#if defined(TTS_FAMILY_V3)
+            language = v;
+            continue;
+#else
+            throw std::runtime_error(a);
+#endif
+        }
+        if (std::strcmp(a, "--seed") == 0) { k.seed = parse_int(v); continue; }
+        if (std::strcmp(a, "--temperature") == 0) { k.temperature = parse_float(v); continue; }
+        if (std::strcmp(a, "--top-k") == 0) { k.top_k = parse_int(v); continue; }
+        if (std::strcmp(a, "--top-p") == 0) { k.top_p = parse_float(v); continue; }
+        if (std::strcmp(a, "--repeat-penalty") == 0) { k.repeat_penalty = parse_float(v); continue; }
+        if (std::strcmp(a, "--n-predict") == 0) { k.n_predict = parse_int(v); continue; }
+        if (std::strcmp(a, "--cfm-steps") == 0) { k.cfm_steps = parse_int(v); continue; }
+        if (std::strcmp(a, "--silence-token") == 0) { k.silence_token = parse_int(v); continue; }
+#if defined(TTS_FAMILY_V3)
+        if (std::strcmp(a, "--min-p") == 0) { k.min_p = parse_float(v); continue; }
+        if (std::strcmp(a, "--cfg-weight") == 0) { k.cfg_weight = parse_float(v); continue; }
+        if (std::strcmp(a, "--cfm-cfg") == 0) { k.cfm_cfg = parse_float(v); continue; }
+#else
+        if (std::strcmp(a, "--silence-count") == 0) { k.silence_count = parse_int(v); continue; }
+#endif
+        throw std::runtime_error(a);
+    }
+#if defined(TTS_FAMILY_V3)
+    if (language.empty()) throw std::runtime_error("language");
+#endif
+    return language;
+}
+
+static void print_knobs() {
+    const auto& k = tts_cpp::chatterbox::detail::runtime_knobs();
+#if defined(TTS_FAMILY_V3)
+    std::fprintf(stderr,
+        "knobs seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d silence_token=%d min_p=%g cfg_weight=%g cfm_cfg=%g sampler_log=%d\n",
+        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict, k.cfm_steps, k.silence_token,
+        k.min_p, k.cfg_weight, k.cfm_cfg, k.sampler_log ? 1 : 0);
+#else
+    std::fprintf(stderr,
+        "knobs seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d silence_token=%d silence_count=%d sampler_log=%d\n",
+        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict, k.cfm_steps, k.silence_token,
+        k.silence_count, k.sampler_log ? 1 : 0);
+#endif
+    std::fflush(stderr);
+}
+
 static std::string stats_line(const tts_cpp::chatterbox::SynthesizeStats& s) {
-    char buf[256];
+    const auto& k = tts_cpp::chatterbox::detail::runtime_knobs();
+    char buf[768];
+#if defined(TTS_FAMILY_V3)
     const int n = std::snprintf(buf, sizeof(buf),
-        "predicted=%d dropped=%d eos=%d n_past=%d\n",
-        s.predicted_count, s.dropped_count, s.eos, s.n_past);
+        "predicted=%d dropped=%d eos=%d n_past=%d seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d silence_token=%d min_p=%g cfg_weight=%g cfm_cfg=%g sampler_log=%d\n",
+        s.predicted_count, s.dropped_count, s.eos, s.n_past,
+        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict, k.cfm_steps, k.silence_token,
+        k.min_p, k.cfg_weight, k.cfm_cfg, k.sampler_log ? 1 : 0);
+#else
+    const int n = std::snprintf(buf, sizeof(buf),
+        "predicted=%d dropped=%d eos=%d n_past=%d seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d silence_token=%d silence_count=%d sampler_log=%d\n",
+        s.predicted_count, s.dropped_count, s.eos, s.n_past,
+        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict, k.cfm_steps, k.silence_token,
+        k.silence_count, k.sampler_log ? 1 : 0);
+#endif
     if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("stats");
     return std::string(buf, (size_t)n);
 }
@@ -106,11 +192,9 @@ static void write_nano_error(HANDLE h, const char* msg) {
 #endif
 
 int main(int argc, char** argv) {
-#if defined(TTS_FAMILY_V3)
-    if (argc < 5) throw std::runtime_error("argv");
-#else
     if (argc < 4) throw std::runtime_error("argv");
-#endif
+    const std::string language = parse_flags(argc, argv);
+    print_knobs();
 #if defined(TTS_FAMILY_NANO)
     constexpr DWORD pipe_out_bytes = 65536;
 #else
@@ -123,7 +207,7 @@ int main(int argc, char** argv) {
     if (!ConnectNamedPipe(h, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
         throw std::runtime_error("pipe connect");
 #if defined(TTS_FAMILY_V3)
-    tts_cpp::chatterbox::Engine tts({argv[1], argv[2], argv[4]});
+    tts_cpp::chatterbox::Engine tts({argv[1], argv[2], language});
 #else
     tts_cpp::chatterbox::Engine tts({argv[1], argv[2]});
 #endif

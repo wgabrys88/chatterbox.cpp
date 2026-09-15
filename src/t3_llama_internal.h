@@ -2,7 +2,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <map>
 #include <ostream>
 #include <random>
@@ -11,39 +10,10 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml.h"
-#include "tts-cpp/chatterbox/v3.h"
+#include "tts-cpp/chatterbox/runtime_knobs.h"
 namespace tts_cpp::chatterbox::detail {
 constexpr int CHBX_MAX_NODES = 8192;
 constexpr int CFG_BATCH = 2;
-inline bool sampler_log_enabled() {
-    const char * v = std::getenv("CHATTERBOX_SAMPLER_LOG");
-    return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y');
-}
-inline float envf(const char * n, float d) {
-    const char * v = std::getenv(n);
-    if (!v || !*v) return d;
-    char * e = nullptr;
-    float f = std::strtof(v, &e);
-    return e != v ? f : d;
-}
-inline int envi(const char * n, int d) {
-    const char * v = std::getenv(n);
-    if (!v || !*v) return d;
-    char * e = nullptr;
-    long x = std::strtol(v, &e, 10);
-    return e != v ? (int)x : d;
-}
-inline float effective_repeat_penalty() { return envf("CHATTERBOX_REPEAT_PENALTY", REPEAT_PENALTY); }
-inline float effective_temperature() { return envf("CHATTERBOX_TEMPERATURE", TEMPERATURE); }
-inline int effective_top_k() { return envi("CHATTERBOX_TOP_K", TOP_K); }
-inline float effective_top_p() { return envf("CHATTERBOX_TOP_P", TOP_P); }
-inline float effective_min_p() { return envf("CHATTERBOX_MIN_P", MIN_P); }
-inline float effective_cfg_weight() { return envf("CHATTERBOX_CFG_WEIGHT", CFG_WEIGHT); }
-inline float effective_cfm_cfg() { return envf("CHATTERBOX_CFM_CFG", CFM_CFG); }
-inline int effective_seed() { return envi("CHATTERBOX_SEED", SEED); }
-inline int effective_n_predict() { return envi("CHATTERBOX_N_PREDICT", N_PREDICT); }
-inline int effective_cfm_steps() { return envi("CHATTERBOX_CFM_STEPS", CFM_STEPS); }
-inline int effective_silence_token() { return envi("CHATTERBOX_SILENCE_TOKEN", SILENCE_TOKEN); }
 inline void apply_speech_repeat_penalty(float * scores, int vocab,
                                         const std::vector<int32_t> & generated) {
     if (generated.empty() || vocab <= 0) return;
