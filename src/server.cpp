@@ -110,7 +110,6 @@ static std::string parse_flags(int argc, char** argv) {
             throw std::runtime_error(a);
 #endif
         }
-        if (std::strcmp(a, "--split-tokens") == 0) { k.split_tokens = parse_int(v); continue; }
         if (std::strcmp(a, "--seed") == 0) { k.seed = parse_int(v); continue; }
         if (std::strcmp(a, "--temperature") == 0) { k.temperature = parse_float(v); continue; }
         if (std::strcmp(a, "--top-p") == 0) { k.top_p = parse_float(v); continue; }
@@ -127,7 +126,7 @@ static std::string parse_flags(int argc, char** argv) {
 #if defined(TTS_FAMILY_V3)
     if (language.empty()) throw std::runtime_error("language");
 #endif
-    if(k.n_predict<1 || k.split_tokens<0 || k.temperature<0 || k.repeat_penalty<=0 || k.top_p<=0 || k.top_p>1)
+    if(k.n_predict<1 || k.temperature<0 || k.repeat_penalty<=0 || k.top_p<=0 || k.top_p>1)
         throw std::runtime_error("generation argument out of range");
 #if defined(TTS_FAMILY_V3)
     if(k.min_p<0 || k.min_p>1 || k.cfg_weight<0)throw std::runtime_error("V3 argument out of range");
@@ -144,13 +143,13 @@ static std::string knob_list() {
     char buf[768];
 #if defined(TTS_FAMILY_V3)
     const int n = std::snprintf(buf, sizeof(buf),
-        "split_tokens=%d seed=%d temperature=%g top_p=%g repeat_penalty=%g n_predict=%d min_p=%g cfg_weight=%g",
-        k.split_tokens, k.seed, k.temperature, k.top_p, k.repeat_penalty, k.n_predict,
+        "seed=%d temperature=%g top_p=%g repeat_penalty=%g n_predict=%d min_p=%g cfg_weight=%g",
+        k.seed, k.temperature, k.top_p, k.repeat_penalty, k.n_predict,
         k.min_p, k.cfg_weight);
 #else
     const int n = std::snprintf(buf, sizeof(buf),
-        "split_tokens=%d seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d",
-        k.split_tokens, k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict);
+        "seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d",
+        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict);
 #endif
     if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("knobs");
     return std::string(buf, (size_t)n);

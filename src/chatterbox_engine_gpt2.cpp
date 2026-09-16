@@ -68,7 +68,7 @@ struct Engine::Impl {
         if(!bpe.load_from_arrays(model.tok_tokens, model.tok_merges)) throw std::runtime_error("tokenizer");
         const EncodeText encode = [&](const std::string& input) {return bpe.tokenize(gpt2_bpe::punc_norm(input));};
         const auto prepared=prepare_text(text, true, trace);
-        const auto units=split_utterances(prepared,effective_split_tokens(),encode,trace);
+        const auto units=encode_one_utterance(prepared,encode,trace);
         trace_event(trace,"preparation_complete","prepare",{{"host_wall_s",json_number(elapsed(begin))}});
         std::mt19937 rng(effective_seed());
         for(size_t i=0;i<units.size();++i) {

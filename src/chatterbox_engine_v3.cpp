@@ -80,7 +80,7 @@ struct Engine::Impl {
             ids.push_back(model.hparams.stop_text_token); return ids;
         };
         const auto prepared=prepare_text(text, opts.language_id=="en", trace);
-        const auto units=split_utterances(prepared,effective_split_tokens(),encode,trace);
+        const auto units=encode_one_utterance(prepared,encode,trace);
         trace_event(trace,"preparation_complete","prepare",{{"host_wall_s",json_number(elapsed(begin))}});
         std::mt19937 rng(effective_seed());
         for(size_t i=0;i<units.size();++i) {

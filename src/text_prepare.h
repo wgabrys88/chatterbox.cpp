@@ -11,7 +11,6 @@ struct TextEdit {
 struct TextSpan { size_t begin, end; };
 struct PreparedText {
     std::string text;
-    std::vector<size_t> boundaries;
     std::vector<TextEdit> edits;
     std::vector<TextSpan> atoms;
     std::vector<TextSpan> unhandled;
