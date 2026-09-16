@@ -16,6 +16,12 @@ struct SynthesizeStats {
     int units = 0;
     int text_tokens = 0;
     int max_unit_predicted = 0;
+    int stop_code = 0;
+    int n_speech = 0;
+    int cut_at = 0;
+    int cut_reason = 0;
+    int n_chunks = 0;
+    int stage = 0;
 };
 class Engine {
 public:

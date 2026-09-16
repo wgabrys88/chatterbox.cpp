@@ -996,6 +996,64 @@ static void run_hift_decode(const model_ctx & m,
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
 }
+S3Gauge s3gen_gauge(const std::vector<int32_t>& speech_tokens) {
+    if (!g_s3gen_cache_entry) throw std::runtime_error("S3Gen not loaded");
+    std::vector<int32_t> padded;
+    for (int32_t token : speech_tokens) if (token >= 0 && token < 6561) padded.push_back(token);
+    if (padded.empty()) throw std::runtime_error("S3Gen empty tokens");
+    model_ctx& m = *g_s3gen_cache_entry->m;
+    const int D = 512;
+    const int MEL = 80;
+    const int n_prompt = (int)m.prompt_token.size();
+    const int n_speech = (int)padded.size();
+    const int n_total = n_prompt + n_speech;
+    std::vector<int32_t> flow_tokens(n_total);
+    std::memcpy(flow_tokens.data(), m.prompt_token.data(), n_prompt * sizeof(int32_t));
+    std::memcpy(flow_tokens.data() + n_prompt, padded.data(), padded.size() * sizeof(int32_t));
+    const std::vector<float>& emb_w_data = m.input_embedding;
+    const int vocab = 6561;
+    if ((int)(emb_w_data.size() / D) < vocab) throw std::runtime_error("input_embedding rows");
+    S3Gauge g;
+    g.n_prompt = n_prompt;
+    g.codebook_norm.resize((size_t)n_speech);
+    for (int i = 0; i < n_speech; ++i) {
+        const float* row = emb_w_data.data() + (size_t)padded[(size_t)i] * D;
+        float acc = 0.0f;
+        for (int d = 0; d < D; ++d) acc += row[d] * row[d];
+        g.codebook_norm[(size_t)i] = std::sqrt(acc);
+    }
+    std::vector<float> input_embed((size_t)n_total * D);
+    for (int i = 0; i < n_total; ++i)
+        std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)flow_tokens[i] * D, D * sizeof(float));
+    std::vector<float> mu_T = run_encoder(m, input_embed, n_total, D);
+    const int T_mu = 2 * n_total;
+    if ((int)mu_T.size() < T_mu * MEL) throw std::runtime_error("encoder mu");
+    mu_T.resize((size_t)T_mu * MEL);
+    std::vector<float> mu((size_t)T_mu * MEL);
+    for (int m2 = 0; m2 < MEL; ++m2)
+        for (int t = 0; t < T_mu; ++t)
+            mu[(size_t)m2 * T_mu + t] = mu_T[(size_t)t * MEL + m2];
+    int t0 = 2 * n_prompt;
+    int T_gen = 2 * n_speech;
+    if (t0 + T_gen > T_mu) T_gen = std::max(0, T_mu - t0);
+    if (T_gen < 1) throw std::runtime_error("gauge frames");
+    g.fuel.resize((size_t)T_gen);
+    std::vector<float> mu_gen((size_t)MEL * T_gen);
+    for (int t = 0; t < T_gen; ++t) {
+        float acc = 0.0f;
+        for (int m2 = 0; m2 < MEL; ++m2) {
+            const float v = mu[(size_t)m2 * T_mu + (t0 + t)];
+            mu_gen[(size_t)m2 * T_gen + t] = v;
+            acc += v * v;
+        }
+        g.fuel[(size_t)t] = std::sqrt(acc);
+    }
+    g.f0 = run_f0_predictor(m, mu_gen, T_gen);
+    g.voiced.resize((size_t)T_gen);
+    for (int t = 0; t < T_gen; ++t)
+        g.voiced[(size_t)t] = g.f0[(size_t)t] > kVoicedThreshold ? 1 : 0;
+    return g;
+}
 std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
     std::vector<float> wav;
     if (!g_s3gen_cache_entry) throw std::runtime_error("S3Gen not loaded");

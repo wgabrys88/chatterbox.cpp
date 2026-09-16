@@ -32,5 +32,11 @@ inline void accumulate_unit(SynthesizeStats* total, const SynthesizeStats& unit,
     if (unit.n_past > total->n_past) total->n_past = unit.n_past;
     if (unit.predicted_count > total->max_unit_predicted) total->max_unit_predicted = unit.predicted_count;
     total->eos = (total->units == 1) ? unit.eos : (total->eos && unit.eos ? 1 : 0);
+    total->stop_code = unit.stop_code;
+    total->n_speech += unit.n_speech;
+    total->cut_at = unit.cut_at;
+    total->cut_reason = unit.cut_reason;
+    total->n_chunks += unit.n_chunks;
+    total->stage = unit.stage;
 }
 }

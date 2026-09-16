@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 #if defined(TTS_FAMILY_GPT2)
 #include "tts-cpp/chatterbox/gpt2.h"
 #elif defined(TTS_FAMILY_V3)
@@ -16,6 +17,11 @@ struct RuntimeKnobs {
     int n_predict = N_PREDICT;
     int cfm_steps = CFM_STEPS;
     int trim_fade = TRIM_FADE;
+    // 0 one-shot burn, 1 tape GGUF only (instrument), 2 steal gauge, 3 native vchunker then burn every slice
+    int stage = 0;
+    // 0 = do not chunk (one burn). Else max speech tokens per vchunker slice. SIL/F0/fuel can cut earlier.
+    int cut_x = 0;
+    std::string artifact_path;
 #if defined(TTS_FAMILY_GPT2)
     int top_k = TOP_K;
     int sil_count = SIL_COUNT;
@@ -38,6 +44,8 @@ inline int effective_seed() { return runtime_knobs().seed; }
 inline int effective_n_predict() { return runtime_knobs().n_predict; }
 inline int effective_cfm_steps() { return runtime_knobs().cfm_steps; }
 inline int effective_trim_fade() { return runtime_knobs().trim_fade; }
+inline int effective_stage() { return runtime_knobs().stage; }
+inline int effective_cut_x() { return runtime_knobs().cut_x; }
 #if defined(TTS_FAMILY_GPT2)
 inline int effective_top_k() { return runtime_knobs().top_k; }
 inline int effective_sil_count() { return runtime_knobs().sil_count; }

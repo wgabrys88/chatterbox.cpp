@@ -118,6 +118,8 @@ static std::string parse_flags(int argc, char** argv) {
         if (std::strcmp(a, "--n-predict") == 0) { k.n_predict = parse_int(v); continue; }
         if (std::strcmp(a, "--cfm-steps") == 0) { k.cfm_steps = parse_int(v); continue; }
         if (std::strcmp(a, "--trim-fade") == 0) { k.trim_fade = parse_int(v); continue; }
+        if (std::strcmp(a, "--stage") == 0) { k.stage = parse_int(v); continue; }
+        if (std::strcmp(a, "--cut-x") == 0) { k.cut_x = parse_int(v); continue; }
 #if defined(TTS_FAMILY_V3)
         if (std::strcmp(a, "--cfg-weight") == 0) { k.cfg_weight = parse_float(v); continue; }
         if (std::strcmp(a, "--cfm-cfg") == 0) { k.cfm_cfg = parse_float(v); continue; }
@@ -133,7 +135,8 @@ static std::string parse_flags(int argc, char** argv) {
     if (language.empty()) throw std::runtime_error("language");
 #endif
     if(k.n_predict<1 || k.temperature<0 || k.repeat_penalty<=0 || k.top_p<=0 || k.top_p>1
-        || k.min_p<0 || k.min_p>1 || k.cfm_steps<1 || k.trim_fade<0)
+        || k.min_p<0 || k.min_p>1 || k.cfm_steps<1 || k.trim_fade<0
+        || k.stage<0 || k.stage>3 || k.cut_x<0)
         throw std::runtime_error("generation argument out of range");
 #if defined(TTS_FAMILY_V3)
     if(k.cfg_weight<0 || k.cfm_cfg<0 || k.exaggeration<0)throw std::runtime_error("V3 argument out of range");
@@ -147,27 +150,28 @@ static std::string parse_flags(int argc, char** argv) {
 // stats trailer so the client sees exactly what the engine ran with.
 static std::string knob_list() {
     const auto& k = tts_cpp::chatterbox::detail::runtime_knobs();
-    char buf[768];
+    char buf[1024];
 #if defined(TTS_FAMILY_V3)
     const int n = std::snprintf(buf, sizeof(buf),
-        "seed=%d temperature=%g top_p=%g min_p=%g repeat_penalty=%g n_predict=%d cfg_weight=%g exaggeration=%g cfm_steps=%d cfm_cfg=%g trim_fade=%d",
+        "seed=%d temperature=%g top_p=%g min_p=%g repeat_penalty=%g n_predict=%d cfg_weight=%g exaggeration=%g cfm_steps=%d cfm_cfg=%g trim_fade=%d stage=%d cut_x=%d",
         k.seed, k.temperature, k.top_p, k.min_p, k.repeat_penalty, k.n_predict,
-        k.cfg_weight, k.exaggeration, k.cfm_steps, k.cfm_cfg, k.trim_fade);
+        k.cfg_weight, k.exaggeration, k.cfm_steps, k.cfm_cfg, k.trim_fade, k.stage, k.cut_x);
 #else
     const int n = std::snprintf(buf, sizeof(buf),
-        "seed=%d temperature=%g top_k=%d top_p=%g min_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d trim_fade=%d sil_count=%d s3gen_sil=%d",
+        "seed=%d temperature=%g top_k=%d top_p=%g min_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d trim_fade=%d sil_count=%d s3gen_sil=%d stage=%d cut_x=%d",
         k.seed, k.temperature, k.top_k, k.top_p, k.min_p, k.repeat_penalty, k.n_predict,
-        k.cfm_steps, k.trim_fade, k.sil_count, k.s3gen_sil);
+        k.cfm_steps, k.trim_fade, k.sil_count, k.s3gen_sil, k.stage, k.cut_x);
 #endif
     if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("knobs");
     return std::string(buf, (size_t)n);
 }
 
 static std::string stats_line(const tts_cpp::chatterbox::SynthesizeStats& s) {
-    char buf[256];
+    char buf[512];
     const int n = std::snprintf(buf, sizeof(buf),
-        "predicted=%d dropped=%d eos=%d n_past=%d units=%d text_tokens=%d max_unit_predicted=%d ",
-        s.predicted_count, s.dropped_count, s.eos, s.n_past, s.units, s.text_tokens, s.max_unit_predicted);
+        "predicted=%d dropped=%d eos=%d n_past=%d units=%d text_tokens=%d max_unit_predicted=%d stop_code=%d n_speech=%d cut_at=%d cut_reason=%d n_chunks=%d stage=%d ",
+        s.predicted_count, s.dropped_count, s.eos, s.n_past, s.units, s.text_tokens, s.max_unit_predicted,
+        s.stop_code, s.n_speech, s.cut_at, s.cut_reason, s.n_chunks, s.stage);
     if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("stats");
     return std::string(buf, (size_t)n) + knob_list() + "\n";
 }
@@ -182,6 +186,7 @@ static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOption
         if(path.empty())throw std::runtime_error("empty output path");
         const auto dest=std::filesystem::u8path(path);
         if(!dest.is_absolute() || std::filesystem::exists(dest))throw std::runtime_error("output path must be absolute and unused");
+        tts_cpp::chatterbox::detail::runtime_knobs().artifact_path=path;
         trace=std::make_unique<ExecutionTrace>(path);
         const std::string length=read_line(h);
         if(length.empty()||length.find_first_not_of("0123456789")!=std::string::npos)throw std::runtime_error("invalid payload length");
@@ -202,6 +207,19 @@ static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOption
         }else trace->event("model_load_end",stage,{{"reused","true"}});
         stage="synthesis";SynthesizeStats stats;std::vector<float> pcm;
         tts->synthesize(text,pcm,&stats,trace.get());
+        const int stage_n=tts_cpp::chatterbox::detail::effective_stage();
+        if(stage_n==1||stage_n==2){
+            const std::string tape=path+".tape.gguf";
+            if(!std::filesystem::exists(std::filesystem::u8path(tape)))throw std::runtime_error("missing utterance GGUF");
+            trace->event("output_write_end","output",{{"samples","0"},{"published","false"},
+                {"tape",json_string(tape)},{"tape_sha256",json_string(sha256_file(tape))},
+                {"stage",std::to_string(stage_n)}});
+            trace->event("request_complete","request",{{"stats",json_string(stats_line(stats))}});
+            stage="acknowledgement";
+            const std::string line="ok "+stats_line(stats);write_exact(h,line.data(),DWORD(line.size()));
+            if(!FlushFileBuffers(h))throw std::runtime_error("acknowledgement flush failed");
+            return;
+        }
         stage="output";trace->event("output_write_start",stage);
         const auto start=TraceClock::now();size_t clipped=0;std::vector<int16_t> samples(pcm.size());
         for(size_t i=0;i<pcm.size();++i){
