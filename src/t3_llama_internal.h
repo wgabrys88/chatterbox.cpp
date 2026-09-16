@@ -3,7 +3,6 @@
 #include <cmath>
 #include <cstdint>
 #include <map>
-#include <ostream>
 #include <random>
 #include <string>
 #include <vector>
@@ -85,6 +84,7 @@ struct chatterbox_model {
     ggml_tensor * rope_freq_factors = nullptr;
     perceiver_w perceiver;
     std::vector<llama_layer> layers;
+    int kv_rows = 0;
     ggml_tensor * memory_k = nullptr, * memory_v = nullptr;
     ggml_context * ctx_w = nullptr, * ctx_kv = nullptr;
     ggml_backend_t backend = nullptr;
@@ -95,7 +95,7 @@ struct chatterbox_model {
 };
 ggml_backend_t init_backend();
 void load_model_gguf(const std::string & path, chatterbox_model & model);
-void eval_prompt(const chatterbox_model &, ggml_gallocr_t, const std::vector<int32_t> &, std::vector<float> &, int &);
+void eval_prompt(chatterbox_model &, ggml_gallocr_t, const std::vector<int32_t> &, std::vector<float> &, int &);
 void eval_step(const chatterbox_model &, ggml_gallocr_t, int, int32_t, int, std::vector<float> &);
 int32_t sample_next_token_ex(const std::vector<float> &, const std::vector<int32_t> &, std::mt19937 &);
 }

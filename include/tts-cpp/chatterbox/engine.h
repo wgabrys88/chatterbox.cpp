@@ -20,11 +20,7 @@ class Engine {
 public:
     explicit Engine(const EngineOptions&);
     ~Engine();
-    // Every family: text is split into utterances (see --split-tokens), each
-    // synthesized on a fresh T3 KV, PCM delivered through the callback in
-    // order. Nano flushes every STREAM_TOKENS; Turbo/V3 once per utterance.
-    using AudioCallback = void (*)(const float *, std::size_t, void *);
-    void synthesize(const std::string&, AudioCallback, void *, SynthesizeStats * = nullptr);
+    void synthesize(const std::string&, std::vector<float>& pcm, SynthesizeStats* = nullptr);
 private:
     struct Impl;
     std::unique_ptr<Impl> pimpl_;

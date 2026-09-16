@@ -6,23 +6,15 @@ from safetensors.torch import load_file
 TEXT_VOCAB_SIZE, SPEECH_VOCAB_SIZE = 50276, 6563
 START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, SPEAKER_EMBED_SIZE = 6561, 6562, 256
 LAYER_RE = re.compile(r"^tfmr\.h\.(\d+)\.(.+)$")
-QTYPE = gguf.GGMLQuantizationType.Q8_0
-F16 = False
 def as_numpy(tensor, *, dtype=None, transpose=False):
     if dtype is not None: tensor = tensor.to(dtype)
     array = tensor.detach().cpu().numpy()
     if transpose: array = array.T
     return np.ascontiguousarray(array)
-def quantizable(name):
-    if F16: return False
-    if name == "chatterbox/speech_head": return True
-    return name.startswith("model/h") and name.endswith(("/attn/c_attn/w", "/attn/c_proj/w", "/mlp/c_fc/w", "/mlp/c_proj/w"))
 def add(writer, name, array):
-    if not quantizable(name):
-        writer.add_tensor(name, array)
-        return
-    qdata = gguf.quants.quantize(array.astype(np.float32), QTYPE)
-    writer.add_tensor(name, qdata, raw_shape=qdata.shape, raw_dtype=QTYPE)
+    dtype = np.float16 if name.startswith("model/h") and name.endswith(("/attn/c_attn/w", "/attn/c_proj/w", "/mlp/c_fc/w", "/mlp/c_proj/w")) else np.float32
+    writer.add_tensor(name, np.ascontiguousarray(array.astype(dtype)))
+
 def tokenizer(ckpt_dir):
     vocab = json.loads((ckpt_dir / "vocab.json").read_text(encoding="utf-8"))
     added = json.loads((ckpt_dir / "added_tokens.json").read_text(encoding="utf-8"))
@@ -49,7 +41,6 @@ def map_name(name):
     }
     if name in table: return table[name]
     if name == "tfmr.wte.weight": return None
-    if name == "text_head.weight": return None
     m = LAYER_RE.match(name)
     if not m: return None
     layers = {
@@ -70,34 +61,21 @@ def map_name(name):
     fmt, dtype, transpose = layers[m.group(2)]
     return fmt.format(int(m.group(1))), dtype, transpose
 def main():
-    global F16
     p = argparse.ArgumentParser()
     p.add_argument("ckpt_dir")
     p.add_argument("out")
-    p.add_argument("--f16", action="store_true", help="skip Q8_0; store mapped tensors as F32 (Nano/Turbo product dtype; flag name is historical)")
+    p.add_argument("t3_safetensors")
     a = p.parse_args()
-    F16 = a.f16
     ckpt_dir, out = Path(a.ckpt_dir), Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    state = load_file(ckpt_dir / "t3_turbo_v1.safetensors")
-    skip = {"tfmr.wte.weight", "text_head.weight"}
-    unknown = [name for name in state if name not in skip and map_name(name) is None]
-    if unknown:
-        print("STOP unknown keys:", file=sys.stderr)
-        for name in unknown:
-            print(f"  {name}\t{tuple(state[name].shape)}", file=sys.stderr)
-        raise SystemExit("turbo is not a nano swap")
+    state = load_file(ckpt_dir / a.t3_safetensors)
     conds = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)
     n_embd = int(state["tfmr.ln_f.weight"].shape[0])
     n_ctx = int(state["tfmr.wpe.weight"].shape[0])
     n_layer = max(int(m.group(1)) for name in state if (m := LAYER_RE.match(name))) + 1
     n_head = n_embd // 64
-    if n_embd % 64:
-        raise SystemExit(f"n_head {n_embd}//64")
-    # Official GPT2_MEDIUM_CONFIG: n_embd=1024 n_layer=24 n_head=16 n_ctx=8196.
-    # Nano delta: generate cap follows wpe (n_ctx), T3 stored F32 under --f16. Do not accept a nano-sized checkpoint.
-    if n_embd != 1024 or n_layer != 24 or n_head != 16 or n_ctx != 8196:
-        raise SystemExit(f"turbo expected GPT2_medium 1024/24/16/8196, got {n_embd}/{n_layer}/{n_head}/{n_ctx}")
+    if (n_embd, n_layer, n_head) not in {(768, 12, 12), (1024, 24, 16)} or n_ctx != 8196:
+        raise SystemExit(f"expected GPT2_small 768/12/12 or GPT2_medium 1024/24/16 with n_ctx 8196, got {n_embd}/{n_layer}/{n_head} n_ctx={n_ctx}")
     writer = gguf.GGUFWriter(str(out), "chatterbox")
     writer.add_uint32("chatterbox.n_ctx", n_ctx)
     writer.add_uint32("chatterbox.n_embd", n_embd)
@@ -110,8 +88,6 @@ def main():
     writer.add_uint32("chatterbox.speaker_embed_size", SPEAKER_EMBED_SIZE)
     writer.add_float32("chatterbox.layer_norm_eps", 1e-5)
     tokens, types, merges = tokenizer(ckpt_dir)
-    if len(tokens) != TEXT_VOCAB_SIZE:
-        raise SystemExit(f"tokenizer {len(tokens)} != {TEXT_VOCAB_SIZE}")
     writer.add_tokenizer_model("gpt2")
     writer.add_token_list(tokens)
     writer.add_token_types(types)

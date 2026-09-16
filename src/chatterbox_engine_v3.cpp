@@ -2,6 +2,7 @@
 #include "tts-cpp/chatterbox/v3.h"
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -50,8 +51,8 @@ struct Engine::Impl {
         if (model.ctx_w) ggml_free(model.ctx_w);
         if (model.ctx_kv) ggml_free(model.ctx_kv);
     }
-    void synthesize(const std::string& text, Engine::AudioCallback cb, void * user, SynthesizeStats * stats) {
-        if (!cb) throw std::runtime_error("audio callback");
+    void synthesize(const std::string& text, std::vector<float>& pcm, SynthesizeStats * stats) {
+        pcm.clear();
         if (opts.language_id.empty()) throw std::runtime_error("language");
         mtl_bpe bpe;
         if (!bpe.load_from_arrays(model.tok_tokens, model.tok_types, model.tok_merges))
@@ -65,9 +66,13 @@ struct Engine::Impl {
             auto tokens = generate_t3(units[i], bpe, rng, &unit);
             auto wav = s3gen_synthesize(tokens);
             const int n_tokens = (int)tokens.size();
-            const int st_len = std::max(1, n_tokens - 1);
+            if (n_tokens < 1) throw std::runtime_error("S3Gen empty tokens");
+            const int st_len = n_tokens - 1;
             wav.resize((size_t)st_len * (size_t)kSamplesPerToken);
-            cb(wav.data(), wav.size(), user);
+            std::fill_n(wav.begin(), std::min(wav.size(), (size_t)TRIM_FADE), 0.0f);
+            for (size_t j = TRIM_FADE; j < std::min(wav.size(), (size_t)(2 * TRIM_FADE)); ++j)
+                wav[j] *= 0.5f * (1.0f - std::cos((float)M_PI * (float)(j - TRIM_FADE) / (float)(TRIM_FADE - 1)));
+            pcm.insert(pcm.end(), wav.begin(), wav.end());
             accumulate_unit(stats, unit, (int)i, (int)units.size(), units[i]);
         }
     }
@@ -116,7 +121,7 @@ struct Engine::Impl {
 };
 Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(); }
 Engine::~Engine() = default;
-void Engine::synthesize(const std::string& text, Engine::AudioCallback cb, void * user, SynthesizeStats * stats) {
-    pimpl_->synthesize(text, cb, user, stats);
+void Engine::synthesize(const std::string& text, std::vector<float>& pcm, SynthesizeStats * stats) {
+    pimpl_->synthesize(text, pcm, stats);
 }
 }

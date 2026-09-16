@@ -1,5 +1,8 @@
 #include "tts-cpp/chatterbox/engine.h"
+#include "tts-cpp/chatterbox/gpt2.h"
+#include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -41,8 +44,8 @@ struct Engine::Impl {
         if (model.ctx_w) ggml_free(model.ctx_w);
         if (model.ctx_kv) ggml_free(model.ctx_kv);
     }
-    void synthesize(const std::string& text, Engine::AudioCallback cb, void * user, SynthesizeStats * stats) {
-        if (!cb) throw std::runtime_error("audio callback");
+    void synthesize(const std::string& text, std::vector<float>& pcm, SynthesizeStats * stats) {
+        pcm.clear();
         gpt2_bpe bpe;
         bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
         const TokenCount count = [&](const std::string& s) { return (int)bpe.tokenize(gpt2_bpe::punc_norm(s)).size(); };
@@ -51,55 +54,56 @@ struct Engine::Impl {
         if (stats) *stats = SynthesizeStats{};
         for (size_t i = 0; i < units.size(); ++i) {
             SynthesizeStats unit;
-            const auto wav = s3gen_synthesize(generate_t3(units[i], bpe, rng, &unit));
-            if (!wav.empty()) cb(wav.data(), wav.size(), user);
+            auto tokens = generate_t3(units[i], bpe, rng, &unit);
+            auto wav = s3gen_synthesize(tokens);
+            std::fill_n(wav.begin(), std::min(wav.size(), (size_t)TRIM_FADE), 0.0f);
+            for (size_t j = TRIM_FADE; j < std::min(wav.size(), (size_t)SAMPLES_PER_TOKEN); ++j)
+                wav[j] *= 0.5f * (1.0f - std::cos((float)M_PI * (float)(j - TRIM_FADE) / (float)(TRIM_FADE - 1)));
+            pcm.insert(pcm.end(), wav.begin(), wav.end());
             accumulate_unit(stats, unit, (int)i, (int)units.size(), units[i]);
         }
     }
     std::vector<int32_t> generate_t3(const std::string& text, const gpt2_bpe& bpe, std::mt19937& rng, SynthesizeStats * stats) {
         const int n_predict = effective_n_predict();
-        const int sil_n = effective_silence_count();
-        const int sil = effective_silence_token();
         auto text_tokens = bpe.tokenize(gpt2_bpe::punc_norm(text));
         if (model.buffer_kv) ggml_backend_buffer_clear(model.buffer_kv, 0);
         int n_past = 0;
         int32_t token = 0;
-        std::vector<int32_t> out, tokens;
-        out.reserve((size_t)n_predict + 1);
-        tokens.reserve((size_t)n_predict + (size_t)sil_n);
+        std::vector<int32_t> predicted, speech;
+        predicted.reserve((size_t)n_predict + 1);
+        speech.reserve((size_t)n_predict + (size_t)SIL_COUNT);
         const int32_t stop = model.hparams.stop_speech_token;
         std::vector<float> logits;
         eval_prompt(model, allocr, text_tokens, logits, n_past);
         const std::vector<int32_t> first_pen = { model.hparams.start_speech_token };
         token = sample_next_token_ex(logits, first_pen, rng);
-        out.push_back(token);
-        if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
+        predicted.push_back(token);
         for (int step = 1; step < n_predict && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
             eval_step(model, allocr, n_past++, token, logits);
-            token = sample_next_token_ex(logits, out, rng);
-            out.push_back(token);
-            if (token >= 0 && token < model.hparams.start_speech_token) tokens.push_back(token);
+            token = sample_next_token_ex(logits, predicted, rng);
+            predicted.push_back(token);
         }
         if (token != stop) {
             char msg[256];
             std::snprintf(msg, sizeof(msg), "T3 no EOS: predicted=%d n_past=%d n_predict=%d n_ctx=%d text_tokens=%d",
-                (int)out.size(), n_past, n_predict, model.hparams.n_ctx, (int)text_tokens.size());
+                (int)predicted.size(), n_past, n_predict, model.hparams.n_ctx, (int)text_tokens.size());
             throw std::runtime_error(msg);
         }
-        tokens.insert(tokens.end(), (size_t)sil_n, sil);
+        for (int32_t next : predicted) if (next >= 0 && next < 6561) speech.push_back(next);
+        speech.insert(speech.end(), (size_t)SIL_COUNT, S3GEN_SIL);
         if (stats) {
-            stats->predicted_count = (int)out.size();
-            stats->dropped_count = (int)tokens.size();
+            stats->predicted_count = (int)predicted.size();
+            stats->dropped_count = (int)speech.size();
             stats->eos = token == stop ? 1 : 0;
             stats->n_past = n_past;
             stats->text_tokens = (int)text_tokens.size();
         }
-        return tokens;
+        return speech;
     }
 };
 Engine::Engine(const EngineOptions& o) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(); }
 Engine::~Engine() = default;
-void Engine::synthesize(const std::string& text, Engine::AudioCallback cb, void * user, SynthesizeStats * stats) {
-    pimpl_->synthesize(text, cb, user, stats);
+void Engine::synthesize(const std::string& text, std::vector<float>& pcm, SynthesizeStats * stats) {
+    pimpl_->synthesize(text, pcm, stats);
 }
 }

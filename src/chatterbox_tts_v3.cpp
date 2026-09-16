@@ -1006,11 +1006,9 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
     if (!g_s3gen_cache_entry) throw std::runtime_error("S3Gen not loaded");
     const int output_tokens = (int)speech_tokens.size();
     constexpr int sr = 24000;
-    constexpr int pre_lookahead_len = 3;
     const int seed = tts_cpp::chatterbox::detail::effective_seed();
     std::vector<int32_t> padded;
     for (int32_t token : speech_tokens) if (token >= 0 && token < 6561) padded.push_back(token);
-    padded.insert(padded.end(), pre_lookahead_len, tts_cpp::chatterbox::detail::effective_silence_token());
     model_ctx& m = *g_s3gen_cache_entry->m;
     const int D = 512;
     const int MEL = 80;
@@ -1024,7 +1022,7 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
     for (int i = 0; i < n_total; ++i)
         std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)flow_tokens[i] * D, D * sizeof(float));
     mu_T = run_encoder(m, input_embed, n_total, D);
-    int T_mu = 2 * n_total - 2 * pre_lookahead_len;
+    int T_mu = 2 * n_total;
     mu_T.resize((size_t)T_mu * MEL);
     std::vector<float> mu(T_mu * MEL);
     for (int m2 = 0; m2 < MEL; ++m2)
@@ -1057,8 +1055,8 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
             const int64_t frame = generated ? t - mel_len1 : t;
             z[m2 * T_mu + t] = positioned_noise(seed + (generated ? 2 : 0), frame * MEL + m2);
         }
-    const int cfm_steps = tts_cpp::chatterbox::detail::effective_cfm_steps();
-    const float cfm_cfg = tts_cpp::chatterbox::detail::effective_cfm_cfg();
+    const int cfm_steps = tts_cpp::chatterbox::CFM_STEPS;
+    const float cfm_cfg = tts_cpp::chatterbox::CFM_CFG;
     std::vector<float> t_span;
     t_span.reserve(cfm_steps + 1);
     for (int i = 0; i <= cfm_steps; ++i) {

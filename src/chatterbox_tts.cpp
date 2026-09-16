@@ -996,36 +996,16 @@ static void run_hift_decode(const model_ctx & m,
     ggml_gallocr_free(allocr);
     ggml_free(ctx);
 }
-static void s3gen_synthesize_meanflow(
-    const std::vector<int32_t>& speech_tokens,
-    bool finalize,
-    const std::vector<float>* source_cache,
-    std::vector<float>& wav,
-    std::vector<float>* source_out) {
+std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
+    std::vector<float> wav;
     if (!g_s3gen_cache_entry) throw std::runtime_error("S3Gen not loaded");
     constexpr int sr = 24000;
-    constexpr int pre_lookahead_len = 3;
     const int seed = tts_cpp::chatterbox::detail::effective_seed();
     std::vector<int32_t> padded;
     for (int32_t token : speech_tokens) if (token >= 0 && token < 6561) padded.push_back(token);
-#if defined(TTS_FAMILY_NANO)
-    // Native streaming owns the end-of-utterance silence exactly once in the
-    // Nano controller.  Non-final prefixes keep the model's three-token
-    // right-context withheld; the final prefix is decoded in full.
-    const int output_tokens = finalize ? (int)padded.size() : (int)padded.size() - pre_lookahead_len;
-    const int trim_tokens = finalize ? 0 : pre_lookahead_len;
-#else
-    // Preserve the established Turbo batch contract: its controller supplies
-    // the product silence and the batch decoder adds/crops hidden right-context.
     const int output_tokens = (int)padded.size();
-    const int trim_tokens = pre_lookahead_len;
-    padded.insert(padded.end(), pre_lookahead_len, tts_cpp::chatterbox::detail::effective_silence_token());
-#endif
-    if (output_tokens <= 0) {
-        wav.clear();
-        if (source_out) source_out->clear();
-        return;
-    }
+    const int trim_tokens = 0;
+    if (output_tokens <= 0) throw std::runtime_error("S3Gen empty tokens");
     model_ctx& m = *g_s3gen_cache_entry->m;
     const int D = 512;
     const int MEL = 80;
@@ -1072,7 +1052,7 @@ static void s3gen_synthesize_meanflow(
             const int64_t frame = generated ? t - mel_len1 : t;
             z[m2 * T_mu + t] = positioned_noise(seed + (generated ? 2 : 0), frame * MEL + m2);
         }
-    const int cfm_steps = tts_cpp::chatterbox::detail::effective_cfm_steps();
+    const int cfm_steps = tts_cpp::chatterbox::CFM_STEPS;
     std::vector<float> t_span;
     t_span.reserve(cfm_steps + 1);
     for (int i = 0; i <= cfm_steps; ++i)
@@ -1096,34 +1076,14 @@ static void s3gen_synthesize_meanflow(
     std::vector<float> f0_up(T_wav);
     for (int i = 0; i < T_mel; ++i)
         for (int j = 0; j < upsample; ++j) f0_up[i * upsample + j] = f0[i];
-    std::vector<float> source_local;
-    std::vector<float> & source = source_out ? *source_out : source_local;
+    std::vector<float> source;
     sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, m.hift_linear_w, m.hift_linear_b, (uint32_t)(seed + 1), source);
-    if (source_cache && !source_cache->empty()) {
-        const size_t n = std::min(source_cache->size(), source.size());
-        std::memcpy(source.data(), source_cache->data(), n * sizeof(float));
-    }
     auto s_stft = run_stft(m, source);
     int T_stft = (int)(s_stft.size() / 18);
     run_hift_decode(m, mel, T_mel, s_stft, T_stft, wav);
     if ((int)wav.size() != output_tokens * kSamplesPerToken) throw std::runtime_error("S3Gen waveform range mismatch");
-}
-#if defined(TTS_FAMILY_NANO)
-void s3gen_synthesize_stream(
-    const std::vector<int32_t>& speech_tokens,
-    bool finalize,
-    const std::vector<float>& source_cache,
-    std::vector<float>& wav,
-    std::vector<float>& source) {
-    s3gen_synthesize_meanflow(speech_tokens, finalize, &source_cache, wav, &source);
-}
-#else
-std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
-    std::vector<float> wav;
-    s3gen_synthesize_meanflow(speech_tokens, true, nullptr, wav, nullptr);
     return wav;
 }
-#endif
 void s3gen_preload(const std::string& path, ggml_backend_t backend) {
     (void)s3gen_model_cache_get(path, backend);
 }

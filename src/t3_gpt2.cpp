@@ -13,8 +13,8 @@
 #include <string>
 #include <vector>
 #include "chatterbox_t3_internal.h"
-#if defined(TTS_FAMILY_V3)
-#error t3_nano.cpp is the GPT-2 T3 backend; configure -DTTS_FAMILY=nano or turbo
+#if !defined(TTS_FAMILY_GPT2)
+#error t3_gpt2.cpp is the GPT-2 T3 backend; configure -DTTS_FAMILY=gpt2
 #endif
 
 using namespace tts_cpp::chatterbox::detail;
@@ -73,12 +73,6 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
         if (model.wpe->ne[0] != hp.n_embd) throw std::runtime_error("wpe n_embd mismatch");
         hp.n_ctx = (int32_t) model.wpe->ne[1];
         if (hp.n_ctx <= 0) throw std::runtime_error("wpe context is empty");
-        // --n-ctx caps the KV allocation below the wpe row count; positions
-        // beyond it are never generated, so the weights are untouched.
-        if (effective_n_ctx() > 0) {
-            if (effective_n_ctx() > hp.n_ctx) throw std::runtime_error("n_ctx exceeds wpe rows");
-            hp.n_ctx = effective_n_ctx();
-        }
         model.ln_f_g           = require_tensor(model, "model/ln_f/g");
         model.ln_f_b           = require_tensor(model, "model/ln_f/b");
         model.text_emb         = require_tensor(model, "chatterbox/text_emb");
@@ -107,12 +101,6 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
             l.c_mlp_proj_w  = require_tensor(model, (p + "/mlp/c_proj/w").c_str());
             l.c_mlp_proj_b  = require_tensor(model, (p + "/mlp/c_proj/b").c_str());
         }
-        ggml_init_params kv_params = { ggml_tensor_overhead() * 2, nullptr, true };
-        model.ctx_kv = ggml_init(kv_params);
-        int64_t n_elements = (int64_t) hp.n_embd * hp.n_layer * hp.n_ctx;
-        model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
-        model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
-        model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
         {
             const int64_t tok_kid = require_key(gguf_ctx, "tokenizer.ggml.tokens");
             const int64_t mer_kid = require_key(gguf_ctx, "tokenizer.ggml.merges");
@@ -137,7 +125,7 @@ static ggml_tensor * build_transformer_core(
     const chatterbox_model & model,
     ggml_tensor * inpL, int n_past, int N) {
     const auto & hp = model.hparams;
-    const int n_embd = hp.n_embd, n_head = hp.n_head, n_layer = hp.n_layer, n_ctx = hp.n_ctx;
+    const int n_embd = hp.n_embd, n_head = hp.n_head, n_layer = hp.n_layer, n_ctx = model.kv_rows;
     const int HD = n_embd / n_head;
     const int64_t L = n_past + N;
     const size_t kv_layer_elems  = (size_t) HD * n_ctx * n_head;
@@ -256,10 +244,30 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
     return gf;
 }
 void eval_prompt(
-    const chatterbox_model & model, ggml_gallocr_t allocr,
+    chatterbox_model & model, ggml_gallocr_t allocr,
     const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
     prompt_len = 1 + model.hparams.cond_prompt_len + (int)text_tokens.size() + 1;
     if (prompt_len > model.hparams.n_ctx) throw std::runtime_error("T3 prompt exceeds context");
+    const int rows = (int)std::min<int64_t>((int64_t)prompt_len + effective_n_predict() + 1, model.hparams.n_ctx);
+    if (rows > model.kv_rows) {
+        if (model.buffer_kv) ggml_backend_buffer_free(model.buffer_kv);
+        model.buffer_kv = nullptr;
+        if (model.ctx_kv) ggml_free(model.ctx_kv);
+        model.ctx_kv = nullptr;
+        model.memory_k = nullptr;
+        model.memory_v = nullptr;
+        model.kv_rows = 0;
+        ggml_init_params kv_params = { ggml_tensor_overhead() * 2, nullptr, true };
+        model.ctx_kv = ggml_init(kv_params);
+        if (!model.ctx_kv) throw std::runtime_error("T3 KV context allocation failed");
+        const int64_t n_elements = (int64_t)model.hparams.n_embd * model.hparams.n_layer * rows;
+        model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
+        model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
+        model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
+        if (!model.buffer_kv) throw std::runtime_error("T3 KV buffer allocation failed");
+        model.kv_rows = rows;
+        ggml_backend_buffer_clear(model.buffer_kv, 0);
+    }
     ggml_cgraph * gf = build_prompt_graph(model, (int)text_tokens.size());
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);

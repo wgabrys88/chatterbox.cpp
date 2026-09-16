@@ -57,10 +57,6 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
         hp.n_layer = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_LAYER));
         hp.n_ff    = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_FF));
         hp.n_ctx   = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_CTX));
-        if (effective_n_ctx() > 0) {
-            if (effective_n_ctx() > hp.n_ctx) throw std::runtime_error("n_ctx exceeds GGUF n_ctx");
-            hp.n_ctx = effective_n_ctx();
-        }
         hp.perceiver_len = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_PERCEIVER_LEN));
         hp.rope_theta    = gguf_get_val_f32(gguf_ctx, require_key(gguf_ctx, KEY_ROPE_THETA));
         hp.rope_orig_ctx = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_ROPE_ORIG_CTX));
@@ -121,13 +117,6 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
             l.up   = require_tensor(model, (p + "/ffn/up/w").c_str());
             l.down = require_tensor(model, (p + "/ffn/down/w").c_str());
         }
-        ggml_init_params kv_params = { ggml_tensor_overhead() * 2, nullptr, true };
-        model.ctx_kv = ggml_init(kv_params);
-        const int HD = hp.n_embd / hp.n_head;
-        int64_t n_elements = (int64_t) HD * hp.n_ctx * hp.n_head * CFG_BATCH * hp.n_layer;
-        model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
-        model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
-        model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
         {
             const int64_t tok_kid = require_key(gguf_ctx, "tokenizer.ggml.tokens");
             const int64_t mer_kid = require_key(gguf_ctx, "tokenizer.ggml.merges");
@@ -194,7 +183,7 @@ static ggml_tensor * build_transformer_core(
     const chatterbox_model & model,
     ggml_tensor * inpL, int n_past, int N) {
     const auto & hp = model.hparams;
-    const int n_embd = hp.n_embd, n_head = hp.n_head, n_layer = hp.n_layer, n_ctx = hp.n_ctx;
+    const int n_embd = hp.n_embd, n_head = hp.n_head, n_layer = hp.n_layer, n_ctx = model.kv_rows;
     const int HD = n_embd / n_head;
     const int64_t L = n_past + N;
     const size_t kv_pos_stride   = (size_t) HD * sizeof(float);
@@ -343,11 +332,31 @@ static void cfg_last_logits(ggml_tensor * logits, int N, int vocab, std::vector<
         out[i] = cond[i] + w * (cond[i] - uncond[i]);
 }
 void eval_prompt(
-    const chatterbox_model & model, ggml_gallocr_t allocr,
+    chatterbox_model & model, ggml_gallocr_t allocr,
     const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
     const int cond_len = 1 + model.hparams.perceiver_len + 1;
     prompt_len = cond_len + (int)text_tokens.size() + 2;
     if (prompt_len > model.hparams.n_ctx) throw std::runtime_error("T3 prompt exceeds context");
+    const int rows = (int)std::min<int64_t>((int64_t)prompt_len + effective_n_predict() + 1, model.hparams.n_ctx);
+    if (rows > model.kv_rows) {
+        if (model.buffer_kv) ggml_backend_buffer_free(model.buffer_kv);
+        model.buffer_kv = nullptr;
+        if (model.ctx_kv) ggml_free(model.ctx_kv);
+        model.ctx_kv = nullptr;
+        model.memory_k = nullptr;
+        model.memory_v = nullptr;
+        model.kv_rows = 0;
+        ggml_init_params kv_params = { ggml_tensor_overhead() * 2, nullptr, true };
+        model.ctx_kv = ggml_init(kv_params);
+        if (!model.ctx_kv) throw std::runtime_error("T3 KV context allocation failed");
+        const int64_t n_elements = (int64_t)model.hparams.n_embd * model.hparams.n_layer * rows * CFG_BATCH;
+        model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
+        model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
+        model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
+        if (!model.buffer_kv) throw std::runtime_error("T3 KV buffer allocation failed");
+        model.kv_rows = rows;
+        ggml_backend_buffer_clear(model.buffer_kv, 0);
+    }
     ggml_cgraph * gf = build_prompt_graph(model, (int)text_tokens.size());
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
@@ -401,7 +410,6 @@ int32_t sample_next_token_ex(
     const int n = (int)logits.size();
     const float temperature = effective_temperature();
     const float min_p = effective_min_p();
-    const int top_k = effective_top_k();
     const float top_p = effective_top_p();
     std::vector<float> scores(logits.begin(), logits.end());
     apply_speech_repeat_penalty(scores.data(), n, generated);
@@ -424,15 +432,6 @@ int32_t sample_next_token_ex(
         for (float p : probs) pmax = std::max(pmax, p);
         const float limit = min_p * pmax;
         for (int i = 0; i < n; ++i) if (probs[i] < limit) scores[i] = -INFINITY;
-    }
-    if (top_k > 0 && top_k < n) {
-        std::vector<float> tmp(scores);
-        std::nth_element(tmp.begin(), tmp.begin() + top_k, tmp.end(), std::greater<float>());
-        float threshold = tmp[top_k];
-        int kept = 0;
-        for (float s : scores) if (s > threshold) ++kept;
-        if (kept < top_k) threshold -= 1e-10f;
-        for (float & s : scores) if (s <= threshold) s = -INFINITY;
     }
     if (top_p < 1.0f) {
         struct IS { int idx; float s; };
