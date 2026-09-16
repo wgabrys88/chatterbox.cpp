@@ -141,7 +141,7 @@ std::string mtl_bpe::punc_norm(const std::string & text) {
         t += '.';
     return t;
 }
-std::vector<int32_t> mtl_bpe::encode(const std::string & text, const std::string & language_id) const {
+std::string mtl_bpe::prepare_input(const std::string & text, const std::string & language_id) {
     if (language_id.empty()) throw std::runtime_error("language");
     std::string t = punc_norm(text);
     t = to_lower_ascii(t);
@@ -158,6 +158,10 @@ std::vector<int32_t> mtl_bpe::encode(const std::string & text, const std::string
         for (char c : t) r += (c == ' ') ? std::string("[SPACE]") : std::string(1, c);
         t = r;
     }
+    return t;
+}
+std::vector<int32_t> mtl_bpe::encode(const std::string & text, const std::string & language_id) const {
+    const std::string t=prepare_input(text,language_id);
     std::vector<int32_t> ids;
     auto emit_bpe = [&](const std::string & frag) {
         if (frag.empty()) return;

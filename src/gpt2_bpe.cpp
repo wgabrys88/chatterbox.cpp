@@ -98,14 +98,14 @@ std::vector<int32_t> gpt2_bpe::tokenize(const std::string & text) const {
     struct added_span { size_t start; size_t len; int32_t id; };
     std::vector<added_span> spans;
     for (auto & [tok, id] : token_to_id) {
-        if (id < 50257) continue;
+        if (id < 50257 || tok.empty()) continue;
         size_t pos = 0;
         while ((pos = text.find(tok, pos)) != std::string::npos) {
             spans.push_back({pos, tok.size(), id});
             pos += tok.size();
         }
     }
-    std::sort(spans.begin(), spans.end(), [](const added_span & a, const added_span & b) { return a.start < b.start; });
+    std::sort(spans.begin(), spans.end(), [](const added_span & a, const added_span & b) { if (a.start != b.start) return a.start < b.start; if(a.len != b.len) return a.len > b.len; return a.id < b.id; });
     std::vector<added_span> clean;
     size_t last_end = 0;
     for (auto & sp : spans) {
@@ -121,11 +121,7 @@ std::vector<int32_t> gpt2_bpe::tokenize(const std::string & text) const {
                 if (it != token_to_id.end()) {
                     ids.push_back(it->second);
                 } else {
-                    for (unsigned char c : word) {
-                        auto & b2u = byte_to_unicode();
-                        auto jt = token_to_id.find(b2u.at(c));
-                        if (jt != token_to_id.end()) ids.push_back(jt->second);
-                    }
+                    throw std::runtime_error("GPT2 BPE piece missing from vocabulary");
                 }
             }
         }

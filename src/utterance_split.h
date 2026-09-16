@@ -1,101 +1,56 @@
 #pragma once
+#include <algorithm>
 #include <cstdio>
 #include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include "tts-cpp/chatterbox/engine.h"
+#include "text_prepare.h"
+#include "execution_trace.h"
 namespace tts_cpp::chatterbox::detail {
-using TokenCount = std::function<int(const std::string&)>;
-
-inline std::string collapse_ws(const std::string& s) {
-    std::string o;
-    bool sp = false;
-    for (char c : s) {
-        const bool w = c == ' ' || c == '\t' || c == '\n' || c == '\r';
-        if (w) { if (!sp && !o.empty()) o += ' '; sp = true; }
-        else { o += c; sp = false; }
+struct UtteranceUnit { size_t begin,end; std::string text; std::vector<int32_t> ids; };
+using EncodeText = std::function<std::vector<int32_t>(const std::string&)>;
+inline std::vector<UtteranceUnit> split_utterances(const PreparedText& p,int budget,const EncodeText& encode,ExecutionTrace* trace) {
+    if(budget<0)throw std::runtime_error("negative split budget");
+    std::vector<UtteranceUnit> out;
+    auto protected_boundary=[&](size_t pos){for(const auto&a:p.atoms)if(pos>a.begin&&pos<a.end)return true;return false;};
+    auto make=[&](size_t b,size_t e){auto t=p.text.substr(b,e-b);return UtteranceUnit{b,e,t,encode(t)};};
+    std::vector<size_t> stops=p.boundaries;stops.push_back(p.text.size());size_t segment=0;
+    for(size_t end:stops){
+        size_t b=segment;segment=end;
+        if(p.text.substr(b,end-b).find_first_not_of(' ')==std::string::npos)continue;
+        if(budget==0){out.push_back(make(b,end));continue;}
+        while(b<end){
+            if(p.text.substr(b,end-b).find_first_not_of(' ')==std::string::npos)break;
+            auto whole=make(b,end);if(whole.ids.size()<=size_t(budget)){out.push_back(std::move(whole));break;}
+            size_t chosen=b;
+            // Prefer the furthest fitting sentence, then clause, then word.
+            for(int level=0;level<3&&chosen==b;++level){
+                for(size_t j=b+1;j<end;++j){
+                    if(p.text[j]!=' '||protected_boundary(j+1))continue;
+                    char c=p.text[j-1];
+                    if(level==0&&c!='.'&&c!='!'&&c!='?')continue;
+                    if(level==1&&c!=','&&c!=';'&&c!=':')continue;
+                    auto u=make(b,j+1);if(u.ids.size()<=size_t(budget))chosen=j+1;
+                }
+            }
+            if(chosen==b)throw std::runtime_error("indivisible text atom exceeds split budget at prepared byte "+std::to_string(b));
+            out.push_back(make(b,chosen));b=chosen;
+        }
     }
-    while (!o.empty() && o.back() == ' ') o.pop_back();
-    return o;
-}
-
-// Sentence boundary: one of .!? followed by optional closers, then a space or end.
-inline std::vector<std::string> split_sentences(const std::string& t) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (size_t i = 0; i < t.size(); ++i) {
-        cur += t[i];
-        if (t[i] != '.' && t[i] != '!' && t[i] != '?') continue;
-        size_t j = i + 1;
-        while (j < t.size() && (t[j] == '.' || t[j] == '!' || t[j] == '?' || t[j] == '"' || t[j] == '\'' || t[j] == ')')) cur += t[j++];
-        if (j < t.size() && t[j] != ' ') { i = j - 1; continue; }
-        const std::string s = collapse_ws(cur);
-        if (!s.empty()) out.push_back(s);
-        cur.clear();
-        i = j;  // skip the space
+    if(out.empty())throw std::runtime_error("empty text");
+    size_t cursor=0;std::string units="[";
+    for(size_t i=0;i<out.size();++i){const auto&u=out[i];
+        if(u.begin<cursor||p.text.substr(cursor,u.begin-cursor).find_first_not_of(' ')!=std::string::npos)throw std::runtime_error("split coverage gap");
+        if(u.ids.empty()||(budget>0&&u.ids.size()>size_t(budget)))throw std::runtime_error("invalid unit token budget");
+        cursor=u.end;if(i)units+=',';
+        units+="{\"index\":"+std::to_string(i)+",\"begin\":"+std::to_string(u.begin)+",\"end\":"+std::to_string(u.end)+",\"tokenizer_input\":"+json_string(u.text)+",\"text_tokens\":"+std::to_string(u.ids.size())+"}";
     }
-    const std::string s = collapse_ws(cur);
-    if (!s.empty()) out.push_back(s);
+    if(p.text.substr(cursor).find_first_not_of(' ')!=std::string::npos)throw std::runtime_error("split trailing gap");
+    trace_event(trace,"split_complete","split",{{"units",units+"]"},{"budget",std::to_string(budget)},{"coverage","true"},{"offset_units",json_string("prepared_utf8_bytes")}});
     return out;
 }
-
-// Split one over-budget sentence at clause marks, then at spaces.
-inline std::vector<std::string> split_long(const std::string& s, int budget, const TokenCount& count) {
-    std::vector<std::string> words, out;
-    {
-        std::string w;
-        for (char c : s) {
-            if (c == ' ') { if (!w.empty()) words.push_back(w); w.clear(); }
-            else w += c;
-        }
-        if (!w.empty()) words.push_back(w);
-    }
-    std::string cur;
-    for (const auto& w : words) {
-        const std::string cand = cur.empty() ? w : cur + " " + w;
-        if (!cur.empty() && count(cand) > budget) {
-            out.push_back(cur);
-            cur = w;
-        } else {
-            cur = cand;
-        }
-        const char b = cur.back();
-        if ((b == ',' || b == ';' || b == ':') && count(cur) * 2 > budget) {
-            out.push_back(cur);
-            cur.clear();
-        }
-    }
-    if (!cur.empty()) out.push_back(cur);
-    return out;
-}
-
-// budget <= 0: one utterance (unsplit), so the roof can be measured as-is.
-inline std::vector<std::string> split_utterances(const std::string& text, int budget, const TokenCount& count) {
-    const std::string t = collapse_ws(text);
-    if (t.empty()) throw std::runtime_error("empty text");
-    if (budget <= 0) return { t };
-    std::vector<std::string> units;
-    std::string cur;
-    for (const auto& s : split_sentences(t)) {
-        if (count(s) > budget) {
-            if (!cur.empty()) { units.push_back(cur); cur.clear(); }
-            for (auto& piece : split_long(s, budget, count)) units.push_back(piece);
-            continue;
-        }
-        const std::string cand = cur.empty() ? s : cur + " " + s;
-        if (!cur.empty() && count(cand) > budget) {
-            units.push_back(cur);
-            cur = s;
-        } else {
-            cur = cand;
-        }
-    }
-    if (!cur.empty()) units.push_back(cur);
-    if (units.empty()) throw std::runtime_error("empty text");
-    return units;
-}
-
 inline void accumulate_unit(SynthesizeStats* total, const SynthesizeStats& unit, int index, int n, const std::string& text) {
     std::fprintf(stderr, "unit %d/%d text_tokens=%d predicted=%d dropped=%d eos=%d n_past=%d text=\"%s\"\n",
         index + 1, n, unit.text_tokens, unit.predicted_count, unit.dropped_count, unit.eos, unit.n_past, text.c_str());

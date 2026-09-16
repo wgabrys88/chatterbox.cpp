@@ -260,6 +260,8 @@ static ggml_tensor * repeat_batch(ggml_context * ctx, ggml_tensor * x, int n_emb
 }
 static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_text_tokens) {
     const int n_embd = model.hparams.n_embd;
+    if(text_tokens.empty() || text_tokens.size()>size_t(model.text_pos_emb->ne[1])) throw std::runtime_error("V3 text position limit");
+    if(model.hparams.cond_prompt_len<1 || model.hparams.cond_prompt_len>model.speech_pos_emb->ne[1]) throw std::runtime_error("V3 conditioning position limit");
     const int cond_len = 1 + model.hparams.perceiver_len + 1;
     const int N = cond_len + n_text_tokens + 2;
     static size_t buf_size = ggml_tensor_overhead()*CHBX_MAX_NODES + ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
@@ -334,6 +336,8 @@ static void cfg_last_logits(ggml_tensor * logits, int N, int vocab, std::vector<
 void eval_prompt(
     chatterbox_model & model, ggml_gallocr_t allocr,
     const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
+    if(text_tokens.empty() || text_tokens.size()>size_t(model.text_pos_emb->ne[1])) throw std::runtime_error("V3 text position limit");
+    if(model.hparams.cond_prompt_len<1 || model.hparams.cond_prompt_len>model.speech_pos_emb->ne[1]) throw std::runtime_error("V3 conditioning position limit");
     const int cond_len = 1 + model.hparams.perceiver_len + 1;
     prompt_len = cond_len + (int)text_tokens.size() + 2;
     if (prompt_len > model.hparams.n_ctx) throw std::runtime_error("T3 prompt exceeds context");
@@ -392,6 +396,7 @@ void eval_prompt(
 void eval_step(
     const chatterbox_model & model, ggml_gallocr_t allocr,
     int n_past, int32_t token, int speech_pos, std::vector<float> & logits_out) {
+    if(speech_pos<0 || speech_pos>=model.speech_pos_emb->ne[1] || n_past<0 || n_past>=model.kv_rows) throw std::runtime_error("V3 generation position limit");
     ggml_cgraph * gf = build_step_graph(model, n_past);
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);

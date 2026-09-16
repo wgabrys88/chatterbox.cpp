@@ -246,6 +246,7 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
 void eval_prompt(
     chatterbox_model & model, ggml_gallocr_t allocr,
     const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
+    if(text_tokens.empty() || text_tokens.size()>size_t(model.hparams.n_ctx) || model.hparams.cond_prompt_len<1) throw std::runtime_error("T3 prompt size");
     prompt_len = 1 + model.hparams.cond_prompt_len + (int)text_tokens.size() + 1;
     if (prompt_len > model.hparams.n_ctx) throw std::runtime_error("T3 prompt exceeds context");
     const int rows = (int)std::min<int64_t>((int64_t)prompt_len + effective_n_predict() + 1, model.hparams.n_ctx);

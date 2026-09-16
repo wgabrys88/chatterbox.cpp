@@ -11,5 +11,6 @@ struct mtl_bpe {
                           const std::vector<int> & types,
                           const std::vector<std::string> & merges);
     std::vector<int32_t> encode(const std::string & text, const std::string & language_id) const;
+    static std::string prepare_input(const std::string&, const std::string&);
     static std::string punc_norm(const std::string & text);
 };

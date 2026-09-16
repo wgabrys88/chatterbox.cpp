@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 namespace tts_cpp::chatterbox {
+class ExecutionTrace;
 struct EngineOptions {
     std::string t3_gguf_path, s3gen_gguf_path, language_id;
 };
@@ -18,9 +19,9 @@ struct SynthesizeStats {
 };
 class Engine {
 public:
-    explicit Engine(const EngineOptions&);
+    explicit Engine(const EngineOptions&, ExecutionTrace* = nullptr);
     ~Engine();
-    void synthesize(const std::string&, std::vector<float>& pcm, SynthesizeStats* = nullptr);
+    void synthesize(const std::string&, std::vector<float>& pcm, SynthesizeStats* = nullptr, ExecutionTrace* = nullptr);
 private:
     struct Impl;
     std::unique_ptr<Impl> pimpl_;

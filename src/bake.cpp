@@ -1,4 +1,5 @@
 #include "bake_native.h"
+#include "execution_trace.h"
 #include "voice_encoder.h"
 #include "voice_features.h"
 #include "ggml.h"
@@ -12,6 +13,9 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <windows.h>
+#include <filesystem>
+#include <set>
 
 namespace {
 struct repl {
@@ -29,8 +33,8 @@ uint32_t require_u32(const gguf_context * g, const char * key) {
 }
 
 void replace_file(const std::string & tmp, const std::string & dest) {
-    std::remove(dest.c_str());
-    if (std::rename(tmp.c_str(), dest.c_str()) != 0)
+    if(!MoveFileExW(std::filesystem::u8path(tmp).c_str(),std::filesystem::u8path(dest).c_str(),
+                    MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))
         throw std::runtime_error("GGUF replace failed: " + dest);
 }
 
@@ -48,6 +52,11 @@ void rewrite_gguf(const std::string & path, const std::vector<repl> & reps,
     gguf_context * gout = gguf_init_empty();
     gguf_set_kv(gout, gin);
     for (const auto & kv : kv_u32) gguf_set_val_u32(gout, kv.first, kv.second);
+    std::set<std::string> replaced;
+    for(const auto& r:reps) {
+        auto* old=ggml_get_tensor(src_ctx,r.name.c_str());
+        if(!old || old->type!=r.type)throw std::runtime_error("missing or wrong-type bake tensor: "+r.name);
+    }
     const int64_t n = gguf_get_n_tensors(gin);
     for (int64_t i = 0; i < n; ++i) {
         const char * name = gguf_get_tensor_name(gin, i);
@@ -59,6 +68,7 @@ void rewrite_gguf(const std::string & path, const std::vector<repl> & reps,
             continue;
         }
         const repl & r = *it->second;
+        replaced.insert(r.name);
         int64_t ne[4] = { 1, 1, 1, 1 };
         for (size_t d = 0; d < r.ne.size() && d < 4; ++d) ne[d] = r.ne[d];
         ggml_tensor * t = ggml_new_tensor(rctx, r.type, (int)r.ne.size(), ne);
@@ -67,6 +77,7 @@ void rewrite_gguf(const std::string & path, const std::vector<repl> & reps,
         gguf_set_tensor_data(gout, name, r.data);
         if (ggml_nbytes(t) != r.bytes) throw std::runtime_error(std::string("tensor size mismatch: ") + name);
     }
+    if(replaced.size()!=reps.size())throw std::runtime_error("incomplete bake replacements");
     const std::string tmp = path + ".tmp";
     if (!gguf_write_to_file(gout, tmp.c_str(), false)) throw std::runtime_error("GGUF write failed: " + path);
     gguf_free(gout);
@@ -77,13 +88,22 @@ void rewrite_gguf(const std::string & path, const std::vector<repl> & reps,
 }
 }
 
-int main(int, char ** argv) {
+int main(int argc, char ** argv) {
+    if(argc!=4)throw std::runtime_error("usage: chatterbox-bake T3 S3 reference.wav");
     const char * t3 = argv[1];
     const char * s3 = argv[2];
     const char * ref = argv[3];
-    ggml_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
+    tts_cpp::chatterbox::ExecutionTrace trace(std::filesystem::current_path().append("bake").u8string());
+    using namespace tts_cpp::chatterbox;
+    trace.event("bake_start","bake",{{"t3",json_string(t3)},{"s3",json_string(s3)},{"reference",json_string(ref)}});
+    try {
+    ggml_log_set([](ggml_log_level level, const char* message, void*) {if(level>=GGML_LOG_LEVEL_WARN&&message){fputs(message,stderr);fflush(stderr);}}, nullptr);
     ggml_backend_t backend = ggml_backend_vk_init(0);
     if (!backend) throw std::runtime_error("Vulkan backend init failed");
+    trace.event("backend_identity","bake",{{"backend",json_string(ggml_backend_name(backend))},
+        {"device",json_string(ggml_backend_dev_description(ggml_backend_get_device(backend)))}});
+    record_runtime_identity(&trace);
+    auto step_start=TraceClock::now();
 
     gguf_init_params meta = { true, nullptr };
     gguf_context * t3meta = gguf_init_from_file(t3, meta);
@@ -108,12 +128,22 @@ int main(int, char ** argv) {
     if (!voice_encoder_embed(wav, ve, backend, speaker)) throw std::runtime_error("VE embed");
     if (speaker.size() != 256) throw std::runtime_error("speaker_emb size");
 
+    trace.event("voice_encoder_complete","bake",{{"reference_16k_samples",std::to_string(wav.size())},
+        {"speaker_dimensions",std::to_string(speaker.size())},{"host_wall_s",json_number(elapsed(step_start))}});
+    step_start=TraceClock::now();
     std::vector<int32_t> prompt_token, cond;
     tts_cpp::chatterbox::detail::compute_speech_tokens_native(ref, s3, (int)max_cond, prompt_token, cond, backend);
+    trace.event("speech_tokenizer_complete","bake",{{"prompt_ids",json_ids(prompt_token)},{"conditioning_ids",json_ids(cond)},
+        {"host_wall_s",json_number(elapsed(step_start))}});
+    step_start=TraceClock::now();
     std::vector<float> prompt_feat, embedding;
     int prompt_rows = 0;
     tts_cpp::chatterbox::detail::compute_prompt_feat_native(ref, s3, prompt_feat, prompt_rows, backend);
+    trace.event("prompt_features_complete","bake",{{"rows",std::to_string(prompt_rows)},{"columns","80"},
+        {"host_wall_s",json_number(elapsed(step_start))}});
+    step_start=TraceClock::now();
     tts_cpp::chatterbox::detail::compute_embedding_native(ref, s3, embedding, backend);
+    trace.event("campplus_complete","bake",{{"dimensions",std::to_string(embedding.size())},{"host_wall_s",json_number(elapsed(step_start))}});
     if (prompt_rows <= 0 || (int)prompt_feat.size() != prompt_rows * 80) throw std::runtime_error("prompt_feat");
     if (embedding.size() != 192) throw std::runtime_error("embedding size");
     if (cond.empty() || prompt_token.empty()) throw std::runtime_error("speech tokens");
@@ -141,4 +171,6 @@ int main(int, char ** argv) {
     });
 
     ggml_backend_free(backend);
+    trace.event("bake_complete","bake",{{"t3_sha256",json_string(sha256_file(t3))},{"s3_sha256",json_string(sha256_file(s3))}});
+    }catch(const std::exception& e){trace.event("bake_failed","bake",{{"error",json_string(e.what())}});fprintf(stderr,"bake failed: %s\n",e.what());return 1;}
 }
