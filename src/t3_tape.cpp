@@ -15,10 +15,19 @@ static void replace_file(const std::string& tmp, const std::string& dest) {
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         throw std::runtime_error("utterance GGUF replace failed: " + dest);
 }
-int first_reuse_loop(const std::vector<int32_t>& ids, int n, int window) {
+int first_speaking_loop(const std::vector<int32_t>& ids, const std::vector<int>& voiced_t,
+                        int n, int window) {
     if (window < 2 || n < window * 2) return -1;
+    auto voiced_run = [&](int i) {
+        if (voiced_t.empty()) return false;
+        int v = 0;
+        for (int j = 0; j < window && i + j < (int)voiced_t.size(); ++j)
+            v += voiced_t[(size_t)(i + j)] ? 1 : 0;
+        return v * 2 >= window;
+    };
     std::map<std::vector<int32_t>, int> first;
     for (int i = 0; i + window <= n; ++i) {
+        if (!voiced_run(i)) continue;
         std::vector<int32_t> g(ids.begin() + i, ids.begin() + i + window);
         auto it = first.find(g);
         if (it != first.end()) return i;
@@ -32,7 +41,7 @@ void analyze_tape_ids(const T3Tape& tape, S3GaugeTensors& g) {
     g.sil_index.clear();
     for (int i = 0; i < body; ++i)
         if (tape.speech_ids[(size_t)i] == tape.s3gen_sil) g.sil_index.push_back(i);
-    g.loop_start = first_reuse_loop(tape.speech_ids, body, 8);
+    g.loop_start = -1;
     int uniq = 0;
     std::map<int32_t, int> seen;
     for (int i = 0; i < n; ++i)
@@ -40,9 +49,11 @@ void analyze_tape_ids(const T3Tape& tape, S3GaugeTensors& g) {
     g.reuse_score = n > 0 ? 1.0f - (float)uniq / (float)n : 0.0f;
 }
 static void token_signals(const T3Tape& tape, const S3GaugeTensors& g, int body,
-                          std::vector<float>& fuel_t, std::vector<int>& voiced_t) {
+                          std::vector<float>& fuel_t, std::vector<float>& f0_t,
+                          std::vector<int>& voiced_t) {
     fuel_t.assign((size_t)body, 0.0f);
-    voiced_t.assign((size_t)body, 1);
+    f0_t.assign((size_t)body, 0.0f);
+    voiced_t.assign((size_t)body, 0);
     const int F = (int)g.fuel.size();
     if (F < 1 || body < 1) return;
     const int n_all = (int)tape.speech_ids.size();
@@ -59,100 +70,79 @@ static void token_signals(const T3Tape& tape, const S3GaugeTensors& g, int body,
         }
         if (a < 0) a = 0;
         if (b > F) b = F;
-        float s = 0.0f;
+        float s = 0.0f, p = 0.0f;
         int v = 0, c = 0;
         for (int f = a; f < b; ++f) {
             s += g.fuel[(size_t)f];
+            if (f < (int)g.f0.size()) p += g.f0[(size_t)f];
             if (f < (int)g.voiced.size() && g.voiced[(size_t)f]) ++v;
             ++c;
         }
         if (c) {
             fuel_t[(size_t)i] = s / (float)c;
+            f0_t[(size_t)i] = p / (float)c;
             voiced_t[(size_t)i] = (v * 2 >= c) ? 1 : 0;
         }
     }
 }
-static int pick_natural_end(int start, int hard, int lo,
-                            const std::vector<int32_t>& sil,
-                            const std::vector<float>& fuel_t,
-                            const std::vector<int>& voiced_t) {
-    int best_sil = -1;
-    for (int s : sil) {
-        if (s + 1 > lo && s + 1 <= hard && s >= start)
-            best_sil = s + 1;
-    }
-    if (best_sil > start) return best_sil;
-    const int win = std::max(16, (hard - start) / 4);
-    const int from = std::max(lo, hard - win);
-    if (!voiced_t.empty()) {
-        for (int i = hard; i > from; --i) {
-            if (i - 1 >= start && i - 1 < (int)voiced_t.size() && voiced_t[(size_t)(i - 1)] == 0)
-                return i;
-        }
-    }
-    if (fuel_t.size() >= 3) {
-        for (int i = hard - 1; i > from; --i) {
-            if (i <= start || i + 1 >= (int)fuel_t.size()) continue;
-            const float x = fuel_t[(size_t)i];
-            if (x <= fuel_t[(size_t)(i - 1)] && x <= fuel_t[(size_t)(i + 1)])
-                return i + 1;
-        }
-    }
-    return hard;
+static float token_effort(float fuel, float f0, int voiced, float f0_ref) {
+    if (voiced && f0_ref > 0.0f && f0 > 0.0f) return fuel * (f0 / f0_ref);
+    return fuel;
 }
-VChunkPlan vchunker(const T3Tape& tape, const S3GaugeTensors& g) {
+VChunkPlan vchunker(const T3Tape& tape, S3GaugeTensors& g) {
     VChunkPlan plan;
     const int n = (int)tape.speech_ids.size();
     if (n < 1) throw std::runtime_error("empty T3 tape");
     int body = std::max(1, n - std::max(tape.appended_silence_count, 0));
+    std::vector<float> fuel_t, f0_t;
+    std::vector<int> voiced_t;
+    token_signals(tape, g, body, fuel_t, f0_t, voiced_t);
+    g.loop_start = first_speaking_loop(tape.speech_ids, voiced_t, body, 8);
     int reason_stop = 0;
     if (g.loop_start >= VCHUNK_MIN && g.loop_start < body) {
         body = g.loop_start;
         reason_stop = 3;
+        token_signals(tape, g, body, fuel_t, f0_t, voiced_t);
     }
-    const int x = tape.cut_x > 0 ? tape.cut_x : body;
-    std::vector<float> fuel_t;
-    std::vector<int> voiced_t;
-    token_signals(tape, g, body, fuel_t, voiced_t);
+    std::vector<float> effort((size_t)body, 0.0f);
+    g.effort_sum = 0.0f;
+    for (int i = 0; i < body; ++i) {
+        effort[(size_t)i] = token_effort(fuel_t[(size_t)i], f0_t[(size_t)i],
+                                         voiced_t[(size_t)i], g.prompt_f0_mean);
+        g.effort_sum += effort[(size_t)i];
+    }
+    const bool tank = g.breath_capacity > 0.0f;
+    const int x_cap = tape.cut_x > 0 ? tape.cut_x : 0;
     int start = 0;
     while (start < body) {
-        int hard = start + x;
-        if (hard > body) hard = body;
         VChunk c;
         c.begin = start;
-        if (hard == body) {
+        float acc = 0.0f;
+        int end = start;
+        int reason = 0;
+        while (end < body) {
+            acc += effort[(size_t)end];
+            ++end;
+            const int len = end - start;
+            if (x_cap > 0 && len >= x_cap) { reason = 1; break; }
+            if (tank && acc >= g.breath_capacity && len >= VCHUNK_MIN) { reason = 5; break; }
+        }
+        if (end >= body) {
             c.end = body;
-            c.reason = reason_stop ? reason_stop : 0;
+            c.reason = reason_stop ? reason_stop : (reason ? reason : 0);
             plan.chunks.push_back(c);
             break;
         }
-        const int lo = start + VCHUNK_MIN;
-        const int nat = pick_natural_end(start, hard, lo, g.sil_index, fuel_t, voiced_t);
-        c.end = nat;
-        if (c.end <= start) c.end = hard;
-        if (nat < hard && nat > start) {
-            bool sil = false;
-            for (int s : g.sil_index) if (s + 1 == nat) { sil = true; break; }
-            if (sil) c.reason = 2;
-            else if (!voiced_t.empty() && nat - 1 < (int)voiced_t.size() && voiced_t[(size_t)(nat - 1)] == 0) c.reason = 4;
-            else c.reason = 5;
-        } else c.reason = 1;
-        if (c.end - c.begin < 1) c.end = std::min(start + 1, body);
+        c.end = end;
+        c.reason = reason;
         plan.chunks.push_back(c);
-        start = c.end;
+        start = end;
     }
     if (plan.chunks.empty()) {
         VChunk c;
         c.begin = 0;
         c.end = n;
         plan.chunks.push_back(c);
-    }
-    if (plan.chunks.size() >= 2) {
-        VChunk& last = plan.chunks.back();
-        if (last.end - last.begin < VCHUNK_MIN) {
-            plan.chunks[plan.chunks.size() - 2].end = last.end;
-            plan.chunks.pop_back();
-        }
     }
     return plan;
 }
@@ -245,6 +235,12 @@ void write_utterance_gguf(const std::string& path, const T3Tape& tape,
         gguf_set_val_u32(gout, "s3.gauge.loop_start", gauge->loop_start < 0 ? 0xffffffffu : (uint32_t)gauge->loop_start);
         gguf_set_val_f32(gout, "s3.gauge.reuse_score", gauge->reuse_score);
         gguf_set_val_f32(gout, "s3.gauge.voiced_threshold", gauge->voiced_threshold);
+        gguf_set_val_f32(gout, "s3.gauge.prompt_fuel_mean", gauge->prompt_fuel_mean);
+        gguf_set_val_f32(gout, "s3.gauge.prompt_f0_mean", gauge->prompt_f0_mean);
+        gguf_set_val_f32(gout, "s3.gauge.breath_capacity", gauge->breath_capacity);
+        gguf_set_val_f32(gout, "s3.gauge.effort_sum", gauge->effort_sum);
+        gguf_set_val_u32(gout, "s3.gauge.one_breath",
+            (gauge->breath_capacity > 0.0f && gauge->effort_sum <= gauge->breath_capacity) ? 1u : 0u);
     }
     for (auto& t : tensors) {
         int64_t ne[4] = { 1, 1, 1, 1 };

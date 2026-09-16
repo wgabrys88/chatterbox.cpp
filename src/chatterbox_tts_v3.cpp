@@ -1058,6 +1058,27 @@ S3Gauge s3gen_gauge(const std::vector<int32_t>& speech_tokens) {
     g.voiced.resize((size_t)T_gen);
     for (int t = 0; t < T_gen; ++t)
         g.voiced[(size_t)t] = g.f0[(size_t)t] > kVoicedThreshold ? 1 : 0;
+    const int T_prompt = 2 * n_prompt;
+    if (T_prompt < 1) throw std::runtime_error("gauge prompt");
+    std::vector<float> mu_p((size_t)MEL * T_prompt);
+    float fuel_ps = 0.0f;
+    for (int t = 0; t < T_prompt; ++t) {
+        float acc = 0.0f;
+        for (int m2 = 0; m2 < MEL; ++m2) {
+            const float v = mu[(size_t)m2 * T_mu + t];
+            mu_p[(size_t)m2 * T_prompt + t] = v;
+            acc += v * v;
+        }
+        fuel_ps += std::sqrt(acc);
+    }
+    std::vector<float> f0_p = run_f0_predictor(m, mu_p, T_prompt);
+    float f0_ps = 0.0f;
+    int nv = 0;
+    for (int t = 0; t < T_prompt; ++t)
+        if (f0_p[(size_t)t] > kVoicedThreshold) { f0_ps += f0_p[(size_t)t]; ++nv; }
+    g.prompt_fuel_mean = fuel_ps / (float)T_prompt;
+    g.prompt_f0_mean = nv ? f0_ps / (float)nv : kVoicedThreshold;
+    g.breath_capacity = g.prompt_fuel_mean * (float)kBreathTokens;
     return g;
 }
 std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {

@@ -3,12 +3,14 @@
 #include <string>
 #include <vector>
 namespace tts_cpp::chatterbox {
-// X in SPEECH tokens. Breath group vs model envelope. Not n_predict.
-inline constexpr int X_BREATH = 100; // ~4 s
-inline constexpr int X_MODEL = 750;  // ~30 s
-inline constexpr int VCHUNK_MIN = 8;
-// Tape is the instrument (I32 codec IDs). The architecture is the vchunker:
-// steal S3 mu/F0/SIL, split a long tape into natural burns.
+// Clock: one speech token = 40 ms. Model envelope X_MODEL is already known.
+// The architecture is the lung inequality, not those ceilings:
+//   C  = prompt_fuel_mean * kBreathTokens     static tank for this voice
+//   e  = fuel[t] * (voiced ? f0[t]/prompt_f0 : 1)
+//   one breath iff sum(e) <= C
+inline constexpr int X_BREATH = 100; // 4 s biology, used only to scale C
+inline constexpr int X_MODEL = 750;  // ~30 s native envelope, packer/call cap
+inline constexpr int VCHUNK_MIN = 2; // vocoder needs two speech tokens
 struct T3Tape {
     std::vector<int32_t> speech_ids;
     std::vector<int32_t> raw_ids;
@@ -34,18 +36,23 @@ struct S3GaugeTensors {
     int loop_start = -1;
     float reuse_score = 0.0f;
     float voiced_threshold = 10.0f;
+    float prompt_fuel_mean = 0.0f;
+    float prompt_f0_mean = 0.0f;
+    float breath_capacity = 0.0f;
+    float effort_sum = 0.0f;
 };
 struct VChunk {
     int begin = 0;
     int end = 0;
-    int reason = 0; // 0 end, 1 x, 2 sil, 3 reuse, 4 unvoiced, 5 fuel_valley
+    int reason = 0; // 0 end, 1 x, 3 speaking_loop, 5 tank
 };
 struct VChunkPlan {
     std::vector<VChunk> chunks;
 };
-int first_reuse_loop(const std::vector<int32_t>& ids, int n, int window = 8);
+int first_speaking_loop(const std::vector<int32_t>& ids, const std::vector<int>& voiced_t,
+                        int n, int window = 8);
 void analyze_tape_ids(const T3Tape& tape, S3GaugeTensors& g);
-VChunkPlan vchunker(const T3Tape& tape, const S3GaugeTensors& g);
+VChunkPlan vchunker(const T3Tape& tape, S3GaugeTensors& g);
 std::vector<int32_t> chunk_ids(const T3Tape& tape, const VChunk& c);
 void write_utterance_gguf(const std::string& path, const T3Tape& tape,
                           const S3GaugeTensors* gauge, const VChunkPlan& plan);

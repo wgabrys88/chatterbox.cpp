@@ -92,7 +92,6 @@ struct Engine::Impl {
                 S3GaugeTensors gt;
                 gt.voiced_threshold=kVoicedThreshold;
                 analyze_tape_ids(tape,gt);
-                if(tape.stage==3 && tape.cut_x==0) tape.cut_x=X_BREATH;
                 const bool steal=tape.cut_x>0||tape.stage>=2;
                 if(steal){
                     auto g=s3gen_gauge(tape.speech_ids);
@@ -102,6 +101,9 @@ struct Engine::Impl {
                     gt.voiced=std::move(g.voiced);
                     gt.n_prompt=g.n_prompt;
                     gt.n_frames=(int)gt.fuel.size();
+                    gt.prompt_fuel_mean=g.prompt_fuel_mean;
+                    gt.prompt_f0_mean=g.prompt_f0_mean;
+                    gt.breath_capacity=g.breath_capacity;
                 }
                 VChunkPlan plan=vchunker(tape,gt);
                 const std::string& stem=runtime_knobs().artifact_path;

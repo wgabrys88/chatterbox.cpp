@@ -17,9 +17,9 @@ struct RuntimeKnobs {
     int n_predict = N_PREDICT;
     int cfm_steps = CFM_STEPS;
     int trim_fade = TRIM_FADE;
-    // 0 one-shot burn, 1 tape GGUF only (instrument), 2 steal gauge, 3 native vchunker then burn every slice
+    // 0 one-shot burn, 1 tape GGUF only (instrument), 2 steal gauge, 3 lung tank then burn every slice
     int stage = 0;
-    // 0 = do not chunk (one burn). Else max speech tokens per vchunker slice. SIL/F0/fuel can cut earlier.
+    // 0 = no extra token cap. Tank C = prompt_fuel_mean * 100. Else also cap slice length.
     int cut_x = 0;
     std::string artifact_path;
 #if defined(TTS_FAMILY_GPT2)
