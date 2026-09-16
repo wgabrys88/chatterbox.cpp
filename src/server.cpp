@@ -113,25 +113,32 @@ static std::string parse_flags(int argc, char** argv) {
         if (std::strcmp(a, "--seed") == 0) { k.seed = parse_int(v); continue; }
         if (std::strcmp(a, "--temperature") == 0) { k.temperature = parse_float(v); continue; }
         if (std::strcmp(a, "--top-p") == 0) { k.top_p = parse_float(v); continue; }
+        if (std::strcmp(a, "--min-p") == 0) { k.min_p = parse_float(v); continue; }
         if (std::strcmp(a, "--repeat-penalty") == 0) { k.repeat_penalty = parse_float(v); continue; }
         if (std::strcmp(a, "--n-predict") == 0) { k.n_predict = parse_int(v); continue; }
+        if (std::strcmp(a, "--cfm-steps") == 0) { k.cfm_steps = parse_int(v); continue; }
+        if (std::strcmp(a, "--trim-fade") == 0) { k.trim_fade = parse_int(v); continue; }
 #if defined(TTS_FAMILY_V3)
-        if (std::strcmp(a, "--min-p") == 0) { k.min_p = parse_float(v); continue; }
         if (std::strcmp(a, "--cfg-weight") == 0) { k.cfg_weight = parse_float(v); continue; }
+        if (std::strcmp(a, "--cfm-cfg") == 0) { k.cfm_cfg = parse_float(v); continue; }
+        if (std::strcmp(a, "--exaggeration") == 0) { k.exaggeration = parse_float(v); continue; }
 #elif defined(TTS_FAMILY_GPT2)
         if (std::strcmp(a, "--top-k") == 0) { k.top_k = parse_int(v); continue; }
+        if (std::strcmp(a, "--sil-count") == 0) { k.sil_count = parse_int(v); continue; }
+        if (std::strcmp(a, "--s3gen-sil") == 0) { k.s3gen_sil = parse_int(v); continue; }
 #endif
         throw std::runtime_error(a);
     }
 #if defined(TTS_FAMILY_V3)
     if (language.empty()) throw std::runtime_error("language");
 #endif
-    if(k.n_predict<1 || k.temperature<0 || k.repeat_penalty<=0 || k.top_p<=0 || k.top_p>1)
+    if(k.n_predict<1 || k.temperature<0 || k.repeat_penalty<=0 || k.top_p<=0 || k.top_p>1
+        || k.min_p<0 || k.min_p>1 || k.cfm_steps<1 || k.trim_fade<0)
         throw std::runtime_error("generation argument out of range");
 #if defined(TTS_FAMILY_V3)
-    if(k.min_p<0 || k.min_p>1 || k.cfg_weight<0)throw std::runtime_error("V3 argument out of range");
+    if(k.cfg_weight<0 || k.cfm_cfg<0 || k.exaggeration<0)throw std::runtime_error("V3 argument out of range");
 #else
-    if(k.top_k<0)throw std::runtime_error("top-k out of range");
+    if(k.top_k<0 || k.sil_count<0 || k.s3gen_sil<0)throw std::runtime_error("GPT2 argument out of range");
 #endif
     return language;
 }
@@ -143,13 +150,14 @@ static std::string knob_list() {
     char buf[768];
 #if defined(TTS_FAMILY_V3)
     const int n = std::snprintf(buf, sizeof(buf),
-        "seed=%d temperature=%g top_p=%g repeat_penalty=%g n_predict=%d min_p=%g cfg_weight=%g",
-        k.seed, k.temperature, k.top_p, k.repeat_penalty, k.n_predict,
-        k.min_p, k.cfg_weight);
+        "seed=%d temperature=%g top_p=%g min_p=%g repeat_penalty=%g n_predict=%d cfg_weight=%g exaggeration=%g cfm_steps=%d cfm_cfg=%g trim_fade=%d",
+        k.seed, k.temperature, k.top_p, k.min_p, k.repeat_penalty, k.n_predict,
+        k.cfg_weight, k.exaggeration, k.cfm_steps, k.cfm_cfg, k.trim_fade);
 #else
     const int n = std::snprintf(buf, sizeof(buf),
-        "seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d",
-        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict);
+        "seed=%d temperature=%g top_k=%d top_p=%g min_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d trim_fade=%d sil_count=%d s3gen_sil=%d",
+        k.seed, k.temperature, k.top_k, k.top_p, k.min_p, k.repeat_penalty, k.n_predict,
+        k.cfm_steps, k.trim_fade, k.sil_count, k.s3gen_sil);
 #endif
     if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("knobs");
     return std::string(buf, (size_t)n);

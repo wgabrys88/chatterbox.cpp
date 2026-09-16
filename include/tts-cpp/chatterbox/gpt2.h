@@ -4,6 +4,7 @@ inline constexpr int SEED = 42;
 inline constexpr int N_PREDICT = 1000;
 inline constexpr int TOP_K = 1000;
 inline constexpr float TOP_P = 0.95f;
+inline constexpr float MIN_P = 0.0f;
 inline constexpr float TEMPERATURE = 0.8f;
 inline constexpr float REPEAT_PENALTY = 1.2f;
 inline constexpr int S3GEN_SIL = 4299;
