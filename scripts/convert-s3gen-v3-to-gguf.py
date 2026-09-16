@@ -23,11 +23,7 @@ def expand_weight_norm(state):
         out.pop(f"{p}.parametrizations.weight.original1", None)
     return out
 def must_f32(name):
-    return any(s in name for s in (
-        "flow/input_embedding", "flow/spk_embed_affine/", "/builtin/",
-        "s3gen/mel_fb/", "campplus/", "s3tokv2/",
-        "flow/encoder/", "flow/encoder_proj", "hift/f0_predictor",
-    ))
+    return any(s in name for s in ("flow/input_embedding", "flow/spk_embed_affine/", "/builtin/", "s3gen/mel_fb/", "campplus/", "s3tokv2/"))
 def add(writer, name, arr):
     if arr.dtype.kind in "iu" or np.issubdtype(arr.dtype, np.integer):
         writer.add_tensor(name, arr); return
@@ -79,8 +75,6 @@ def main():
     gen = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)["gen"]
     writer = gguf.GGUFWriter(str(out), "chatterbox-s3gen")
     writer.add_uint32("s3gen.speech_vocab_size", 6561)
-    writer.add_uint32("s3gen.gauge.schema", 1)
-    writer.add_uint32("s3gen.token_duration_ms", 40)
     writer.add_uint32("s3gen.input_size", 512)
     writer.add_uint32("s3gen.output_size", 80)
     writer.add_uint32("s3gen.encoder.n_blocks", 6)

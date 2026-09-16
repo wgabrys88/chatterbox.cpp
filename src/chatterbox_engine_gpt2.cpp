@@ -11,7 +11,6 @@
 #include "chatterbox_t3_internal.h"
 #include "gpt2_bpe.h"
 #include "s3gen_pipeline.h"
-#include "t3_tape.h"
 #include "utterance_split.h"
 #include "execution_trace.h"
 #include "text_prepare.h"
@@ -69,7 +68,7 @@ struct Engine::Impl {
         if(!bpe.load_from_arrays(model.tok_tokens, model.tok_merges)) throw std::runtime_error("tokenizer");
         const EncodeText encode = [&](const std::string& input) {return bpe.tokenize(gpt2_bpe::punc_norm(input));};
         const auto prepared=prepare_text(text, true, trace);
-        const auto units=encode_one_utterance(prepared,encode,trace);
+        const auto units=split_utterances(prepared,effective_split_tokens(),encode,trace);
         trace_event(trace,"preparation_complete","prepare",{{"host_wall_s",json_number(elapsed(begin))}});
         std::mt19937 rng(effective_seed());
         for(size_t i=0;i<units.size();++i) {
@@ -82,91 +81,33 @@ struct Engine::Impl {
                 {"seed",std::to_string(effective_seed())},{"rng",json_string("mt19937 request scope; advances across units")}});
             try {
                 SynthesizeStats unit;
-                T3Tape tape=generate_t3(u.ids,rng,&unit,trace);
-                tape.stage=effective_stage();
-                tape.cut_x=effective_cut_x();
-                tape.seed=effective_seed();
-                tape.n_predict=effective_n_predict();
-                tape.s3gen_sil=effective_s3gen_sil();
-                tape.appended_silence_count=effective_sil_count();
-                S3GaugeTensors gt;
-                gt.voiced_threshold=kVoicedThreshold;
-                analyze_tape_ids(tape,gt);
-                const bool steal=tape.cut_x>0||tape.stage>=2;
-                if(steal){
-                    auto g=s3gen_gauge(tape.speech_ids);
-                    gt.codebook_norm=std::move(g.codebook_norm);
-                    gt.fuel=std::move(g.fuel);
-                    gt.f0=std::move(g.f0);
-                    gt.voiced=std::move(g.voiced);
-                    gt.n_prompt=g.n_prompt;
-                    gt.n_frames=(int)gt.fuel.size();
-                    gt.prompt_fuel_mean=g.prompt_fuel_mean;
-                    gt.prompt_f0_mean=g.prompt_f0_mean;
-                    gt.breath_capacity=g.breath_capacity;
-                }
-                VChunkPlan plan=vchunker(tape,gt);
-                const std::string& stem=runtime_knobs().artifact_path;
-                if(stem.empty())throw std::runtime_error("artifact path");
-                write_utterance_gguf(stem+".tape.gguf",tape,steal?&gt:nullptr,plan);
-                unit.n_speech=(int)tape.speech_ids.size();
-                unit.cut_at=plan.chunks.front().end;
-                unit.cut_reason=plan.chunks.front().reason;
-                unit.n_chunks=(int)plan.chunks.size();
-                unit.stage=tape.stage;
-                unit.stop_code=tape.stop_code;
-                if(tape.stage==1||tape.stage==2){
-                    accumulate_unit(stats,unit,int(i),int(units.size()),u.text);
-                    trace_event(trace,"unit_complete","unit",{{"index",std::to_string(i)},
-                        {"t3_completed_invocations","1"},{"s3_completed_invocations","0"},
-                        {"n_speech",std::to_string(tape.speech_ids.size())},
-                        {"n_chunks",std::to_string(plan.chunks.size())},
-                        {"stage",std::to_string(tape.stage)},{"eos",tape.eos?"true":"false"}});
-                    continue;
-                }
-                if(tape.stage==0&&tape.cut_x==0&&!tape.eos){
-                    char msg[256];
-                    std::snprintf(msg,sizeof(msg),"T3 no EOS: predicted=%d n_past=%d n_predict=%d n_ctx=%d text_tokens=%d",
-                        unit.predicted_count,tape.n_past,tape.n_predict,model.hparams.n_ctx,tape.text_tokens);
-                    throw std::runtime_error(msg);
-                }
+                auto tokens=generate_t3(u.ids,rng,&unit,trace);
                 auto decode_start=TraceClock::now();
-                const size_t offset0=pcm.size();
-                size_t raw_all=0;
-                int s3_n=0;
-                for(const auto& ch:plan.chunks){
-                    auto ids=chunk_ids(tape,ch);
-                    if(ids.empty())continue;
-                    trace_event(trace,"s3_start","s3",{{"index",std::to_string(i)},{"s3_input_ids",json_ids(ids)},
-                        {"chunk_begin",std::to_string(ch.begin)},{"chunk_end",std::to_string(ch.end)},
-                        {"chunk_reason",std::to_string(ch.reason)},
-                        {"cfm_steps",std::to_string(effective_cfm_steps())},{"trim_fade",std::to_string(effective_trim_fade())}});
-                    auto wav=s3gen_synthesize(ids);
-                    const size_t raw=wav.size();
-                    raw_all+=raw; ++s3_n;
-                    if(wav.size()!=ids.size()*size_t(960)) throw std::runtime_error("S3 sample/token length mismatch");
-                    for(float v:wav) if(!std::isfinite(v)) throw std::runtime_error("non-finite S3 sample");
-                    const int fade=effective_trim_fade();
-                    if(fade>0) std::fill_n(wav.begin(),std::min(wav.size(),size_t(fade)),0.0f);
-                    if(fade>=2){
-                        for(size_t j=size_t(fade);j<std::min(wav.size(),size_t(2*fade));++j)
-                            wav[j]*=0.5f*(1.0f-std::cos(float(M_PI)*float(j-fade)/float(fade-1)));
-                    }
-                    if(wav.empty() || wav.size()>(size_t(UINT32_MAX)-36)/2 || pcm.size()>(size_t(UINT32_MAX)-36)/2-wav.size())
-                        throw std::runtime_error("empty audio or RIFF size limit");
-                    pcm.insert(pcm.end(),wav.begin(),wav.end());
-                    trace_event(trace,"s3_complete","s3",{{"index",std::to_string(i)},{"raw_samples",std::to_string(raw)},
-                        {"chunk_end",std::to_string(ch.end)},{"completed_invocations","1"}});
-                }
+                trace_event(trace,"s3_start","s3",{{"index",std::to_string(i)},{"s3_input_ids",json_ids(tokens)},
+                    {"cfm_steps",std::to_string(CFM_STEPS)}});
+                auto wav=s3gen_synthesize(tokens);
+                const size_t raw=wav.size();
+                trace_event(trace,"s3_complete","s3",{{"index",std::to_string(i)},{"host_wall_s",json_number(elapsed(decode_start))},
+                    {"raw_samples",std::to_string(raw)},{"completed_invocations","1"}});
+                const size_t crop=0;
+                if(wav.size()!=tokens.size()*size_t(960)) throw std::runtime_error("S3 sample/token length mismatch");
                 auto assembly_start=TraceClock::now();
+                for(float v:wav) if(!std::isfinite(v)) throw std::runtime_error("non-finite S3 sample");
+                std::fill_n(wav.begin(),std::min(wav.size(),size_t(TRIM_FADE)),0.0f);
+                for(size_t j=TRIM_FADE;j<std::min(wav.size(),size_t(2*TRIM_FADE));++j)
+                    wav[j]*=0.5f*(1.0f-std::cos(float(M_PI)*float(j-TRIM_FADE)/float(TRIM_FADE-1)));
+                const size_t offset=pcm.size();
+                if(wav.empty() || wav.size()>(size_t(UINT32_MAX)-36)/2 || offset>(size_t(UINT32_MAX)-36)/2-wav.size())
+                    throw std::runtime_error("empty audio or RIFF size limit");
+                pcm.insert(pcm.end(),wav.begin(),wav.end());
                 accumulate_unit(stats,unit,int(i),int(units.size()),u.text);
                 trace_event(trace,"unit_complete","unit",{{"index",std::to_string(i)},
-                    {"output_begin_sample",std::to_string(offset0)},{"output_end_sample",std::to_string(pcm.size())},
-                    {"unit_samples",std::to_string(pcm.size()-offset0)},{"raw_samples",std::to_string(raw_all)},
-                    {"n_chunks",std::to_string(plan.chunks.size())},{"s3_completed_invocations",std::to_string(s3_n)},
+                    {"output_begin_sample",std::to_string(offset)},{"output_end_sample",std::to_string(pcm.size())},
+                    {"unit_samples",std::to_string(wav.size())},{"raw_samples",std::to_string(raw)},
+                    {"cropped_samples",std::to_string(crop)},{"onset_zero_samples",std::to_string(std::min(wav.size(),size_t(TRIM_FADE)))},
+                    {"faded_samples",std::to_string(wav.size()>TRIM_FADE?std::min(wav.size()-TRIM_FADE,size_t(TRIM_FADE)):0)},
                     {"assembly_host_wall_s",json_number(elapsed(assembly_start))},{"host_wall_s",json_number(elapsed(unit_start))},
-                    {"t3_completed_invocations","1"},{"eos",tape.eos?"true":"false"},
-                    {"s3_host_wall_s",json_number(elapsed(decode_start))}});
+                    {"t3_completed_invocations","1"},{"s3_completed_invocations","1"},{"eos","true"}});
             } catch(const std::exception& e) {
                 trace_event(trace,"unit_failed","unit",{{"index",std::to_string(i)},{"error",json_string(e.what())}});throw;
             }
@@ -174,7 +115,7 @@ struct Engine::Impl {
         trace_event(trace,"synthesis_complete","synthesis",{{"host_wall_s",json_number(elapsed(begin))},
             {"units",std::to_string(units.size())},{"samples",std::to_string(pcm.size())}});
     }
-    T3Tape generate_t3(const std::vector<int32_t>& text_tokens, std::mt19937& rng, SynthesizeStats* stats, ExecutionTrace* trace) {
+    std::vector<int32_t> generate_t3(const std::vector<int32_t>& text_tokens, std::mt19937& rng, SynthesizeStats* stats, ExecutionTrace* trace) {
         const int n_predict=effective_n_predict();
         if(n_predict<1)throw std::runtime_error("n-predict must be positive");
         auto generation_start=TraceClock::now();
@@ -183,7 +124,7 @@ struct Engine::Impl {
         int32_t token = 0;
         std::vector<int32_t> predicted, speech;
         predicted.reserve((size_t)n_predict + 1);
-        speech.reserve((size_t)n_predict + (size_t)effective_sil_count());
+        speech.reserve((size_t)n_predict + (size_t)SIL_COUNT);
         const int32_t stop = model.hparams.stop_speech_token;
         std::vector<float> logits;
         auto decode_start=TraceClock::now();
@@ -193,7 +134,7 @@ struct Engine::Impl {
         eval_prompt(model, allocr, text_tokens, logits, n_past);
         trace_event(trace,"prefill_complete","t3",{{"host_wall_s",json_number(elapsed(prefill_start))},
             {"prompt_length",std::to_string(n_past)},{"kv_rows",std::to_string(model.kv_rows)},
-            {"sampler_order",json_string("temperature,top_k,top_p,min_p,repetition_penalty,sample")}});
+            {"sampler_order",json_string("temperature,top_k,top_p,repetition_penalty,sample")}});
         decode_start=TraceClock::now();
         const std::vector<int32_t> first_pen = { model.hparams.start_speech_token };
         token = sample_next_token_ex(logits, first_pen, rng);
@@ -210,39 +151,33 @@ struct Engine::Impl {
                 {"host_wall_s",json_number(elapsed(generation_start))}});throw;
         }
         const bool reached_eos=!predicted.empty()&&predicted.back()==stop;
-        const int stop_code=reached_eos?0:n_past+1>model.hparams.n_ctx?1:2;
         trace_event(trace,"t3_result","t3",{{"raw_ids",json_ids(predicted)},
             {"raw_count_including_eos",std::to_string(predicted.size())},{"eos",reached_eos?"true":"false"},
-            {"stop_reason",json_string(reached_eos?"eos":stop_code==1?"context_limit":"prediction_limit")},
-            {"stop_code",std::to_string(stop_code)},
+            {"stop_reason",json_string(reached_eos?"eos":n_past+1>model.hparams.n_ctx?"context_limit":"prediction_limit")},
             {"n_past",std::to_string(n_past)},{"generation_host_wall_s",json_number(elapsed(decode_start))},
             {"eos_index",reached_eos?std::to_string(predicted.size()-1):"null"},
             {"host_wall_s",json_number(elapsed(generation_start))}});
+        if (token != stop) {
+            char msg[256];
+            std::snprintf(msg, sizeof(msg), "T3 no EOS: predicted=%d n_past=%d n_predict=%d n_ctx=%d text_tokens=%d",
+                (int)predicted.size(), n_past, n_predict, model.hparams.n_ctx, (int)text_tokens.size());
+            throw std::runtime_error(msg);
+        }
         for (int32_t next : predicted) if (next >= 0 && next < 6561) speech.push_back(next);
-        const int sil_count=effective_sil_count();
-        speech.insert(speech.end(), (size_t)sil_count, (int32_t)effective_s3gen_sil());
-        T3Tape tape;
-        tape.speech_ids=std::move(speech);
-        tape.raw_ids=predicted;
-        tape.stop_code=stop_code;
-        tape.n_past=n_past;
-        tape.eos=reached_eos?1:0;
-        tape.text_tokens=(int)text_tokens.size();
+        speech.insert(speech.end(), (size_t)SIL_COUNT, S3GEN_SIL);
         if (stats) {
             stats->predicted_count = (int)predicted.size();
-            stats->dropped_count = (int)tape.speech_ids.size();
-            stats->eos = tape.eos;
+            stats->dropped_count = (int)speech.size();
+            stats->eos = token == stop ? 1 : 0;
             stats->n_past = n_past;
-            stats->text_tokens = tape.text_tokens;
-            stats->stop_code = stop_code;
-            stats->n_speech = (int)tape.speech_ids.size();
+            stats->text_tokens = (int)text_tokens.size();
         }
-        trace_event(trace,"t3_complete","t3",{{"valid_speech_count",std::to_string(tape.speech_ids.size()-(size_t)sil_count)},
-            {"removed_count",std::to_string(predicted.size()-(tape.speech_ids.size()-(size_t)sil_count))},
-            {"appended_silence_count",std::to_string(sil_count)},{"s3_input_count",std::to_string(tape.speech_ids.size())},
+        trace_event(trace,"t3_complete","t3",{{"valid_speech_count",std::to_string(speech.size()-3)},
+            {"removed_count",std::to_string(predicted.size()-(speech.size()-3))},
+            {"appended_silence_count","3"},{"s3_input_count",std::to_string(speech.size())},
             {"legacy_dropped_definition",json_string("S3 input count, not omitted words")},
             {"completed_invocations","1"}});
-        return tape;
+        return speech;
     }
 };
 Engine::Engine(const EngineOptions& o, ExecutionTrace* trace) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(trace); }

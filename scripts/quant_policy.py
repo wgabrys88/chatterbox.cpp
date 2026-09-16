@@ -7,8 +7,6 @@ DENY = (
     "mel_fb", "pos_emb", "pe/pe", "pre_attention_query", "/bias",
     "/bn/", "/norm/", "/ln_", "/scale", "alpha", "beta", "gamma",
     "voice_encoder/", "campplus/", "s3tokv2/",
-    # Gauge is the vocoder's own fuel plan. Encoder mu and F0 stay F32.
-    "flow/encoder/", "flow/encoder_proj", "hift/f0_predictor",
 )
 DENY_SUFFIX = ("/b", "/bias", "/g")
 QUANT_TYPE = {
