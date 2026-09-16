@@ -260,7 +260,7 @@ static ggml_tensor * repeat_batch(ggml_context * ctx, ggml_tensor * x, int n_emb
 }
 static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_text_tokens) {
     const int n_embd = model.hparams.n_embd;
-    if(text_tokens.empty() || text_tokens.size()>size_t(model.text_pos_emb->ne[1])) throw std::runtime_error("V3 text position limit");
+    if(n_text_tokens <= 0 || n_text_tokens > model.text_pos_emb->ne[1]) throw std::runtime_error("V3 text position limit");
     if(model.hparams.cond_prompt_len<1 || model.hparams.cond_prompt_len>model.speech_pos_emb->ne[1]) throw std::runtime_error("V3 conditioning position limit");
     const int cond_len = 1 + model.hparams.perceiver_len + 1;
     const int N = cond_len + n_text_tokens + 2;
