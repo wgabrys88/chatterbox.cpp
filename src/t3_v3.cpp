@@ -288,13 +288,13 @@ static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_te
     ggml_tensor * cond = ggml_concat(ctx, spkr, perc, 1);
     cond = ggml_concat(ctx, cond, emo, 1);
     cond = repeat_batch(ctx, cond, n_embd, cond_len);
-    ggml_tensor * temb = ggml_add(ctx,
-        ggml_get_rows(ctx, model.text_emb, text_tokens),
-        ggml_get_rows(ctx, model.text_pos_emb, text_pos));
-    // Match PyTorch T3.prepare_input_embeds: CFG batch 0 = text, batch 1 = zeros.
-    ggml_tensor * temb3 = ggml_reshape_3d(ctx, temb, n_embd, n_text_tokens, 1);
-    ggml_tensor * text_uncond = ggml_scale(ctx, temb3, 0.0f);
-    ggml_tensor * text = ggml_concat(ctx, temb3, text_uncond, 2);
+    ggml_tensor * tpos = ggml_get_rows(ctx, model.text_pos_emb, text_pos);
+    ggml_tensor * temb = ggml_add(ctx, ggml_get_rows(ctx, model.text_emb, text_tokens), tpos);
+    // Match PyTorch T3.prepare_input_embeds: zero token emb on CFG batch 1,
+    // then add learned positions. Uncond = position-only, not all-zeros.
+    ggml_tensor * t0 = ggml_reshape_3d(ctx, temb, n_embd, n_text_tokens, 1);
+    ggml_tensor * t1 = ggml_reshape_3d(ctx, tpos, n_embd, n_text_tokens, 1);
+    ggml_tensor * text = ggml_concat(ctx, t0, t1, 2);
     ggml_tensor * bos = ggml_add(ctx,
         ggml_get_rows(ctx, model.speech_emb, bos_tok),
         ggml_get_rows(ctx, model.speech_pos_emb, bos_pos));
