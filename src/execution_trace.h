@@ -21,6 +21,9 @@ inline double elapsed(TraceClock::time_point start) {
 }
 class ExecutionTrace {
     std::ofstream stream_;
+    std::ofstream text_tokens_;
+    std::ofstream t3_tokens_;
+    std::ofstream s3_tokens_;
     std::string id_;
     size_t seq_ = 0;
     std::string unit_ = "null";
@@ -28,9 +31,14 @@ class ExecutionTrace {
 public:
     explicit ExecutionTrace(const std::string& wav_path);
     void event(const std::string& event, const std::string& stage, Fields fields = {});
+    void token_rows(const std::string& table, const std::vector<int32_t>& ids);
 };
 inline void trace_event(ExecutionTrace* trace, const std::string& name,
                         const std::string& stage, Fields fields = {}) {
     if (trace) trace->event(name, stage, fields);
+}
+inline void trace_tokens(ExecutionTrace* trace, const std::string& table,
+                         const std::vector<int32_t>& ids) {
+    if (trace) trace->token_rows(table, ids);
 }
 }

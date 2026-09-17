@@ -81,6 +81,7 @@ struct Engine::Impl {
         };
         const auto prepared=prepare_text(text, opts.language_id=="en", trace);
         const auto u=encode_utterance(prepared,encode,trace);
+        trace_tokens(trace,"text",u.ids);
         trace_event(trace,"preparation_complete","prepare",{{"host_wall_s",json_number(elapsed(begin))}});
         std::mt19937 rng(effective_seed());
         auto unit_start=TraceClock::now();
@@ -97,6 +98,7 @@ struct Engine::Impl {
             trace_event(trace,"s3_start","s3",{{"index","0"},{"s3_input_ids",json_ids(tokens)},
                 {"cfm_steps",std::to_string(CFM_STEPS)}});
             auto wav=s3gen_synthesize(tokens);
+            trace_tokens(trace,"s3",tokens);
             const size_t raw=wav.size();
             trace_event(trace,"s3_complete","s3",{{"index","0"},{"host_wall_s",json_number(elapsed(decode_start))},
                 {"raw_samples",std::to_string(raw)},{"completed_invocations","1"}});
@@ -168,6 +170,7 @@ struct Engine::Impl {
             {"n_past",std::to_string(n_past)},{"generation_host_wall_s",json_number(elapsed(decode_start))},
             {"eos_index",reached_eos?std::to_string(predicted.size()-1):"null"},
             {"host_wall_s",json_number(elapsed(generation_start))}});
+        trace_tokens(trace,"t3",predicted);
         if (predicted.empty()) throw std::runtime_error("T3 produced no tokens");
         if (predicted.back() != stop) {
             char msg[256];

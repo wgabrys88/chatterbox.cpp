@@ -5,3 +5,6 @@ models/
 *.wav
 __pycache__/
 *.pyc
+knowledgebase.md
+/knowledgebase.md
+

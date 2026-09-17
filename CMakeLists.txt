@@ -17,14 +17,14 @@ if("${TTS_FAMILY}" STREQUAL "v3")
     set(TTS_T3_SOURCES
         src/t3_v3.cpp
         src/mtl_bpe.cpp
-        src/chatterbox_tts_v3.cpp
+        src/chatterbox_s3.cpp
         src/chatterbox_engine_v3.cpp)
 elseif("${TTS_FAMILY}" STREQUAL "gpt2")
     set(TTS_FAMILY_DEFINE TTS_FAMILY_GPT2)
     set(TTS_T3_SOURCES
         src/t3_gpt2.cpp
         src/gpt2_bpe.cpp
-        src/chatterbox_tts.cpp
+        src/chatterbox_s3.cpp
         src/chatterbox_engine_gpt2.cpp)
 else()
     message(FATAL_ERROR "TTS_FAMILY must be gpt2 or v3 (got '${TTS_FAMILY}')")

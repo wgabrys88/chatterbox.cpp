@@ -72,20 +72,40 @@ std::string sha256_file(const std::string& path) {
     return h.finish();
 }
 ExecutionTrace::ExecutionTrace(const std::string& wav) {
-    id_=std::filesystem::u8path(wav).parent_path().filename().u8string();
+    const auto wav_path=std::filesystem::u8path(wav);
+    const auto dir=wav_path.parent_path();
+    id_=dir.filename().u8string();
     bool valid=id_.size()==32 && id_.find_first_not_of("0123456789abcdef")==std::string::npos;
     if(!valid) id_="engine-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64());
-    stream_.exceptions(std::ios::badbit|std::ios::failbit);
-    stream_.open(std::filesystem::u8path(wav+".engine.jsonl"),std::ios::binary|std::ios::trunc);
-    event("trace_open","diagnostics",{{"caller_run_id",valid?json_string(id_):"null"}});
+    auto open_table=[&](std::ofstream& f, const char* name){
+        f.exceptions(std::ios::badbit|std::ios::failbit);
+        f.open(dir / name, std::ios::binary|std::ios::trunc);
+    };
+    open_table(stream_, "events.jsonl");
+    open_table(text_tokens_, "text_tokens.jsonl");
+    open_table(t3_tokens_, "t3_tokens.jsonl");
+    open_table(s3_tokens_, "s3_tokens.jsonl");
+    event("trace_open","diagnostics",{{"caller_run_id",valid?json_string(id_):"null"},{"schema",json_string("tables_v1")}});
 }
 void ExecutionTrace::event(const std::string& name,const std::string& stage,Fields fields) {
     if(name=="unit_start")for(const auto& f:fields)if(f.first=="index")unit_=f.second;
-    stream_<<"{\"schema_version\":1,\"component\":\"engine\",\"run_id\":"<<json_string(id_)
+    stream_<<"{\"schema_version\":2,\"component\":\"engine\",\"run_id\":"<<json_string(id_)
       <<",\"seq\":"<<seq_++<<",\"event\":"<<json_string(name)<<",\"stage\":"<<json_string(stage)
       <<",\"unit_index\":"<<unit_<<",\"monotonic_elapsed_s\":"<<json_number(elapsed(start_));
     for(const auto& f:fields) stream_<<','<<json_string(f.first)<<':'<<f.second;
     stream_<<"}\n"; stream_.flush();
+}
+void ExecutionTrace::token_rows(const std::string& name, const std::vector<int32_t>& ids) {
+    std::ofstream* out=nullptr;
+    if(name=="text") out=&text_tokens_;
+    else if(name=="t3") out=&t3_tokens_;
+    else if(name=="s3") out=&s3_tokens_;
+    else throw std::runtime_error("unknown token table");
+    for(size_t i=0;i<ids.size();++i){
+        *out<<"{\"run_id\":"<<json_string(id_)<<",\"table\":"<<json_string(name)
+            <<",\"i\":"<<i<<",\"id\":"<<ids[i]<<"}\n";
+    }
+    out->flush();
 }
 void record_runtime_identity(ExecutionTrace* trace) {
     if(!trace)return;
