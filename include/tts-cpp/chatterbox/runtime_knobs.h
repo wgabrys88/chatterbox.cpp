@@ -13,7 +13,6 @@ struct RuntimeKnobs {
     float top_p = TOP_P;
     int seed = SEED;
     int n_predict = N_PREDICT;
-    int split_tokens = SPLIT_TOKENS;
 #if defined(TTS_FAMILY_GPT2)
     int top_k = TOP_K;
 #elif defined(TTS_FAMILY_V3)
@@ -30,7 +29,6 @@ inline float effective_temperature() { return runtime_knobs().temperature; }
 inline float effective_top_p() { return runtime_knobs().top_p; }
 inline int effective_seed() { return runtime_knobs().seed; }
 inline int effective_n_predict() { return runtime_knobs().n_predict; }
-inline int effective_split_tokens() { return runtime_knobs().split_tokens; }
 #if defined(TTS_FAMILY_GPT2)
 inline int effective_top_k() { return runtime_knobs().top_k; }
 #elif defined(TTS_FAMILY_V3)

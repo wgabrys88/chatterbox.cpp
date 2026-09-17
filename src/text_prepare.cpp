@@ -56,11 +56,6 @@ PreparedText prepare_text(const std::string& s,bool english,ExecutionTrace* trac
     static const std::regex seat(R"(([0-9]{1,6})([A-Za-z]))");
     static const std::regex phone_context(R"((call|phone|telephone)\b[^.!?\n]*$)",std::regex::icase);
     for(size_t i=0;i<s.size();) {
-        if(s.compare(i,3,"|||")==0) {
-            size_t b=p.text.size(); p.text+=' ';
-            p.edits.push_back({i,i+3,b,p.text.size()," ","explicit_boundary"});
-            p.boundaries.push_back(p.text.size()); i+=3;continue;
-        }
         if(space(s[i])) {size_t j=i+1;while(j<s.size()&&space(s[j]))++j;
             size_t b=p.text.size();p.text+=' '; if(s.substr(i,j-i)!=" ")p.edits.push_back({i,j,b,b+1," ","whitespace"});i=j;continue;}
         size_t used=0;std::string replacement,rule;std::smatch m;
@@ -68,7 +63,7 @@ PreparedText prepare_text(const std::string& s,bool english,ExecutionTrace* trac
         auto end_ok=[&](size_t n){return i+n==s.size() || (!word(static_cast<unsigned char>(s[i+n])) && s[i+n]!='.' && s[i+n]!='-' && s[i+n]!=':') || (s[i+n]=='.' && (i+n+1==s.size()||space(s[i+n+1])));};
         // Protect the whole whitespace-delimited URL/email/mixed identifier.
         if(start) {
-            size_t j=i;while(j<s.size()&&!space(s[j])&&s.compare(j,3,"|||")!=0)++j;
+            size_t j=i;while(j<s.size()&&!space(s[j]))++j;
             std::string atom=s.substr(i,j-i); bool alpha=false,num=false;
             for(unsigned char c:atom){alpha|=std::isalpha(c)!=0;num|=std::isdigit(c)!=0;}
             const bool seat_context=i>=5 && lower(s.substr(i-5,5))=="seat ";
