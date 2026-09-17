@@ -87,7 +87,23 @@ struct Engine::Impl {
             ids.insert(ids.begin(),model.hparams.start_text_token);
             ids.push_back(model.hparams.stop_text_token); return ids;
         };
-        const auto prepared=prepare_text(text, opts.language_id=="en", trace);
+        PreparedText prepared;
+        if (opts.language_id == "en") {
+            prepared = prepare_text(text, true, trace);
+        } else {
+            validate_utf8(text);
+            prepared.text = text;
+            trace_event(trace, "text_prepared", "prepare", {
+                {"original_sha256", json_string(sha256_text(text))},
+                {"prepared_sha256", json_string(sha256_text(text))},
+                {"text", json_string(text)},
+                {"edits", "[]"},
+                {"unhandled_spans", "[]"},
+                {"explicit_boundaries", "[]"},
+                {"policy", json_string("language_tokenizer_only")},
+                {"language_id", json_string(opts.language_id)},
+            });
+        }
 #else
         gpt2_bpe bpe;
         if(!bpe.load_from_arrays(model.tok_tokens, model.tok_merges)) throw std::runtime_error("tokenizer");
