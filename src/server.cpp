@@ -155,6 +155,29 @@ static std::string knob_list() {
     return std::string(buf, (size_t)n);
 }
 
+static std::string knobs_json() {
+    const auto& k = tts_cpp::chatterbox::detail::runtime_knobs();
+    char buf[768];
+#if defined(TTS_FAMILY_V3)
+    const int n = std::snprintf(buf, sizeof(buf),
+        "{\"seed\":%d,\"temperature\":%.17g,\"top-p\":%.17g,\"repeat-penalty\":%.17g,"
+        "\"n-predict\":%d,\"min-p\":%.17g,\"cfg-weight\":%.17g}",
+        k.seed, k.temperature, k.top_p, k.repeat_penalty, k.n_predict,
+        k.min_p, k.cfg_weight);
+#else
+    const int n = std::snprintf(buf, sizeof(buf),
+        "{\"seed\":%d,\"temperature\":%.17g,\"top-k\":%d,\"top-p\":%.17g,"
+        "\"repeat-penalty\":%.17g,\"n-predict\":%d}",
+        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict);
+#endif
+    if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("knobs json");
+    return std::string(buf, (size_t)n);
+}
+
+static std::string language_json(const std::string& language) {
+    return language.empty() ? std::string("null") : json_string(language);
+}
+
 static std::string stats_line(const tts_cpp::chatterbox::SynthesizeStats& s) {
     char buf[256];
     const int n = std::snprintf(buf, sizeof(buf),
@@ -202,11 +225,21 @@ static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOption
             samples[i]=int16_t(std::clamp(pcm[i],-1.f,1.f)*32767.f);
         }
         write_wav(path,samples);published=true;
+        const std::string wav_sha=sha256_file(path);
+        const std::string duration=json_number(double(samples.size())/24000);
+        const auto& rk=tts_cpp::chatterbox::detail::runtime_knobs();
         trace->event("output_write_end",stage,{{"samples",std::to_string(samples.size())},{"sample_rate","24000"},
             {"channels","1"},{"clipping_count",std::to_string(clipped)},{"finite_samples","true"},
-            {"duration_s",json_number(double(samples.size())/24000)},{"wav_sha256",json_string(sha256_file(path))},
+            {"duration_s",duration},{"wav_sha256",json_string(wav_sha)},
             {"host_wall_s",json_number(elapsed(start))},{"published","true"}});
         trace->event("request_complete","request",{{"stats",json_string(stats_line(stats))}});
+        trace->write_meta("execution_complete",{
+            {"seed",json_string(std::to_string(rk.seed))},
+            {"knobs",knobs_json()},
+            {"language_id",language_json(options.language_id)},
+            {"wav_sha256",json_string(wav_sha)},
+            {"duration_s",duration},
+            {"sr","24000"}});
         stage="acknowledgement";
         const std::string line="ok "+stats_line(stats);write_exact(h,line.data(),DWORD(line.size()));
         if(!FlushFileBuffers(h))throw std::runtime_error("acknowledgement flush failed");
@@ -214,7 +247,15 @@ static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOption
         std::fprintf(stderr,"request failed stage=%s error=%s\n",stage.c_str(),e.what());std::fflush(stderr);
         // Preserve a completed WAV on transport-only failure; the client marks it unknown.
         if(published&&stage!="acknowledgement") {std::error_code ec;std::filesystem::remove(std::filesystem::u8path(path),ec);}
-        if(trace)trace->event("request_failed",stage,{{"error",json_string(e.what())},{"completed_wav_preserved",published&&stage=="acknowledgement"?"true":"false"}});
+        if(trace){
+            const auto& rk=tts_cpp::chatterbox::detail::runtime_knobs();
+            trace->event("request_failed",stage,{{"error",json_string(e.what())},{"completed_wav_preserved",published&&stage=="acknowledgement"?"true":"false"}});
+            trace->write_meta("failed",{
+                {"seed",json_string(std::to_string(rk.seed))},
+                {"knobs",knobs_json()},
+                {"language_id",language_json(options.language_id)},
+                {"sr","24000"}});
+        }
         const std::string line="err "+one_line(e.what())+"\n";
         write_exact(h,line.data(),DWORD(line.size()));
         FlushFileBuffers(h);

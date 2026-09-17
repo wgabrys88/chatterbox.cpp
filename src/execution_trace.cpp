@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -61,6 +62,10 @@ struct Hash {
         return s.str();
     }
 };
+std::string lookup_field(Fields fields, const char* key, const std::string& fallback) {
+    for (const auto& f : fields) if (f.first == key) return f.second;
+    return fallback;
+}
 }
 std::string sha256_text(const std::string& value) { Hash h; h.add(value.data(),value.size()); return h.finish(); }
 std::string sha256_file(const std::string& path) {
@@ -74,22 +79,25 @@ std::string sha256_file(const std::string& path) {
 ExecutionTrace::ExecutionTrace(const std::string& wav) {
     const auto wav_path=std::filesystem::u8path(wav);
     const auto dir=wav_path.parent_path();
+    dir_=dir.u8string();
     id_=dir.filename().u8string();
     bool valid=id_.size()==32 && id_.find_first_not_of("0123456789abcdef")==std::string::npos;
     if(!valid) id_="engine-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64());
     auto open_table=[&](std::ofstream& f, const char* name){
         f.exceptions(std::ios::badbit|std::ios::failbit);
-        f.open(dir / name, std::ios::binary|std::ios::trunc);
+        f.open(dir / name, std::ios::binary|std::ios::app);
     };
     open_table(stream_, "events.jsonl");
     open_table(text_tokens_, "text_tokens.jsonl");
     open_table(t3_tokens_, "t3_tokens.jsonl");
     open_table(s3_tokens_, "s3_tokens.jsonl");
-    event("trace_open","diagnostics",{{"caller_run_id",valid?json_string(id_):"null"},{"schema",json_string("tables_v1")}});
+    event("trace_open","diagnostics",{{"caller_run_id",valid?json_string(id_):"null"},{"schema",json_string("tables_v3")}});
+    std::fprintf(stderr,"tables_v3 run_id=%s\n",id_.c_str());
+    std::fflush(stderr);
 }
 void ExecutionTrace::event(const std::string& name,const std::string& stage,Fields fields) {
     if(name=="unit_start")for(const auto& f:fields)if(f.first=="index")unit_=f.second;
-    stream_<<"{\"schema_version\":2,\"component\":\"engine\",\"run_id\":"<<json_string(id_)
+    stream_<<"{\"schema_version\":3,\"component\":\"engine\",\"run_id\":"<<json_string(id_)
       <<",\"seq\":"<<seq_++<<",\"event\":"<<json_string(name)<<",\"stage\":"<<json_string(stage)
       <<",\"unit_index\":"<<unit_<<",\"monotonic_elapsed_s\":"<<json_number(elapsed(start_));
     for(const auto& f:fields) stream_<<','<<json_string(f.first)<<':'<<f.second;
@@ -97,15 +105,39 @@ void ExecutionTrace::event(const std::string& name,const std::string& stage,Fiel
 }
 void ExecutionTrace::token_rows(const std::string& name, const std::vector<int32_t>& ids) {
     std::ofstream* out=nullptr;
+    const bool timed = (name=="t3" || name=="s3");
     if(name=="text") out=&text_tokens_;
     else if(name=="t3") out=&t3_tokens_;
     else if(name=="s3") out=&s3_tokens_;
     else throw std::runtime_error("unknown token table");
     for(size_t i=0;i<ids.size();++i){
         *out<<"{\"run_id\":"<<json_string(id_)<<",\"table\":"<<json_string(name)
-            <<",\"i\":"<<i<<",\"id\":"<<ids[i]<<"}\n";
+            <<",\"i\":"<<i<<",\"id\":"<<ids[i]
+            <<",\"t_s\":"<<json_number(timed ? double(i)*0.04 : 0.0)<<"}\n";
     }
     out->flush();
+}
+void ExecutionTrace::write_meta(const std::string& status, Fields fields) {
+    const auto path=std::filesystem::u8path(dir_) / "meta.json";
+    std::ofstream f;
+    f.exceptions(std::ios::badbit|std::ios::failbit);
+    f.open(path, std::ios::binary|std::ios::trunc);
+    f<<"{\"schema_version\":3"
+     <<",\"run_id\":"<<json_string(id_)
+     <<",\"seed\":"<<lookup_field(fields,"seed",json_string("42"))
+     <<",\"knobs\":"<<lookup_field(fields,"knobs","{}")
+     <<",\"language_id\":"<<lookup_field(fields,"language_id","null")
+     <<",\"git_heads\":{\"trident\":null,\"engine\":null,\"ggml\":null}"
+     <<",\"ENGINE_REV\":null"
+     <<",\"binary_sha256\":null"
+     <<",\"gguf_sha256\":{\"t3\":null,\"s3\":null}"
+     <<",\"wav_sha256\":"<<lookup_field(fields,"wav_sha256","null")
+     <<",\"duration_s\":"<<lookup_field(fields,"duration_s","null")
+     <<",\"sr\":"<<lookup_field(fields,"sr","24000")
+     <<",\"status\":"<<json_string(status)
+     <<"}";
+    f<<"\n";
+    f.flush();
 }
 void record_runtime_identity(ExecutionTrace* trace) {
     if(!trace)return;

@@ -1,5 +1,4 @@
 #include "bake_native.h"
-#include "execution_trace.h"
 #include "voice_encoder.h"
 #include "voice_features.h"
 #include "ggml.h"
@@ -93,17 +92,11 @@ int main(int argc, char ** argv) {
     const char * t3 = argv[1];
     const char * s3 = argv[2];
     const char * ref = argv[3];
-    tts_cpp::chatterbox::ExecutionTrace trace(std::filesystem::current_path().append("bake").u8string());
     using namespace tts_cpp::chatterbox;
-    trace.event("bake_start","bake",{{"t3",json_string(t3)},{"s3",json_string(s3)},{"reference",json_string(ref)}});
     try {
     ggml_log_set([](ggml_log_level level, const char* message, void*) {if(level>=GGML_LOG_LEVEL_WARN&&message){fputs(message,stderr);fflush(stderr);}}, nullptr);
     ggml_backend_t backend = ggml_backend_vk_init(0);
     if (!backend) throw std::runtime_error("Vulkan backend init failed");
-    trace.event("backend_identity","bake",{{"backend",json_string(ggml_backend_name(backend))},
-        {"device",json_string(ggml_backend_dev_description(ggml_backend_get_device(backend)))}});
-    record_runtime_identity(&trace);
-    auto step_start=TraceClock::now();
 
     gguf_init_params meta = { true, nullptr };
     gguf_context * t3meta = gguf_init_from_file(t3, meta);
@@ -128,22 +121,12 @@ int main(int argc, char ** argv) {
     if (!voice_encoder_embed(wav, ve, backend, speaker)) throw std::runtime_error("VE embed");
     if (speaker.size() != 256) throw std::runtime_error("speaker_emb size");
 
-    trace.event("voice_encoder_complete","bake",{{"reference_16k_samples",std::to_string(wav.size())},
-        {"speaker_dimensions",std::to_string(speaker.size())},{"host_wall_s",json_number(elapsed(step_start))}});
-    step_start=TraceClock::now();
     std::vector<int32_t> prompt_token, cond;
     tts_cpp::chatterbox::detail::compute_speech_tokens_native(ref, s3, (int)max_cond, prompt_token, cond, backend);
-    trace.event("speech_tokenizer_complete","bake",{{"prompt_ids",json_ids(prompt_token)},{"conditioning_ids",json_ids(cond)},
-        {"host_wall_s",json_number(elapsed(step_start))}});
-    step_start=TraceClock::now();
     std::vector<float> prompt_feat, embedding;
     int prompt_rows = 0;
     tts_cpp::chatterbox::detail::compute_prompt_feat_native(ref, s3, prompt_feat, prompt_rows, backend);
-    trace.event("prompt_features_complete","bake",{{"rows",std::to_string(prompt_rows)},{"columns","80"},
-        {"host_wall_s",json_number(elapsed(step_start))}});
-    step_start=TraceClock::now();
     tts_cpp::chatterbox::detail::compute_embedding_native(ref, s3, embedding, backend);
-    trace.event("campplus_complete","bake",{{"dimensions",std::to_string(embedding.size())},{"host_wall_s",json_number(elapsed(step_start))}});
     if (prompt_rows <= 0 || (int)prompt_feat.size() != prompt_rows * 80) throw std::runtime_error("prompt_feat");
     if (embedding.size() != 192) throw std::runtime_error("embedding size");
     if (cond.empty() || prompt_token.empty()) throw std::runtime_error("speech tokens");
@@ -171,6 +154,5 @@ int main(int argc, char ** argv) {
     });
 
     ggml_backend_free(backend);
-    trace.event("bake_complete","bake",{{"t3_sha256",json_string(sha256_file(t3))},{"s3_sha256",json_string(sha256_file(s3))}});
-    }catch(const std::exception& e){trace.event("bake_failed","bake",{{"error",json_string(e.what())}});fprintf(stderr,"bake failed: %s\n",e.what());return 1;}
+    }catch(const std::exception& e){fprintf(stderr,"bake failed: %s\n",e.what());return 1;}
 }
