@@ -348,6 +348,25 @@ int32_t sample_next_token_ex(
             if (cum <= cutoff) scores[sorted[i].idx] = -INFINITY;
         }
     }
+    {
+        const float min_p = effective_min_p();
+        if (min_p > 0.0f) {
+            float mx = -INFINITY;
+            for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
+            std::vector<float> probs((size_t)n);
+            float psum = 0;
+            for (int i = 0; i < n; ++i) {
+                probs[i] = (scores[i] == -INFINITY) ? 0.0f : std::exp(scores[i] - mx);
+                psum += probs[i];
+            }
+            if (psum == 0.0f) throw std::runtime_error("sampler produced empty distribution");
+            for (float & p : probs) p /= psum;
+            float pmax = 0;
+            for (float p : probs) pmax = std::max(pmax, p);
+            const float limit = min_p * pmax;
+            for (int i = 0; i < n; ++i) if (probs[i] < limit) scores[i] = -INFINITY;
+        }
+    }
     apply_speech_repeat_penalty(scores.data(), n, generated);
     float mx = -INFINITY;
     for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);

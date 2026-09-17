@@ -68,7 +68,7 @@ struct Engine::Impl {
         if(!bpe.load_from_arrays(model.tok_tokens, model.tok_merges)) throw std::runtime_error("tokenizer");
         const EncodeText encode = [&](const std::string& input) {return bpe.tokenize(gpt2_bpe::punc_norm(input));};
         const auto prepared=prepare_text(text, true, trace);
-        const auto units=split_utterances(prepared,effective_split_tokens(),encode,trace);
+        const auto units=encode_one_utterance(prepared,encode,trace);
         trace_event(trace,"preparation_complete","prepare",{{"host_wall_s",json_number(elapsed(begin))}});
         std::mt19937 rng(effective_seed());
         for(size_t i=0;i<units.size();++i) {
@@ -84,7 +84,7 @@ struct Engine::Impl {
                 auto tokens=generate_t3(u.ids,rng,&unit,trace);
                 auto decode_start=TraceClock::now();
                 trace_event(trace,"s3_start","s3",{{"index",std::to_string(i)},{"s3_input_ids",json_ids(tokens)},
-                    {"cfm_steps",std::to_string(CFM_STEPS)}});
+                    {"cfm_steps",std::to_string(effective_cfm_steps())},{"trim_fade",std::to_string(effective_trim_fade())}});
                 auto wav=s3gen_synthesize(tokens);
                 const size_t raw=wav.size();
                 trace_event(trace,"s3_complete","s3",{{"index",std::to_string(i)},{"host_wall_s",json_number(elapsed(decode_start))},
@@ -93,9 +93,12 @@ struct Engine::Impl {
                 if(wav.size()!=tokens.size()*size_t(960)) throw std::runtime_error("S3 sample/token length mismatch");
                 auto assembly_start=TraceClock::now();
                 for(float v:wav) if(!std::isfinite(v)) throw std::runtime_error("non-finite S3 sample");
-                std::fill_n(wav.begin(),std::min(wav.size(),size_t(TRIM_FADE)),0.0f);
-                for(size_t j=TRIM_FADE;j<std::min(wav.size(),size_t(2*TRIM_FADE));++j)
-                    wav[j]*=0.5f*(1.0f-std::cos(float(M_PI)*float(j-TRIM_FADE)/float(TRIM_FADE-1)));
+                const int fade=effective_trim_fade();
+                if(fade>0) std::fill_n(wav.begin(),std::min(wav.size(),size_t(fade)),0.0f);
+                if(fade>=2){
+                    for(size_t j=size_t(fade);j<std::min(wav.size(),size_t(2*fade));++j)
+                        wav[j]*=0.5f*(1.0f-std::cos(float(M_PI)*float(j-fade)/float(fade-1)));
+                }
                 const size_t offset=pcm.size();
                 if(wav.empty() || wav.size()>(size_t(UINT32_MAX)-36)/2 || offset>(size_t(UINT32_MAX)-36)/2-wav.size())
                     throw std::runtime_error("empty audio or RIFF size limit");
@@ -104,8 +107,8 @@ struct Engine::Impl {
                 trace_event(trace,"unit_complete","unit",{{"index",std::to_string(i)},
                     {"output_begin_sample",std::to_string(offset)},{"output_end_sample",std::to_string(pcm.size())},
                     {"unit_samples",std::to_string(wav.size())},{"raw_samples",std::to_string(raw)},
-                    {"cropped_samples",std::to_string(crop)},{"onset_zero_samples",std::to_string(std::min(wav.size(),size_t(TRIM_FADE)))},
-                    {"faded_samples",std::to_string(wav.size()>TRIM_FADE?std::min(wav.size()-TRIM_FADE,size_t(TRIM_FADE)):0)},
+                    {"cropped_samples",std::to_string(crop)},{"onset_zero_samples",std::to_string(std::min(wav.size(),size_t(std::max(fade,0))))},
+                    {"faded_samples",std::to_string(fade>=2 && wav.size()>size_t(fade)?std::min(wav.size()-size_t(fade),size_t(fade)):0)},
                     {"assembly_host_wall_s",json_number(elapsed(assembly_start))},{"host_wall_s",json_number(elapsed(unit_start))},
                     {"t3_completed_invocations","1"},{"s3_completed_invocations","1"},{"eos","true"}});
             } catch(const std::exception& e) {
@@ -124,7 +127,7 @@ struct Engine::Impl {
         int32_t token = 0;
         std::vector<int32_t> predicted, speech;
         predicted.reserve((size_t)n_predict + 1);
-        speech.reserve((size_t)n_predict + (size_t)SIL_COUNT);
+        speech.reserve((size_t)n_predict + (size_t)effective_sil_count());
         const int32_t stop = model.hparams.stop_speech_token;
         std::vector<float> logits;
         auto decode_start=TraceClock::now();
@@ -134,7 +137,7 @@ struct Engine::Impl {
         eval_prompt(model, allocr, text_tokens, logits, n_past);
         trace_event(trace,"prefill_complete","t3",{{"host_wall_s",json_number(elapsed(prefill_start))},
             {"prompt_length",std::to_string(n_past)},{"kv_rows",std::to_string(model.kv_rows)},
-            {"sampler_order",json_string("temperature,top_k,top_p,repetition_penalty,sample")}});
+            {"sampler_order",json_string("temperature,top_k,top_p,min_p,repetition_penalty,sample")}});
         decode_start=TraceClock::now();
         const std::vector<int32_t> first_pen = { model.hparams.start_speech_token };
         token = sample_next_token_ex(logits, first_pen, rng);
@@ -164,7 +167,8 @@ struct Engine::Impl {
             throw std::runtime_error(msg);
         }
         for (int32_t next : predicted) if (next >= 0 && next < 6561) speech.push_back(next);
-        speech.insert(speech.end(), (size_t)SIL_COUNT, S3GEN_SIL);
+        const int sil_count=effective_sil_count();
+        speech.insert(speech.end(), (size_t)sil_count, (int32_t)effective_s3gen_sil());
         if (stats) {
             stats->predicted_count = (int)predicted.size();
             stats->dropped_count = (int)speech.size();
@@ -172,9 +176,9 @@ struct Engine::Impl {
             stats->n_past = n_past;
             stats->text_tokens = (int)text_tokens.size();
         }
-        trace_event(trace,"t3_complete","t3",{{"valid_speech_count",std::to_string(speech.size()-3)},
-            {"removed_count",std::to_string(predicted.size()-(speech.size()-3))},
-            {"appended_silence_count","3"},{"s3_input_count",std::to_string(speech.size())},
+        trace_event(trace,"t3_complete","t3",{{"valid_speech_count",std::to_string(speech.size()-(size_t)sil_count)},
+            {"removed_count",std::to_string(predicted.size()-(speech.size()-(size_t)sil_count))},
+            {"appended_silence_count",std::to_string(sil_count)},{"s3_input_count",std::to_string(speech.size())},
             {"legacy_dropped_definition",json_string("S3 input count, not omitted words")},
             {"completed_invocations","1"}});
         return speech;
