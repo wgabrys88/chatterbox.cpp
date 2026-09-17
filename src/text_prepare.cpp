@@ -56,6 +56,11 @@ PreparedText prepare_text(const std::string& s,bool english,ExecutionTrace* trac
     static const std::regex seat(R"(([0-9]{1,6})([A-Za-z]))");
     static const std::regex phone_context(R"((call|phone|telephone)\b[^.!?\n]*$)",std::regex::icase);
     for(size_t i=0;i<s.size();) {
+        if(s.compare(i,3,"|||")==0) {
+            size_t b=p.text.size(); p.text+=' ';
+            p.edits.push_back({i,i+3,b,p.text.size()," ","explicit_boundary"});
+            p.boundaries.push_back(p.text.size()); i+=3;continue;
+        }
         if(space(s[i])) {size_t j=i+1;while(j<s.size()&&space(s[j]))++j;
             size_t b=p.text.size();p.text+=' '; if(s.substr(i,j-i)!=" ")p.edits.push_back({i,j,b,b+1," ","whitespace"});i=j;continue;}
         size_t used=0;std::string replacement,rule;std::smatch m;
@@ -63,7 +68,7 @@ PreparedText prepare_text(const std::string& s,bool english,ExecutionTrace* trac
         auto end_ok=[&](size_t n){return i+n==s.size() || (!word(static_cast<unsigned char>(s[i+n])) && s[i+n]!='.' && s[i+n]!='-' && s[i+n]!=':') || (s[i+n]=='.' && (i+n+1==s.size()||space(s[i+n+1])));};
         // Protect the whole whitespace-delimited URL/email/mixed identifier.
         if(start) {
-            size_t j=i;while(j<s.size()&&!space(s[j]))++j;
+            size_t j=i;while(j<s.size()&&!space(s[j])&&s.compare(j,3,"|||")!=0)++j;
             std::string atom=s.substr(i,j-i); bool alpha=false,num=false;
             for(unsigned char c:atom){alpha|=std::isalpha(c)!=0;num|=std::isdigit(c)!=0;}
             const bool seat_context=i>=5 && lower(s.substr(i-5,5))=="seat ";
@@ -112,10 +117,11 @@ PreparedText prepare_text(const std::string& s,bool english,ExecutionTrace* trac
         else {size_t b=p.text.size();p.text+=s[i];if(s[i]>='0'&&s[i]<='9')p.unhandled.push_back({b,b+1});++i;}
     }
     if(p.text.find_first_not_of(' ')==std::string::npos)throw std::runtime_error("empty text");
-    std::string edits="[",unhandled="[";
+    std::string edits="[",unhandled="[",boundaries="[";
     for(size_t i=0;i<p.edits.size();++i){const auto&e=p.edits[i];if(i)edits+=',';edits+="{\"original_begin\":"+std::to_string(e.original_begin)+",\"original_end\":"+std::to_string(e.original_end)+",\"prepared_begin\":"+std::to_string(e.prepared_begin)+",\"prepared_end\":"+std::to_string(e.prepared_end)+",\"replacement\":"+json_string(e.replacement)+",\"rule\":"+json_string(e.rule)+"}";}
     for(size_t i=0;i<p.unhandled.size();++i){if(i)unhandled+=',';unhandled+="["+std::to_string(p.unhandled[i].begin)+","+std::to_string(p.unhandled[i].end)+"]";}
-    trace_event(trace,"text_prepared","prepare",{{"original_sha256",json_string(sha256_text(s))},{"prepared_sha256",json_string(sha256_text(p.text))},{"text",json_string(p.text)},{"edits",edits+"]"},{"unhandled_spans",unhandled+"]"},{"policy",json_string(english?"english_bounded_v1":"language_tokenizer_only")}});
+    for(size_t i=0;i<p.boundaries.size();++i){if(i)boundaries+=',';boundaries+=std::to_string(p.boundaries[i]);}
+    trace_event(trace,"text_prepared","prepare",{{"original_sha256",json_string(sha256_text(s))},{"prepared_sha256",json_string(sha256_text(p.text))},{"text",json_string(p.text)},{"edits",edits+"]"},{"unhandled_spans",unhandled+"]"},{"explicit_boundaries",boundaries+"]"},{"policy",json_string(english?"english_bounded_v1":"language_tokenizer_only")}});
     return p;
 }
 }

@@ -80,12 +80,8 @@ struct Engine::Impl {
             ids.push_back(model.hparams.stop_text_token); return ids;
         };
         const auto prepared=prepare_text(text, opts.language_id=="en", trace);
-        const auto units=encode_one_utterance(prepared,encode,trace);
+        const auto units=split_utterances(prepared,effective_split_tokens(),encode,trace);
         trace_event(trace,"preparation_complete","prepare",{{"host_wall_s",json_number(elapsed(begin))}});
-        const float exaggeration=effective_exaggeration();
-        if(ggml_nbytes(model.builtin_emotion_adv)!=sizeof(float))
-            throw std::runtime_error("emotion_adv size");
-        ggml_backend_tensor_set(model.builtin_emotion_adv, &exaggeration, 0, sizeof(float));
         std::mt19937 rng(effective_seed());
         for(size_t i=0;i<units.size();++i) {
             const auto&u=units[i];auto unit_start=TraceClock::now();
@@ -100,8 +96,7 @@ struct Engine::Impl {
                 auto tokens=generate_t3(u.ids,rng,&unit,trace);
                 auto decode_start=TraceClock::now();
                 trace_event(trace,"s3_start","s3",{{"index",std::to_string(i)},{"s3_input_ids",json_ids(tokens)},
-                    {"cfm_steps",std::to_string(effective_cfm_steps())},{"cfm_cfg",json_number(effective_cfm_cfg())},
-                    {"trim_fade",std::to_string(effective_trim_fade())}});
+                    {"cfm_steps",std::to_string(CFM_STEPS)}});
                 auto wav=s3gen_synthesize(tokens);
                 const size_t raw=wav.size();
                 trace_event(trace,"s3_complete","s3",{{"index",std::to_string(i)},{"host_wall_s",json_number(elapsed(decode_start))},
@@ -111,12 +106,9 @@ struct Engine::Impl {
                 wav.resize(wav.size()-crop);
                 auto assembly_start=TraceClock::now();
                 for(float v:wav) if(!std::isfinite(v)) throw std::runtime_error("non-finite S3 sample");
-                const int fade=effective_trim_fade();
-                if(fade>0) std::fill_n(wav.begin(),std::min(wav.size(),size_t(fade)),0.0f);
-                if(fade>=2){
-                    for(size_t j=size_t(fade);j<std::min(wav.size(),size_t(2*fade));++j)
-                        wav[j]*=0.5f*(1.0f-std::cos(float(M_PI)*float(j-fade)/float(fade-1)));
-                }
+                std::fill_n(wav.begin(),std::min(wav.size(),size_t(TRIM_FADE)),0.0f);
+                for(size_t j=TRIM_FADE;j<std::min(wav.size(),size_t(2*TRIM_FADE));++j)
+                    wav[j]*=0.5f*(1.0f-std::cos(float(M_PI)*float(j-TRIM_FADE)/float(TRIM_FADE-1)));
                 const size_t offset=pcm.size();
                 if(wav.empty() || wav.size()>(size_t(UINT32_MAX)-36)/2 || offset>(size_t(UINT32_MAX)-36)/2-wav.size())
                     throw std::runtime_error("empty audio or RIFF size limit");
@@ -125,8 +117,8 @@ struct Engine::Impl {
                 trace_event(trace,"unit_complete","unit",{{"index",std::to_string(i)},
                     {"output_begin_sample",std::to_string(offset)},{"output_end_sample",std::to_string(pcm.size())},
                     {"unit_samples",std::to_string(wav.size())},{"raw_samples",std::to_string(raw)},
-                    {"cropped_samples",std::to_string(crop)},{"onset_zero_samples",std::to_string(std::min(wav.size(),size_t(std::max(fade,0))))},
-                    {"faded_samples",std::to_string(fade>=2 && wav.size()>size_t(fade)?std::min(wav.size()-size_t(fade),size_t(fade)):0)},
+                    {"cropped_samples",std::to_string(crop)},{"onset_zero_samples",std::to_string(std::min(wav.size(),size_t(TRIM_FADE)))},
+                    {"faded_samples",std::to_string(wav.size()>TRIM_FADE?std::min(wav.size()-TRIM_FADE,size_t(TRIM_FADE)):0)},
                     {"assembly_host_wall_s",json_number(elapsed(assembly_start))},{"host_wall_s",json_number(elapsed(unit_start))},
                     {"t3_completed_invocations","1"},{"s3_completed_invocations","1"},{"eos","true"}});
             } catch(const std::exception& e) {
