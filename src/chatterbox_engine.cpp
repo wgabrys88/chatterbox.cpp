@@ -1,5 +1,11 @@
 #include "tts-cpp/chatterbox/engine.h"
+#if defined(TTS_FAMILY_V3)
+#include "tts-cpp/chatterbox/v3.h"
+#include "mtl_bpe.h"
+#else
 #include "tts-cpp/chatterbox/gpt2.h"
+#include "gpt2_bpe.h"
+#endif
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
@@ -9,7 +15,6 @@
 #include <string>
 #include <vector>
 #include "chatterbox_t3_internal.h"
-#include "gpt2_bpe.h"
 #include "s3gen_pipeline.h"
 #include "utterance_split.h"
 #include "execution_trace.h"
@@ -20,6 +25,15 @@
 #include "ggml-backend.h"
 namespace tts_cpp::chatterbox {
 using namespace detail;
+#if defined(TTS_FAMILY_V3)
+static std::vector<int32_t> drop_invalid_tokens(const std::vector<int32_t> & x, int32_t sos, int32_t eos) {
+    size_t s = 0, e = x.size();
+    for (size_t i = 0; i < x.size(); ++i) if (x[i] == sos) { s = i + 1; break; }
+    for (size_t i = 0; i < x.size(); ++i) if (x[i] == eos) { e = i; break; }
+    if (s > e) throw std::runtime_error("drop_invalid");
+    return std::vector<int32_t>(x.begin() + (std::ptrdiff_t)s, x.begin() + (std::ptrdiff_t)e);
+}
+#endif
 struct Engine::Impl {
     EngineOptions opts;
     chatterbox_model model{};
@@ -64,10 +78,22 @@ struct Engine::Impl {
             {"driver_source",json_string("server.log Vulkan initialization and client host_inventory")},
             {"layers",std::to_string(model.hparams.n_layer)},{"embedding",std::to_string(model.hparams.n_embd)},
             {"heads",std::to_string(model.hparams.n_head)}});
+#if defined(TTS_FAMILY_V3)
+        if(opts.language_id.empty()) throw std::runtime_error("language");
+        mtl_bpe bpe;
+        if(!bpe.load_from_arrays(model.tok_tokens,model.tok_types,model.tok_merges)) throw std::runtime_error("tokenizer");
+        const EncodeText encode = [&](const std::string& input) {
+            auto ids=bpe.encode(input,opts.language_id);
+            ids.insert(ids.begin(),model.hparams.start_text_token);
+            ids.push_back(model.hparams.stop_text_token); return ids;
+        };
+        const auto prepared=prepare_text(text, opts.language_id=="en", trace);
+#else
         gpt2_bpe bpe;
         if(!bpe.load_from_arrays(model.tok_tokens, model.tok_merges)) throw std::runtime_error("tokenizer");
         const EncodeText encode = [&](const std::string& input) {return bpe.tokenize(gpt2_bpe::punc_norm(input));};
         const auto prepared=prepare_text(text, true, trace);
+#endif
         const auto u=encode_utterance(prepared,encode,trace);
         trace_tokens(trace,"text",u.ids);
         trace_event(trace,"preparation_complete","prepare",{{"host_wall_s",json_number(elapsed(begin))}});
@@ -75,7 +101,13 @@ struct Engine::Impl {
         auto unit_start=TraceClock::now();
         trace_event(trace,"unit_start","unit",{{"index","0"},{"count","1"},
             {"begin",std::to_string(u.begin)},{"end",std::to_string(u.end)},
-            {"text",json_string(u.text)},{"tokenizer_preprocessed",json_string(gpt2_bpe::punc_norm(u.text))},{"text_ids",json_ids(u.ids)},
+            {"text",json_string(u.text)},{"tokenizer_preprocessed",json_string(
+#if defined(TTS_FAMILY_V3)
+                mtl_bpe::prepare_input(u.text,opts.language_id)
+#else
+                gpt2_bpe::punc_norm(u.text)
+#endif
+            )},{"text_ids",json_ids(u.ids)},
             {"text_tokens",std::to_string(u.ids.size())},{"conditioning_tokens",std::to_string(model.hparams.cond_prompt_len)},
             {"architectural_context",std::to_string(model.hparams.n_ctx)},{"n_predict",std::to_string(effective_n_predict())},
             {"seed",std::to_string(effective_seed())},{"rng",json_string("mt19937 request scope")}});
@@ -90,8 +122,14 @@ struct Engine::Impl {
             const size_t raw=wav.size();
             trace_event(trace,"s3_complete","s3",{{"index","0"},{"host_wall_s",json_number(elapsed(decode_start))},
                 {"raw_samples",std::to_string(raw)},{"completed_invocations","1"}});
+#if defined(TTS_FAMILY_V3)
+            const size_t crop=960;
+            if(tokens.size()<2 || wav.size()!=tokens.size()*size_t(960)) throw std::runtime_error("S3 sample/token length mismatch");
+            wav.resize(wav.size()-crop);
+#else
             const size_t crop=0;
             if(wav.size()!=tokens.size()*size_t(960)) throw std::runtime_error("S3 sample/token length mismatch");
+#endif
             auto assembly_start=TraceClock::now();
             for(float v:wav) if(!std::isfinite(v)) throw std::runtime_error("non-finite S3 sample");
             std::fill_n(wav.begin(),std::min(wav.size(),size_t(TRIM_FADE)),0.0f);
@@ -121,11 +159,7 @@ struct Engine::Impl {
         auto generation_start=TraceClock::now();
         if (model.buffer_kv) ggml_backend_buffer_clear(model.buffer_kv, 0);
         int n_past = 0;
-        int32_t token = 0;
-        std::vector<int32_t> predicted, speech;
-        predicted.reserve((size_t)n_predict + 1);
-        speech.reserve((size_t)n_predict + (size_t)SIL_COUNT);
-        const int32_t stop = model.hparams.stop_speech_token;
+        std::vector<int32_t> predicted;
         std::vector<float> logits;
         auto decode_start=TraceClock::now();
         trace_event(trace,"t3_start","t3",{{"attempted_invocations","1"},{"requested_prediction_cap",std::to_string(n_predict)}});
@@ -134,8 +168,31 @@ struct Engine::Impl {
         eval_prompt(model, allocr, text_tokens, logits, n_past);
         trace_event(trace,"prefill_complete","t3",{{"host_wall_s",json_number(elapsed(prefill_start))},
             {"prompt_length",std::to_string(n_past)},{"kv_rows",std::to_string(model.kv_rows)},
-            {"sampler_order",json_string("temperature,top_k,top_p,repetition_penalty,sample")}});
+            {"sampler_order",json_string(
+#if defined(TTS_FAMILY_V3)
+                "cfg,repetition_penalty,temperature,min_p,top_p,sample"
+#else
+                "temperature,top_k,top_p,repetition_penalty,sample"
+#endif
+            )}});
         decode_start=TraceClock::now();
+#if defined(TTS_FAMILY_V3)
+        const int32_t stop = model.hparams.stop_speech_token;
+        const int32_t sos = model.hparams.start_speech_token;
+        std::vector<int32_t> generated;
+        generated.push_back(sos);
+        predicted.reserve((size_t)n_predict);
+        for (int i = 0; i < n_predict && n_past + 1 <= model.hparams.n_ctx; ++i) {
+            int32_t token = sample_next_token_ex(logits, generated, rng);
+            predicted.push_back(token);
+            generated.push_back(token);
+            if (token == stop) break;
+            eval_step(model, allocr, n_past++, token, i + 1, logits);
+        }
+#else
+        int32_t token = 0;
+        predicted.reserve((size_t)n_predict + 1);
+        const int32_t stop = model.hparams.stop_speech_token;
         const std::vector<int32_t> first_pen = { model.hparams.start_speech_token };
         token = sample_next_token_ex(logits, first_pen, rng);
         predicted.push_back(token);
@@ -144,13 +201,14 @@ struct Engine::Impl {
             token = sample_next_token_ex(logits, predicted, rng);
             predicted.push_back(token);
         }
+#endif
         } catch(const std::exception& e) {
             trace_event(trace,"t3_failed","t3",{{"raw_ids",json_ids(predicted)},{"raw_count_including_eos",std::to_string(predicted.size())},
                 {"n_past",std::to_string(n_past)},{"kv_rows",std::to_string(model.kv_rows)},
                 {"stop_reason",json_string("model_error")},{"error",json_string(e.what())},
                 {"host_wall_s",json_number(elapsed(generation_start))}});throw;
         }
-        const bool reached_eos=!predicted.empty()&&predicted.back()==stop;
+        const bool reached_eos=!predicted.empty()&&predicted.back()==model.hparams.stop_speech_token;
         trace_event(trace,"t3_result","t3",{{"raw_ids",json_ids(predicted)},
             {"raw_count_including_eos",std::to_string(predicted.size())},{"eos",reached_eos?"true":"false"},
             {"stop_reason",json_string(reached_eos?"eos":n_past+1>model.hparams.n_ctx?"context_limit":"prediction_limit")},
@@ -158,18 +216,43 @@ struct Engine::Impl {
             {"eos_index",reached_eos?std::to_string(predicted.size()-1):"null"},
             {"host_wall_s",json_number(elapsed(generation_start))}});
         trace_tokens(trace,"t3",predicted);
-        if (token != stop) {
+#if defined(TTS_FAMILY_V3)
+        if (predicted.empty()) throw std::runtime_error("T3 produced no tokens");
+        if (predicted.back() != model.hparams.stop_speech_token) {
             char msg[256];
             std::snprintf(msg, sizeof(msg), "T3 no EOS: predicted=%d n_past=%d n_predict=%d n_ctx=%d text_tokens=%d",
                 (int)predicted.size(), n_past, n_predict, model.hparams.n_ctx, (int)text_tokens.size());
             throw std::runtime_error(msg);
         }
+        auto dropped = drop_invalid_tokens(predicted, model.hparams.start_speech_token, model.hparams.stop_speech_token);
+        if (stats) {
+            stats->predicted_count = (int)predicted.size();
+            stats->dropped_count = (int)dropped.size();
+            stats->eos = predicted.back() == model.hparams.stop_speech_token ? 1 : 0;
+            stats->n_past = n_past;
+            stats->text_tokens = (int)text_tokens.size();
+        }
+        trace_event(trace,"t3_complete","t3",{{"valid_speech_count",std::to_string(dropped.size()-0)},
+            {"removed_count",std::to_string(predicted.size()-(dropped.size()-0))},
+            {"appended_silence_count","0"},{"s3_input_count",std::to_string(dropped.size())},
+            {"legacy_dropped_definition",json_string("S3 input count, not omitted words")},
+            {"completed_invocations","1"}});
+        return dropped;
+#else
+        if (predicted.empty() || predicted.back() != model.hparams.stop_speech_token) {
+            char msg[256];
+            std::snprintf(msg, sizeof(msg), "T3 no EOS: predicted=%d n_past=%d n_predict=%d n_ctx=%d text_tokens=%d",
+                (int)predicted.size(), n_past, n_predict, model.hparams.n_ctx, (int)text_tokens.size());
+            throw std::runtime_error(msg);
+        }
+        std::vector<int32_t> speech;
+        speech.reserve((size_t)n_predict + (size_t)SIL_COUNT);
         for (int32_t next : predicted) if (next >= 0 && next < 6561) speech.push_back(next);
         speech.insert(speech.end(), (size_t)SIL_COUNT, S3GEN_SIL);
         if (stats) {
             stats->predicted_count = (int)predicted.size();
             stats->dropped_count = (int)speech.size();
-            stats->eos = token == stop ? 1 : 0;
+            stats->eos = predicted.back() == model.hparams.stop_speech_token ? 1 : 0;
             stats->n_past = n_past;
             stats->text_tokens = (int)text_tokens.size();
         }
@@ -179,6 +262,7 @@ struct Engine::Impl {
             {"legacy_dropped_definition",json_string("S3 input count, not omitted words")},
             {"completed_invocations","1"}});
         return speech;
+#endif
     }
 };
 Engine::Engine(const EngineOptions& o, ExecutionTrace* trace) : pimpl_(std::make_unique<Impl>(o)) { pimpl_->init(trace); }
