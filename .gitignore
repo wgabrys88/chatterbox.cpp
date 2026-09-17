@@ -5,6 +5,8 @@ models/
 *.wav
 __pycache__/
 *.pyc
+# PARENT handover runbook. Never track a copy of this name.
 knowledgebase.md
 /knowledgebase.md
+**/knowledgebase.md
 
