@@ -173,7 +173,7 @@ static ggml_tensor * build_transformer_core(
             qkv_col_stride,
             qkv_head_stride,
             (size_t) 2 * n_embd * sizeof(float));
-        const size_t layer_off = (size_t) il * kv_layer_elems * sizeof(float);
+        const size_t layer_off = (size_t) il * kv_layer_elems * kv_ts;
         {
             ggml_tensor * k_dst = ggml_view_3d(ctx, model.memory_k,
                 HD, N, n_head,
