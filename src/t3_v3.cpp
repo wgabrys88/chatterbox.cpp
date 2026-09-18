@@ -292,6 +292,7 @@ static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_te
     ggml_tensor * temb = ggml_add(ctx, ggml_get_rows(ctx, model.text_emb, text_tokens), tpos);
     // Match PyTorch T3.prepare_input_embeds: zero token emb on CFG batch 1,
     // then add learned positions. Uncond = position-only, not all-zeros.
+    // Do not ggml_scale the summed embedding; that zeros positions too.
     ggml_tensor * t0 = ggml_reshape_3d(ctx, temb, n_embd, n_text_tokens, 1);
     ggml_tensor * t1 = ggml_reshape_3d(ctx, tpos, n_embd, n_text_tokens, 1);
     ggml_tensor * text = ggml_concat(ctx, t0, t1, 2);
