@@ -1,6 +1,5 @@
 #include "s3gen_pipeline.h"
 #include "chatterbox_t3_internal.h"
-#include "execution_trace.h"
 #if defined(TTS_FAMILY_V3)
 #include "tts-cpp/chatterbox/v3.h"
 #endif
@@ -1117,7 +1116,7 @@ static void run_hift_decode(const model_ctx & m,
     return wav;
 #endif
 }
-std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens, tts_cpp::chatterbox::ExecutionTrace* trace) {
+std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
 #if !defined(TTS_FAMILY_V3)
     std::vector<float> wav;
 #endif
@@ -1146,11 +1145,7 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens, t
     std::vector<float> input_embed(n_total * D), mu_T;
     for (int i = 0; i < n_total; ++i)
         std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)flow_tokens[i] * D, D * sizeof(float));
-    auto encoder_start = tts_cpp::chatterbox::TraceClock::now();
     mu_T = run_encoder(m, input_embed, n_total, D);
-    tts_cpp::chatterbox::trace_event(trace, "s3_encoder_complete", "s3", {
-        {"host_wall_s", tts_cpp::chatterbox::json_number(tts_cpp::chatterbox::elapsed(encoder_start))},
-        {"n_total", std::to_string(n_total)}});
 #if defined(TTS_FAMILY_V3)
     int T_mu = 2 * n_total;
 #else
@@ -1209,7 +1204,6 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens, t
     std::vector<float> x2((size_t)T_mu * MEL * 2), mu2((size_t)T_mu * MEL * 2, 0.f);
     std::vector<float> cond2((size_t)T_mu * MEL * 2, 0.f), spks2((size_t)MEL * 2, 0.f);
 #endif
-    auto cfm_start = tts_cpp::chatterbox::TraceClock::now();
     for (size_t step = 0; step + 1 < t_span.size(); ++step) {
         const float t = t_span[step], r = t_span[step + 1], dt = r - t;
 #if defined(TTS_FAMILY_V3)
@@ -1237,16 +1231,11 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens, t
         for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
 #endif
     }
-    tts_cpp::chatterbox::trace_event(trace, "s3_cfm_complete", "s3", {
-        {"host_wall_s", tts_cpp::chatterbox::json_number(tts_cpp::chatterbox::elapsed(cfm_start))},
-        {"cfm_steps", std::to_string(cfm_steps)},
-        {"T_mu", std::to_string(T_mu)}});
     const int T_mel = T_mu - mel_len1;
     std::vector<float> mel(MEL * T_mel);
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mel; ++t)
             mel[m2 * T_mel + t] = z[m2 * T_mu + (t + mel_len1)];
-    auto vocoder_start = tts_cpp::chatterbox::TraceClock::now();
     auto f0 = run_f0_predictor(m, mel, T_mel);
     int upsample = 8 * 5 * 3 * 4;
     int T_wav = T_mel * upsample;
@@ -1267,9 +1256,6 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens, t
 #else
     run_hift_decode(m, mel, T_mel, s_stft, T_stft, wav);
 #endif
-    tts_cpp::chatterbox::trace_event(trace, "s3_vocoder_complete", "s3", {
-        {"host_wall_s", tts_cpp::chatterbox::json_number(tts_cpp::chatterbox::elapsed(vocoder_start))},
-        {"T_mel", std::to_string(T_mel)}});
     if ((int)wav.size() != output_tokens * kSamplesPerToken) throw std::runtime_error("S3Gen waveform range mismatch");
     return wav;
 }

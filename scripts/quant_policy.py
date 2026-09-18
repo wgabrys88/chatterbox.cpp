@@ -7,26 +7,6 @@ import numpy as np
 
 WEIGHT_TYPES = tuple(json.loads(Path(__file__).with_name("precision_policy.json").read_text(encoding="utf-8"))["weight_types"])
 QUANT_TYPES = {"q4_0": gguf.GGMLQuantizationType.Q4_0}
-S3_ALWAYS_F32 = (
-    "flow/input_embedding",
-    "flow/spk_embed_affine/",
-    "/builtin/",
-    "s3gen/mel_fb/",
-    "campplus/",
-    "s3tokv2/",
-    "hift/m_source/",
-)
-
-
-def s3_force_f32(name, array):
-    arr = np.ascontiguousarray(array)
-    if arr.ndim <= 1:
-        return True
-    if any(token in name for token in S3_ALWAYS_F32):
-        return True
-    if arr.ndim != 2 and (name.startswith("cfm/") or name.startswith("hift/")):
-        return True
-    return False
 
 
 def add_weight(writer, name, array, weight_type, *, force_f32=False):

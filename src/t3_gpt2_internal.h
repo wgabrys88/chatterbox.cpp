@@ -55,6 +55,4 @@ void load_model_gguf(const std::string & path, chatterbox_model & model);
 void eval_prompt(chatterbox_model &, ggml_gallocr_t, const std::vector<int32_t> &, std::vector<float> &, int &);
 void eval_step(const chatterbox_model &, ggml_gallocr_t, int, int32_t, std::vector<float> &);
 int32_t sample_next_token_ex(const std::vector<float> &, const std::vector<int32_t> &, std::mt19937 &);
-void reset_eval_step_times();
-void eval_step_times(double & build_s, double & alloc_s, double & compute_s, double & copy_s, int & n);
 }
