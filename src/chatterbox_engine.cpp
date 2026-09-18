@@ -33,6 +33,14 @@ static std::vector<int32_t> drop_invalid_tokens(const std::vector<int32_t> & x, 
     if (s > e) throw std::runtime_error("drop_invalid");
     return std::vector<int32_t>(x.begin() + (std::ptrdiff_t)s, x.begin() + (std::ptrdiff_t)e);
 }
+static std::string json_number_rewrites(const std::vector<mtl_number_rewrite> & rewrites) {
+    std::string out = "[";
+    for (size_t i = 0; i < rewrites.size(); ++i) {
+        if (i) out += ',';
+        out += "{\"kind\":\"icu_spellout\",\"source\":" + json_string(rewrites[i].source) + ",\"target\":" + json_string(rewrites[i].target) + "}";
+    }
+    return out + "]";
+}
 #endif
 struct Engine::Impl {
     EngineOptions opts;
@@ -82,28 +90,34 @@ struct Engine::Impl {
         if(opts.language_id.empty()) throw std::runtime_error("language");
         mtl_bpe bpe;
         if(!bpe.load_from_arrays(model.tok_tokens,model.tok_types,model.tok_merges)) throw std::runtime_error("tokenizer");
+        const auto numbers = bpe.verbalize_numbers(text, opts.language_id);
+        trace_event(trace, "number_verbalized", "prepare", {
+            {"original_text", json_string(text)},
+            {"transport_text", json_string(numbers.text)},
+            {"changed", numbers.rewrites.empty() ? "false" : "true"},
+            {"changes", json_number_rewrites(numbers.rewrites)},
+            {"language_id", json_string(opts.language_id)},
+            {"provider", json_string(numbers.provider)},
+            {"policy", json_string("icu_cldr_locale_spellout")},
+        });
         const EncodeText encode = [&](const std::string& input) {
             auto ids=bpe.encode(input,opts.language_id);
             ids.insert(ids.begin(),model.hparams.start_text_token);
             ids.push_back(model.hparams.stop_text_token); return ids;
         };
+        validate_utf8(numbers.text);
         PreparedText prepared;
-        if (opts.language_id == "en") {
-            prepared = prepare_text(text, true, trace);
-        } else {
-            validate_utf8(text);
-            prepared.text = text;
-            trace_event(trace, "text_prepared", "prepare", {
-                {"original_sha256", json_string(sha256_text(text))},
-                {"prepared_sha256", json_string(sha256_text(text))},
-                {"text", json_string(text)},
-                {"edits", "[]"},
-                {"unhandled_spans", "[]"},
-                {"explicit_boundaries", "[]"},
-                {"policy", json_string("language_tokenizer_only")},
-                {"language_id", json_string(opts.language_id)},
-            });
-        }
+        prepared.text = numbers.text;
+        trace_event(trace, "text_prepared", "prepare", {
+            {"original_sha256", json_string(sha256_text(text))},
+            {"prepared_sha256", json_string(sha256_text(numbers.text))},
+            {"text", json_string(numbers.text)},
+            {"edits", "[]"},
+            {"unhandled_spans", "[]"},
+            {"explicit_boundaries", "[]"},
+            {"policy", json_string("icu_then_language_tokenizer")},
+            {"language_id", json_string(opts.language_id)},
+        });
 #else
         gpt2_bpe bpe;
         if(!bpe.load_from_arrays(model.tok_tokens, model.tok_merges)) throw std::runtime_error("tokenizer");

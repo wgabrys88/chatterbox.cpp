@@ -60,6 +60,8 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
         hp.perceiver_len = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_PERCEIVER_LEN));
         hp.rope_theta    = gguf_get_val_f32(gguf_ctx, require_key(gguf_ctx, KEY_ROPE_THETA));
         hp.rope_orig_ctx = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_ROPE_ORIG_CTX));
+        if (gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_TEXT_FRONTEND)) != 2)
+            throw std::runtime_error("unsupported text frontend contract");
         if (!model.backend) throw std::runtime_error("Vulkan backend required");
         if (hp.n_embd % hp.n_head) throw std::runtime_error("n_head");
         const int64_t num_tensors = gguf_get_n_tensors(gguf_ctx);

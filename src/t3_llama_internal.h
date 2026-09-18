@@ -31,6 +31,7 @@ constexpr const char * KEY_N_CTX             = "chatterbox.n_ctx";
 constexpr const char * KEY_PERCEIVER_LEN     = "chatterbox.perceiver_len";
 constexpr const char * KEY_ROPE_THETA        = "chatterbox.rope_theta";
 constexpr const char * KEY_ROPE_ORIG_CTX     = "chatterbox.rope_orig_ctx";
+constexpr const char * KEY_TEXT_FRONTEND     = "chatterbox.text_frontend_version";
 struct chatterbox_hparams {
     int32_t n_text_vocab = 0, n_speech_vocab = 0;
     int32_t start_text_token = 0, stop_text_token = 0;

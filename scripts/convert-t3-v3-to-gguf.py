@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, math, re, sys
+import argparse, hashlib, json, math, re, sys
 from pathlib import Path
 import gguf, numpy as np, torch
 from safetensors.torch import load_file
@@ -36,8 +36,19 @@ def add(writer, name, array):
     writer.add_tensor(name, np.ascontiguousarray(array.astype(dtype)))
 
 def tokenizer(ckpt_dir):
-    tok = json.loads((ckpt_dir / "grapheme_mtl_merged_expanded_v1.json").read_text(encoding="utf-8"))
-    vocab = tok["model"]["vocab"]
+    tokenizer_path = ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"
+    tokenizer_bytes = tokenizer_path.read_bytes()
+    tok = json.loads(tokenizer_bytes.decode("utf-8"))
+    if tok.get("normalizer") is not None:
+        raise SystemExit("tokenizer normalizer contract changed")
+    if tok.get("pre_tokenizer") != {"type": "Whitespace"}:
+        raise SystemExit("tokenizer pre-tokenizer contract changed")
+    model = tok.get("model", {})
+    if model.get("type") != "BPE" or model.get("unk_token") != "[UNK]":
+        raise SystemExit("tokenizer BPE contract changed")
+    if tok.get("post_processor") is not None or tok.get("decoder") is not None:
+        raise SystemExit("tokenizer post-processing contract changed")
+    vocab = model["vocab"]
     if not isinstance(vocab, dict):
         raise SystemExit("tokenizer vocab")
     id_to_tok = {int(i): t for t, i in vocab.items()}
@@ -54,14 +65,17 @@ def tokenizer(ckpt_dir):
         tokens.append(tok_s)
         types.append(int(gguf.TokenType.USER_DEFINED if i in added_ids else gguf.TokenType.NORMAL))
     merges = []
-    for m in tok["model"]["merges"]:
+    for m in model["merges"]:
         if isinstance(m, str):
             merges.append(m)
         elif isinstance(m, list) and len(m) == 2:
             merges.append(m[0] + " " + m[1])
         else:
             raise SystemExit("merge")
-    return tokens, types, merges
+    language_tokens = sorted(t for t in tokens if re.fullmatch(r"\[[a-z]{2,3}\]", t))
+    if not language_tokens:
+        raise SystemExit("tokenizer has no language tokens")
+    return tokens, types, merges, hashlib.sha256(tokenizer_bytes).hexdigest(), language_tokens
 def map_name(name):
     table = {
         "tfmr.norm.weight": ("model/norm/g", torch.float32),
@@ -135,7 +149,7 @@ def main():
     if speech_pos_len <= N_PREDICT:
         raise SystemExit(f"speech_pos {speech_pos_len} must exceed N_PREDICT {N_PREDICT}")
     n_ctx = 1 + perceiver_len + 1 + text_pos_len + 2 + N_PREDICT
-    tokens, types, merges = tokenizer(ckpt_dir)
+    tokens, types, merges, tokenizer_sha256, language_tokens = tokenizer(ckpt_dir)
     writer = gguf.GGUFWriter(str(out), "chatterbox")
     writer.add_uint32("chatterbox.n_ctx", n_ctx)
     writer.add_uint32("chatterbox.n_embd", n_embd)
@@ -154,6 +168,9 @@ def main():
     writer.add_float32("chatterbox.layer_norm_eps", 1e-5)
     writer.add_float32("chatterbox.rope_theta", ROPE_THETA)
     writer.add_uint32("chatterbox.rope_orig_ctx", ROPE_ORIG_CTX)
+    writer.add_uint32("chatterbox.text_frontend_version", 2)
+    writer.add_string("chatterbox.tokenizer.source_sha256", tokenizer_sha256)
+    writer.add_string("chatterbox.tokenizer.language_tokens", ",".join(language_tokens))
     writer.add_tokenizer_model("hf-bpe")
     writer.add_token_list(tokens)
     writer.add_token_types(types)

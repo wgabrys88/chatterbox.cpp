@@ -19,6 +19,7 @@ if("${TTS_FAMILY}" STREQUAL "v3")
         src/mtl_bpe.cpp
         src/chatterbox_s3.cpp
         src/chatterbox_engine.cpp)
+    set(TTS_SYSTEM_LIBS icu)
 elseif("${TTS_FAMILY}" STREQUAL "gpt2")
     set(TTS_FAMILY_DEFINE TTS_FAMILY_GPT2)
     set(TTS_T3_SOURCES
@@ -37,7 +38,7 @@ endif()
 add_compile_definitions(${TTS_FAMILY_DEFINE})
 add_library(tts-cpp STATIC ${TTS_T3_SOURCES} src/text_prepare.cpp src/execution_trace.cpp)
 target_include_directories(tts-cpp PUBLIC include PRIVATE src ggml/include)
-target_link_libraries(tts-cpp PUBLIC ggml bcrypt psapi Vulkan::Vulkan)
+target_link_libraries(tts-cpp PUBLIC ggml bcrypt psapi Vulkan::Vulkan ${TTS_SYSTEM_LIBS})
 target_compile_definitions(tts-cpp PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_definitions(tts-cpp PRIVATE GGML_USE_VULKAN)
 if(MSVC)
