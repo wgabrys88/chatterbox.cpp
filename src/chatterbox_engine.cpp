@@ -189,7 +189,7 @@ struct Engine::Impl {
                 ,{"cfm_cfg",json_number(effective_cfm_cfg())}
 #endif
             });
-            auto wav=s3gen_synthesize(tokens);
+            auto wav=s3gen_synthesize(tokens, trace);
             trace_tokens(trace,"s3",tokens);
             const size_t raw=wav.size();
             trace_event(trace,"s3_complete","s3",{{"index","0"},{"host_wall_s",json_number(elapsed(decode_start))},
@@ -235,6 +235,7 @@ struct Engine::Impl {
         std::vector<int32_t> predicted;
         std::vector<float> logits;
         auto decode_start=TraceClock::now();
+        double sample_s=0;
         trace_event(trace,"t3_start","t3",{{"attempted_invocations","1"},{"requested_prediction_cap",std::to_string(n_predict)}});
         try {
         auto prefill_start=TraceClock::now();
@@ -256,22 +257,29 @@ struct Engine::Impl {
         generated.push_back(sos);
         predicted.reserve((size_t)n_predict);
         for (int i = 0; i < n_predict && n_past + 1 <= model.hparams.n_ctx; ++i) {
+            auto sample_start=TraceClock::now();
             int32_t token = sample_next_token_ex(logits, generated, rng);
+            sample_s += elapsed(sample_start);
             predicted.push_back(token);
             generated.push_back(token);
             if (token == stop) break;
             eval_step(model, allocr, n_past++, token, i + 1, logits);
         }
 #else
+        reset_eval_step_times();
         int32_t token = 0;
         predicted.reserve((size_t)n_predict + 1);
         const int32_t stop = model.hparams.stop_speech_token;
         const std::vector<int32_t> first_pen = { model.hparams.start_speech_token };
+        auto sample_start=TraceClock::now();
         token = sample_next_token_ex(logits, first_pen, rng);
+        sample_s += elapsed(sample_start);
         predicted.push_back(token);
         for (int step = 1; step < n_predict && token != stop && n_past + 1 <= model.hparams.n_ctx; ++step) {
             eval_step(model, allocr, n_past++, token, logits);
+            sample_start=TraceClock::now();
             token = sample_next_token_ex(logits, predicted, rng);
+            sample_s += elapsed(sample_start);
             predicted.push_back(token);
         }
 #endif
@@ -282,12 +290,30 @@ struct Engine::Impl {
                 {"host_wall_s",json_number(elapsed(generation_start))}});throw;
         }
         const bool reached_eos=!predicted.empty()&&predicted.back()==model.hparams.stop_speech_token;
+#if defined(TTS_FAMILY_V3)
         trace_event(trace,"t3_result","t3",{{"raw_ids",json_ids(predicted)},
             {"raw_count_including_eos",std::to_string(predicted.size())},{"eos",reached_eos?"true":"false"},
             {"stop_reason",json_string(reached_eos?"eos":n_past+1>model.hparams.n_ctx?"context_limit":"prediction_limit")},
             {"n_past",std::to_string(n_past)},{"generation_host_wall_s",json_number(elapsed(decode_start))},
+            {"generation_sample_host_wall_s",json_number(sample_s)},
             {"eos_index",reached_eos?std::to_string(predicted.size()-1):"null"},
             {"host_wall_s",json_number(elapsed(generation_start))}});
+#else
+        double step_build_s=0, step_alloc_s=0, step_compute_s=0, step_copy_s=0; int step_n=0;
+        eval_step_times(step_build_s, step_alloc_s, step_compute_s, step_copy_s, step_n);
+        trace_event(trace,"t3_result","t3",{{"raw_ids",json_ids(predicted)},
+            {"raw_count_including_eos",std::to_string(predicted.size())},{"eos",reached_eos?"true":"false"},
+            {"stop_reason",json_string(reached_eos?"eos":n_past+1>model.hparams.n_ctx?"context_limit":"prediction_limit")},
+            {"n_past",std::to_string(n_past)},{"generation_host_wall_s",json_number(elapsed(decode_start))},
+            {"generation_sample_host_wall_s",json_number(sample_s)},
+            {"eval_step_count",std::to_string(step_n)},
+            {"eval_step_build_host_wall_s",json_number(step_build_s)},
+            {"eval_step_alloc_host_wall_s",json_number(step_alloc_s)},
+            {"eval_step_compute_host_wall_s",json_number(step_compute_s)},
+            {"eval_step_copy_host_wall_s",json_number(step_copy_s)},
+            {"eos_index",reached_eos?std::to_string(predicted.size()-1):"null"},
+            {"host_wall_s",json_number(elapsed(generation_start))}});
+#endif
         trace_tokens(trace,"t3",predicted);
 #if defined(TTS_FAMILY_V3)
         if (predicted.empty()) throw std::runtime_error("T3 produced no tokens");

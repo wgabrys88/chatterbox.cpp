@@ -4,6 +4,7 @@
 #include "gguf.h"
 #include "ggml-vulkan.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -19,6 +20,21 @@
 
 using namespace tts_cpp::chatterbox::detail;
 namespace tts_cpp::chatterbox::detail {
+namespace {
+thread_local double g_step_build_s = 0, g_step_alloc_s = 0, g_step_compute_s = 0, g_step_copy_s = 0;
+thread_local int g_step_n = 0;
+using StepClock = std::chrono::steady_clock;
+inline double step_elapsed(StepClock::time_point start) {
+    return std::chrono::duration<double>(StepClock::now() - start).count();
+}
+}
+void reset_eval_step_times() {
+    g_step_build_s = g_step_alloc_s = g_step_compute_s = g_step_copy_s = 0;
+    g_step_n = 0;
+}
+void eval_step_times(double & build_s, double & alloc_s, double & compute_s, double & copy_s, int & n) {
+    build_s = g_step_build_s; alloc_s = g_step_alloc_s; compute_s = g_step_compute_s; copy_s = g_step_copy_s; n = g_step_n;
+}
 
 static int64_t require_key(const gguf_context * ctx, const char * key) {
     int64_t id = gguf_find_key(ctx, key);
@@ -300,16 +316,25 @@ void eval_prompt(
 void eval_step(
     const chatterbox_model & model, ggml_gallocr_t allocr,
     int n_past, int32_t token, std::vector<float> & logits_out) {
+    auto t0 = StepClock::now();
     ggml_cgraph * gf = build_step_graph(model, n_past);
+    g_step_build_s += step_elapsed(t0);
+    t0 = StepClock::now();
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
     int32_t position = n_past;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), &position, 0, sizeof(position));
+    g_step_alloc_s += step_elapsed(t0);
+    t0 = StepClock::now();
     if (ggml_backend_graph_compute(model.backend, gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("T3 step failed");
+    g_step_compute_s += step_elapsed(t0);
+    t0 = StepClock::now();
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);
     ggml_backend_tensor_get(logits, logits_out.data(), 0, (size_t)model.hparams.n_speech_vocab*sizeof(float));
+    g_step_copy_s += step_elapsed(t0);
+    ++g_step_n;
 }
 int32_t sample_next_token_ex(
     const std::vector<float> & logits,
