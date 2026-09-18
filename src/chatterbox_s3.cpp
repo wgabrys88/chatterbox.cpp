@@ -1233,7 +1233,7 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens, t
             }
 #else
         auto t_emb = compute_time_mixed(m, compute_time_mlp(m, t), compute_time_mlp(m, r));
-        std::vector<float> dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, true);
+        std::vector<float> dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu, false);
         for (size_t i = 0; i < z.size(); ++i) z[i] += dt * dxdt[i];
 #endif
     }
