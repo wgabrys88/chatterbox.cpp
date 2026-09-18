@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-import json, re, sys
+import argparse, json, re, sys
 from pathlib import Path
 import gguf, numpy as np, torch
 from safetensors.torch import load_file
-from quant_policy import QUANT_TYPE, should_quantize
-QUANT = "q4_0"
+from quant_policy import WEIGHT_TYPES, add_weight
 TEXT_VOCAB_SIZE = 2454
 def as_numpy(tensor, *, dtype=None):
     if dtype is not None: tensor = tensor.to(dtype)
@@ -22,20 +21,25 @@ def expand_weight_norm(state):
         out.pop(f"{p}.parametrizations.weight.original0", None)
         out.pop(f"{p}.parametrizations.weight.original1", None)
     return out
+
+class TrackingState(dict):
+    def __init__(self, source):
+        super().__init__(source)
+        self.used = set()
+    def __getitem__(self, key):
+        self.used.add(key)
+        return super().__getitem__(key)
+    def mark(self, key):
+        if key in self:
+            self.used.add(key)
 def must_f32(name):
-    return any(s in name for s in ("flow/input_embedding", "flow/spk_embed_affine/", "/builtin/", "s3gen/mel_fb/", "campplus/", "s3tokv2/"))
-def add(writer, name, arr):
-    if arr.dtype.kind in "iu" or np.issubdtype(arr.dtype, np.integer):
-        writer.add_tensor(name, arr); return
-    if must_f32(name):
-        writer.add_tensor(name, np.ascontiguousarray(arr.astype(np.float32))); return
-    qtype = QUANT_TYPE[QUANT]
-    if not should_quantize(name, arr.shape, qtype):
-        writer.add_tensor(name, np.ascontiguousarray(arr.astype(np.float16)) if arr.ndim == 3 else arr)
-        return
-    qdata = gguf.quants.quantize(np.ascontiguousarray(arr.astype(np.float32)), qtype)
-    writer.add_tensor(name, qdata, raw_shape=qdata.shape, raw_dtype=qtype)
-def export_conformer_block(writer, state, prefix, gguf_prefix):
+    return any(s in name for s in (
+        "flow/input_embedding", "flow/spk_embed_affine/", "/builtin/", "s3gen/mel_fb/",
+        "campplus/", "s3tokv2/", "cfm/", "hift/",
+    ))
+def add(writer, name, arr, weight_type):
+    return add_weight(writer, name, arr, weight_type, force_f32=must_f32(name) or arr.ndim <= 1)
+def export_conformer_block(writer, state, prefix, gguf_prefix, weight_type):
     mapping = {
         "norm_mha.weight": "norm_mha/w", "norm_mha.bias": "norm_mha/b",
         "norm_ff.weight": "norm_ff/w", "norm_ff.bias": "norm_ff/b",
@@ -49,9 +53,14 @@ def export_conformer_block(writer, state, prefix, gguf_prefix):
         "feed_forward.w_2.weight": "ff/w2/w", "feed_forward.w_2.bias": "ff/w2/b",
     }
     for src_suffix, dst_suffix in mapping.items():
-        add(writer, f"{gguf_prefix}/{dst_suffix}", as_numpy(state[f"{prefix}.{src_suffix}"], dtype=torch.float32))
+        add(writer, f"{gguf_prefix}/{dst_suffix}", as_numpy(state[f"{prefix}.{src_suffix}"], dtype=torch.float32), weight_type)
 def main():
-    ckpt_dir, out = Path(sys.argv[1]), Path(sys.argv[2])
+    p = argparse.ArgumentParser()
+    p.add_argument("ckpt_dir")
+    p.add_argument("out")
+    p.add_argument("--weight-type", required=True, choices=WEIGHT_TYPES)
+    a = p.parse_args()
+    ckpt_dir, out = Path(a.ckpt_dir), Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     tok = json.loads((ckpt_dir / "grapheme_mtl_merged_expanded_v1.json").read_text(encoding="utf-8"))
     vocab = tok["model"]["vocab"]
@@ -71,9 +80,10 @@ def main():
     mixer = [name for name in raw if "time_embed_mixer" in name]
     if mixer:
         raise SystemExit("time_embed_mixer present")
-    state = expand_weight_norm(raw)
+    state = TrackingState(expand_weight_norm(raw))
     gen = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)["gen"]
     writer = gguf.GGUFWriter(str(out), "chatterbox-s3gen")
+    writer.add_string("s3gen.conversion.weight_type", a.weight_type)
     writer.add_uint32("s3gen.speech_vocab_size", 6561)
     writer.add_uint32("s3gen.input_size", 512)
     writer.add_uint32("s3gen.output_size", 80)
@@ -91,40 +101,40 @@ def main():
     embedding = gen["embedding"].squeeze(0)
     writer.add_uint32("s3gen.builtin.prompt_token_len", int(prompt_token.numel()))
     writer.add_uint32("s3gen.builtin.prompt_feat_frames", int(prompt_feat.shape[0]))
-    add(writer, "s3gen/builtin/prompt_token", as_numpy(prompt_token))
-    add(writer, "s3gen/builtin/prompt_feat", as_numpy(prompt_feat, dtype=torch.float32))
-    add(writer, "s3gen/builtin/embedding", as_numpy(embedding, dtype=torch.float32))
-    add(writer, "flow/input_embedding", as_numpy(state["flow.input_embedding.weight"]))
-    add(writer, "flow/spk_embed_affine/w", as_numpy(state["flow.spk_embed_affine_layer.weight"]))
-    add(writer, "flow/spk_embed_affine/b", as_numpy(state["flow.spk_embed_affine_layer.bias"]))
-    add(writer, "flow/encoder_proj/w", as_numpy(state["flow.encoder_proj.weight"]))
-    add(writer, "flow/encoder_proj/b", as_numpy(state["flow.encoder_proj.bias"]))
-    add(writer, "flow/encoder/embed/linear/w", as_numpy(state["flow.encoder.embed.out.0.weight"]))
-    add(writer, "flow/encoder/embed/linear/b", as_numpy(state["flow.encoder.embed.out.0.bias"]))
-    add(writer, "flow/encoder/embed/norm/w", as_numpy(state["flow.encoder.embed.out.1.weight"]))
-    add(writer, "flow/encoder/embed/norm/b", as_numpy(state["flow.encoder.embed.out.1.bias"]))
-    add(writer, "flow/encoder/pre_lookahead/conv1/w", as_numpy(state["flow.encoder.pre_lookahead_layer.conv1.weight"]))
-    add(writer, "flow/encoder/pre_lookahead/conv1/b", as_numpy(state["flow.encoder.pre_lookahead_layer.conv1.bias"]))
-    add(writer, "flow/encoder/pre_lookahead/conv2/w", as_numpy(state["flow.encoder.pre_lookahead_layer.conv2.weight"]))
-    add(writer, "flow/encoder/pre_lookahead/conv2/b", as_numpy(state["flow.encoder.pre_lookahead_layer.conv2.bias"]))
+    add(writer, "s3gen/builtin/prompt_token", as_numpy(prompt_token), a.weight_type)
+    add(writer, "s3gen/builtin/prompt_feat", as_numpy(prompt_feat, dtype=torch.float32), a.weight_type)
+    add(writer, "s3gen/builtin/embedding", as_numpy(embedding, dtype=torch.float32), a.weight_type)
+    add(writer, "flow/input_embedding", as_numpy(state["flow.input_embedding.weight"]), a.weight_type)
+    add(writer, "flow/spk_embed_affine/w", as_numpy(state["flow.spk_embed_affine_layer.weight"]), a.weight_type)
+    add(writer, "flow/spk_embed_affine/b", as_numpy(state["flow.spk_embed_affine_layer.bias"]), a.weight_type)
+    add(writer, "flow/encoder_proj/w", as_numpy(state["flow.encoder_proj.weight"]), a.weight_type)
+    add(writer, "flow/encoder_proj/b", as_numpy(state["flow.encoder_proj.bias"]), a.weight_type)
+    add(writer, "flow/encoder/embed/linear/w", as_numpy(state["flow.encoder.embed.out.0.weight"]), a.weight_type)
+    add(writer, "flow/encoder/embed/linear/b", as_numpy(state["flow.encoder.embed.out.0.bias"]), a.weight_type)
+    add(writer, "flow/encoder/embed/norm/w", as_numpy(state["flow.encoder.embed.out.1.weight"]), a.weight_type)
+    add(writer, "flow/encoder/embed/norm/b", as_numpy(state["flow.encoder.embed.out.1.bias"]), a.weight_type)
+    add(writer, "flow/encoder/pre_lookahead/conv1/w", as_numpy(state["flow.encoder.pre_lookahead_layer.conv1.weight"]), a.weight_type)
+    add(writer, "flow/encoder/pre_lookahead/conv1/b", as_numpy(state["flow.encoder.pre_lookahead_layer.conv1.bias"]), a.weight_type)
+    add(writer, "flow/encoder/pre_lookahead/conv2/w", as_numpy(state["flow.encoder.pre_lookahead_layer.conv2.weight"]), a.weight_type)
+    add(writer, "flow/encoder/pre_lookahead/conv2/b", as_numpy(state["flow.encoder.pre_lookahead_layer.conv2.bias"]), a.weight_type)
     for i in range(6):
-        export_conformer_block(writer, state, f"flow.encoder.encoders.{i}", f"flow/encoder/block{i}")
-    add(writer, "flow/encoder/up_layer/conv/w", as_numpy(state["flow.encoder.up_layer.conv.weight"]))
-    add(writer, "flow/encoder/up_layer/conv/b", as_numpy(state["flow.encoder.up_layer.conv.bias"]))
-    add(writer, "flow/encoder/up_embed/linear/w", as_numpy(state["flow.encoder.up_embed.out.0.weight"]))
-    add(writer, "flow/encoder/up_embed/linear/b", as_numpy(state["flow.encoder.up_embed.out.0.bias"]))
-    add(writer, "flow/encoder/up_embed/norm/w", as_numpy(state["flow.encoder.up_embed.out.1.weight"]))
-    add(writer, "flow/encoder/up_embed/norm/b", as_numpy(state["flow.encoder.up_embed.out.1.bias"]))
+        export_conformer_block(writer, state, f"flow.encoder.encoders.{i}", f"flow/encoder/block{i}", a.weight_type)
+    add(writer, "flow/encoder/up_layer/conv/w", as_numpy(state["flow.encoder.up_layer.conv.weight"]), a.weight_type)
+    add(writer, "flow/encoder/up_layer/conv/b", as_numpy(state["flow.encoder.up_layer.conv.bias"]), a.weight_type)
+    add(writer, "flow/encoder/up_embed/linear/w", as_numpy(state["flow.encoder.up_embed.out.0.weight"]), a.weight_type)
+    add(writer, "flow/encoder/up_embed/linear/b", as_numpy(state["flow.encoder.up_embed.out.0.bias"]), a.weight_type)
+    add(writer, "flow/encoder/up_embed/norm/w", as_numpy(state["flow.encoder.up_embed.out.1.weight"]), a.weight_type)
+    add(writer, "flow/encoder/up_embed/norm/b", as_numpy(state["flow.encoder.up_embed.out.1.bias"]), a.weight_type)
     for i in range(4):
-        export_conformer_block(writer, state, f"flow.encoder.up_encoders.{i}", f"flow/encoder/up_block{i}")
-    add(writer, "flow/encoder/after_norm/w", as_numpy(state["flow.encoder.after_norm.weight"]))
-    add(writer, "flow/encoder/after_norm/b", as_numpy(state["flow.encoder.after_norm.bias"]))
+        export_conformer_block(writer, state, f"flow.encoder.up_encoders.{i}", f"flow/encoder/up_block{i}", a.weight_type)
+    add(writer, "flow/encoder/after_norm/w", as_numpy(state["flow.encoder.after_norm.weight"]), a.weight_type)
+    add(writer, "flow/encoder/after_norm/b", as_numpy(state["flow.encoder.after_norm.bias"]), a.weight_type)
     for k in sorted(k for k in state if k.startswith("flow.decoder.estimator.")):
-        add(writer, k.replace("flow.decoder.estimator.", "cfm/").replace(".", "/"), as_numpy(state[k], dtype=torch.float32))
+        add(writer, k.replace("flow.decoder.estimator.", "cfm/").replace(".", "/"), as_numpy(state[k], dtype=torch.float32), a.weight_type)
     for k in sorted(k for k in state if k.startswith("mel2wav.")):
-        add(writer, k.replace("mel2wav.", "hift/").replace(".", "/"), as_numpy(state[k], dtype=torch.float32))
+        add(writer, k.replace("mel2wav.", "hift/").replace(".", "/"), as_numpy(state[k], dtype=torch.float32), a.weight_type)
     import librosa
-    add(writer, "s3gen/mel_fb/24k_80", np.ascontiguousarray(librosa.filters.mel(sr=24000, n_fft=1920, n_mels=80, fmin=0, fmax=8000).astype(np.float32)))
+    add(writer, "s3gen/mel_fb/24k_80", np.ascontiguousarray(librosa.filters.mel(sr=24000, n_fft=1920, n_mels=80, fmin=0, fmax=8000).astype(np.float32)), a.weight_type)
     speaker_keys = [k for k in state if k.startswith("speaker_encoder.")]
     BN_EPS = 1e-5
     bn_groups = {}
@@ -148,10 +158,10 @@ def main():
                 beta = grp["bias"].float() if "bias" in grp else torch.zeros_like(mean)
                 scale = gamma / denom
                 shift = beta - mean * scale
-                add(writer, gguf_base + "/s", np.ascontiguousarray(scale.numpy().astype(np.float32)))
-                add(writer, gguf_base + "/b", np.ascontiguousarray(shift.numpy().astype(np.float32)))
+                add(writer, gguf_base + "/s", np.ascontiguousarray(scale.numpy().astype(np.float32)), a.weight_type)
+                add(writer, gguf_base + "/b", np.ascontiguousarray(shift.numpy().astype(np.float32)), a.weight_type)
             continue
-        add(writer, "campplus/" + k.removeprefix("speaker_encoder.").replace(".", "/"), as_numpy(state[k], dtype=torch.float32))
+        add(writer, "campplus/" + k.removeprefix("speaker_encoder.").replace(".", "/"), as_numpy(state[k], dtype=torch.float32), a.weight_type)
     writer.add_uint32("campplus.feat_dim", 80)
     writer.add_uint32("campplus.embedding_size", 192)
     writer.add_uint32("campplus.growth_rate", 32)
@@ -179,12 +189,12 @@ def main():
         for k, mb in enumerate(bin_mel):
             if mb < mel_lo or mb > mel_hi: continue
             kaldi_fb[m, k] = (mb - mel_lo) / (mel_center - mel_lo) if mb <= mel_center else (mel_hi - mb) / (mel_hi - mel_center)
-    add(writer, "campplus/mel_fb_kaldi_80", np.ascontiguousarray(kaldi_fb))
+    add(writer, "campplus/mel_fb_kaldi_80", np.ascontiguousarray(kaldi_fb), a.weight_type)
     for k in [k for k in state if k.startswith("tokenizer.")]:
         rest = k[len("tokenizer."):]
         if rest in ("window", "_mel_filters"): continue
-        add(writer, "s3tokv2/" + rest.replace(".", "/"), as_numpy(state[k], dtype=torch.float32))
-    add(writer, "s3tokv2/mel_fb", np.ascontiguousarray(librosa.filters.mel(sr=16000, n_fft=400, n_mels=128, fmin=0, fmax=8000).astype(np.float32)))
+        add(writer, "s3tokv2/" + rest.replace(".", "/"), as_numpy(state[k], dtype=torch.float32), a.weight_type)
+    add(writer, "s3tokv2/mel_fb", np.ascontiguousarray(librosa.filters.mel(sr=16000, n_fft=400, n_mels=128, fmin=0, fmax=8000).astype(np.float32)), a.weight_type)
     writer.add_uint32("s3tokv2.n_mels", 128)
     writer.add_uint32("s3tokv2.n_audio_state", 1280)
     writer.add_uint32("s3tokv2.n_audio_head", 20)
@@ -201,6 +211,15 @@ def main():
     writer.add_uint32("s3tokv2.sample_rate", 16000)
     writer.add_float32("s3tokv2.rope_theta", 10000.0)
     writer.add_uint32("s3tokv2.rope_max_pos", 2048)
+    for key in state:
+        if key.endswith(".num_batches_tracked") or key in ("tokenizer.window", "tokenizer._mel_filters"):
+            state.mark(key)
+    unused = sorted(set(state) - state.used)
+    if unused:
+        print("STOP unconsumed expanded s3gen keys:", file=sys.stderr)
+        for name in unused:
+            print(f"  {name}\t{tuple(state.get(name).shape)}", file=sys.stderr)
+        raise SystemExit("s3gen conversion incomplete")
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()

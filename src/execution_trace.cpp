@@ -124,7 +124,7 @@ void ExecutionTrace::write_meta(const std::string& status, Fields fields) {
     f.open(path, std::ios::binary|std::ios::trunc);
     f<<"{\"schema_version\":3"
      <<",\"run_id\":"<<json_string(id_)
-     <<",\"seed\":"<<lookup_field(fields,"seed",json_string("42"))
+     <<",\"seed\":"<<lookup_field(fields,"seed","null")
      <<",\"knobs\":"<<lookup_field(fields,"knobs","{}")
      <<",\"language_id\":"<<lookup_field(fields,"language_id","null")
      <<",\"git_heads\":{\"trident\":null,\"engine\":null,\"ggml\":null}"

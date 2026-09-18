@@ -2,18 +2,21 @@
 import argparse, json, re, sys
 from pathlib import Path
 import gguf, numpy as np, torch
+from quant_policy import WEIGHT_TYPES, add_weight
 from safetensors.torch import load_file
 TEXT_VOCAB_SIZE, SPEECH_VOCAB_SIZE = 50276, 6563
 START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, SPEAKER_EMBED_SIZE = 6561, 6562, 256
 LAYER_RE = re.compile(r"^tfmr\.h\.(\d+)\.(.+)$")
+SKIP = {"tfmr.wte.weight"}
 def as_numpy(tensor, *, dtype=None, transpose=False):
     if dtype is not None: tensor = tensor.to(dtype)
     array = tensor.detach().cpu().numpy()
     if transpose: array = array.T
     return np.ascontiguousarray(array)
-def add(writer, name, array):
-    dtype = np.float16 if name.startswith("model/h") and name.endswith(("/attn/c_attn/w", "/attn/c_proj/w", "/mlp/c_fc/w", "/mlp/c_proj/w")) else np.float32
-    writer.add_tensor(name, np.ascontiguousarray(array.astype(dtype)))
+MATRIX_SUFFIXES = ("/attn/c_attn/w", "/attn/c_proj/w", "/mlp/c_fc/w", "/mlp/c_proj/w")
+def add(writer, name, array, matrix_type):
+    is_matrix = name.startswith("model/h") and name.endswith(MATRIX_SUFFIXES)
+    add_weight(writer, name, array, matrix_type, force_f32=not is_matrix)
 
 def tokenizer(ckpt_dir):
     vocab = json.loads((ckpt_dir / "vocab.json").read_text(encoding="utf-8"))
@@ -40,7 +43,7 @@ def map_name(name):
         "cond_enc.spkr_enc.bias": ("chatterbox/cond_spkr/b", torch.float32, False),
     }
     if name in table: return table[name]
-    if name == "tfmr.wte.weight": return None
+    if name in SKIP: return None
     m = LAYER_RE.match(name)
     if not m: return None
     layers = {
@@ -65,10 +68,17 @@ def main():
     p.add_argument("ckpt_dir")
     p.add_argument("out")
     p.add_argument("t3_safetensors")
+    p.add_argument("--matrix-type", required=True, choices=WEIGHT_TYPES)
     a = p.parse_args()
     ckpt_dir, out = Path(a.ckpt_dir), Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     state = load_file(ckpt_dir / a.t3_safetensors)
+    unknown = [name for name in state if name not in SKIP and map_name(name) is None]
+    if unknown:
+        print("STOP unknown GPT2 T3 keys:", file=sys.stderr)
+        for name in unknown:
+            print(f"  {name}\t{tuple(state[name].shape)}", file=sys.stderr)
+        raise SystemExit("GPT2 T3 conversion incomplete")
     conds = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)
     n_embd = int(state["tfmr.ln_f.weight"].shape[0])
     n_ctx = int(state["tfmr.wpe.weight"].shape[0])
@@ -77,6 +87,7 @@ def main():
     if (n_embd, n_layer, n_head) not in {(768, 12, 12), (1024, 24, 16)} or n_ctx != 8196:
         raise SystemExit(f"expected GPT2_small 768/12/12 or GPT2_medium 1024/24/16 with n_ctx 8196, got {n_embd}/{n_layer}/{n_head} n_ctx={n_ctx}")
     writer = gguf.GGUFWriter(str(out), "chatterbox")
+    writer.add_string("chatterbox.conversion.matrix_type", a.matrix_type)
     writer.add_uint32("chatterbox.n_ctx", n_ctx)
     writer.add_uint32("chatterbox.n_embd", n_embd)
     writer.add_uint32("chatterbox.n_head", n_head)
@@ -96,7 +107,7 @@ def main():
         mapped = map_name(name)
         if mapped is None: continue
         gguf_name, dtype, transpose = mapped
-        add(writer, gguf_name, as_numpy(tensor, dtype=dtype, transpose=transpose))
+        add(writer, gguf_name, as_numpy(tensor, dtype=dtype, transpose=transpose), a.matrix_type)
     builtin_tokens = conds["t3"]["cond_prompt_speech_tokens"].reshape(-1).to(torch.int32)
     writer.add_uint32("chatterbox.cond_prompt_max", int(builtin_tokens.numel()))
     writer.add_uint32("chatterbox.cond_prompt_length", int(builtin_tokens.numel()))

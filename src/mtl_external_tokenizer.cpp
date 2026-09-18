@@ -1,11 +1,13 @@
 #include "mtl_external_tokenizer.h"
 #include <windows.h>
+#include <algorithm>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
 namespace {
 std::wstring wide(const std::string & s) {
     if (s.empty()) return {};
@@ -16,6 +18,7 @@ std::wstring wide(const std::string & s) {
         throw std::runtime_error("UTF-8 path conversion");
     return out;
 }
+
 std::wstring quote(const std::wstring & arg) {
     std::wstring out = L"\"";
     size_t slashes = 0;
@@ -35,75 +38,142 @@ std::wstring quote(const std::wstring & arg) {
     out.push_back(L'\"');
     return out;
 }
-std::filesystem::path temp_file(const wchar_t * prefix) {
-    wchar_t dir[MAX_PATH + 1]{};
-    const DWORD n = GetTempPathW(MAX_PATH, dir);
-    if (!n || n > MAX_PATH) throw std::runtime_error("GetTempPathW");
-    wchar_t file[MAX_PATH + 1]{};
-    if (!GetTempFileNameW(dir, prefix, 0, file)) throw std::runtime_error("GetTempFileNameW");
-    return std::filesystem::path(file);
-}
-struct TempPair {
-    std::filesystem::path input = temp_file(L"mtl"), output = temp_file(L"mto");
-    ~TempPair() { std::error_code ec; std::filesystem::remove(input, ec); std::filesystem::remove(output, ec); }
-};
-void run(const mtl_external_tokenizer_options & o, const std::string & mode, const std::string & language, const std::filesystem::path & input, const std::filesystem::path & output) {
-    std::vector<std::wstring> args = {
-        wide(o.python), wide(o.script), L"--mode", wide(mode), L"--source", wide(o.source), L"--tts-source", wide(o.tts_source),
-        L"--tokenizer", wide(o.tokenizer_json), L"--cangjie", wide(o.cangjie_json), L"--dicta-model", wide(o.dicta_model),
-        L"--language", wide(language), L"--input", input.wstring(), L"--output", output.wstring()
-    };
-    std::wstring cmd;
-    for (const auto & arg : args) { if (!cmd.empty()) cmd.push_back(L' '); cmd += quote(arg); }
-    STARTUPINFOW si{}; si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    std::vector<wchar_t> mutable_cmd(cmd.begin(), cmd.end()); mutable_cmd.push_back(L'\0');
-    if (!CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
-        throw std::runtime_error("official tokenizer process start");
-    CloseHandle(pi.hThread);
-    const DWORD wait = WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 1;
-    if (wait != WAIT_OBJECT_0 || !GetExitCodeProcess(pi.hProcess, &code)) { CloseHandle(pi.hProcess); throw std::runtime_error("official tokenizer process wait"); }
-    CloseHandle(pi.hProcess);
-    if (code != 0) throw std::runtime_error("official tokenizer process failed");
-}
-template <typename T> T read_scalar(std::ifstream & f) {
+
+template <typename T> T take_scalar(const std::vector<uint8_t> & data, size_t & offset) {
+    if (offset + sizeof(T) > data.size()) throw std::runtime_error("official tokenizer response truncated");
     T value{};
-    f.read(reinterpret_cast<char *>(&value), sizeof(value));
-    if (!f) throw std::runtime_error("official tokenizer output truncated");
+    std::memcpy(&value, data.data() + offset, sizeof(T));
+    offset += sizeof(T);
     return value;
 }
+
+void write_all(HANDLE h, const void * data, size_t size) {
+    const auto * p = static_cast<const uint8_t *>(data);
+    while (size) {
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(size, std::numeric_limits<DWORD>::max()));
+        DWORD written = 0;
+        if (!WriteFile(h, p, chunk, &written, nullptr) || !written) throw std::runtime_error("official tokenizer pipe write");
+        p += written;
+        size -= written;
+    }
 }
 
-std::string mtl_external_punc_norm(const mtl_external_tokenizer_options & o, const std::string & text) {
-    TempPair files;
-    { std::ofstream f(files.input, std::ios::binary | std::ios::trunc); f.write(text.data(), static_cast<std::streamsize>(text.size())); if (!f) throw std::runtime_error("official punctuation input write"); }
-    run(o, "punc", "", files.input, files.output);
-    std::ifstream f(files.output, std::ios::binary | std::ios::ate);
-    const auto size = f.tellg();
-    if (size < 0) throw std::runtime_error("official punctuation output");
-    std::string result(static_cast<size_t>(size), '\0');
-    f.seekg(0);
-    if (size && !f.read(result.data(), static_cast<std::streamsize>(size))) throw std::runtime_error("official punctuation output");
-    return result;
+void read_all(HANDLE h, void * data, size_t size) {
+    auto * p = static_cast<uint8_t *>(data);
+    while (size) {
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(size, std::numeric_limits<DWORD>::max()));
+        DWORD got = 0;
+        if (!ReadFile(h, p, chunk, &got, nullptr) || !got) throw std::runtime_error("official tokenizer pipe read");
+        p += got;
+        size -= got;
+    }
 }
-mtl_external_tokenizer_result mtl_external_tokenize(const mtl_external_tokenizer_options & o, const std::string & text, const std::string & language) {
-    TempPair files;
-    { std::ofstream f(files.input, std::ios::binary | std::ios::trunc); f.write(text.data(), static_cast<std::streamsize>(text.size())); if (!f) throw std::runtime_error("official tokenizer input write"); }
-    run(o, "tokenize", language, files.input, files.output);
-    std::ifstream f(files.output, std::ios::binary);
-    const uint32_t magic = read_scalar<uint32_t>(f);
-    if (magic != 0x344c544dU) throw std::runtime_error("official tokenizer output magic");
-    const uint32_t text_size = read_scalar<uint32_t>(f);
-    const uint32_t count = read_scalar<uint32_t>(f);
+
+struct PipePair {
+    HANDLE parent_write = nullptr;
+    HANDLE parent_read = nullptr;
+    HANDLE child_read = nullptr;
+    HANDLE child_write = nullptr;
+    ~PipePair() {
+        for (HANDLE h : {parent_write, parent_read, child_read, child_write}) if (h) CloseHandle(h);
+    }
+};
+}
+
+struct mtl_external_tokenizer::Impl {
+    HANDLE input = nullptr;
+    HANDLE output = nullptr;
+    HANDLE process = nullptr;
+
+    Impl(const mtl_external_tokenizer_options & o, const std::string & language) {
+        PipePair pipes;
+        SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+        if (!CreatePipe(&pipes.child_read, &pipes.parent_write, &sa, 0)) throw std::runtime_error("official tokenizer stdin pipe");
+        if (!CreatePipe(&pipes.parent_read, &pipes.child_write, &sa, 0)) throw std::runtime_error("official tokenizer stdout pipe");
+        if (!SetHandleInformation(pipes.parent_write, HANDLE_FLAG_INHERIT, 0) || !SetHandleInformation(pipes.parent_read, HANDLE_FLAG_INHERIT, 0))
+            throw std::runtime_error("official tokenizer pipe inheritance");
+
+        std::vector<std::wstring> args = {
+            wide(o.python), wide(o.script), L"--source", wide(o.source), L"--tts-source", wide(o.tts_source),
+            L"--tokenizer", wide(o.tokenizer_json), L"--cangjie", wide(o.cangjie_json), L"--dicta-model", wide(o.dicta_model),
+            L"--language", wide(language),
+        };
+        std::wstring command;
+        for (const auto & arg : args) { if (!command.empty()) command.push_back(L' '); command += quote(arg); }
+        std::vector<wchar_t> mutable_command(command.begin(), command.end());
+        mutable_command.push_back(L'\0');
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = pipes.child_read;
+        si.hStdOutput = pipes.child_write;
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+            throw std::runtime_error("official tokenizer process start");
+        CloseHandle(pi.hThread);
+        process = pi.hProcess;
+        input = pipes.parent_write; pipes.parent_write = nullptr;
+        output = pipes.parent_read; pipes.parent_read = nullptr;
+        CloseHandle(pipes.child_read); pipes.child_read = nullptr;
+        CloseHandle(pipes.child_write); pipes.child_write = nullptr;
+        const auto ready = request('R', "");
+        if (std::string(ready.begin(), ready.end()) != "ready") throw std::runtime_error("official tokenizer readiness handshake");
+    }
+
+    ~Impl() {
+        if (input) { CloseHandle(input); input = nullptr; }
+        if (process) {
+            const DWORD wait = WaitForSingleObject(process, 3000);
+            if (wait == WAIT_TIMEOUT) {
+                TerminateProcess(process, 1);
+                WaitForSingleObject(process, 3000);
+            }
+            CloseHandle(process);
+            process = nullptr;
+        }
+        if (output) { CloseHandle(output); output = nullptr; }
+    }
+
+    std::vector<uint8_t> request(char mode, const std::string & text) {
+        if (text.size() > std::numeric_limits<uint32_t>::max()) throw std::runtime_error("official tokenizer input too large");
+        const uint32_t size = static_cast<uint32_t>(text.size());
+        write_all(input, &mode, 1);
+        write_all(input, &size, sizeof(size));
+        if (size) write_all(input, text.data(), size);
+        uint32_t status = 0, response_size = 0;
+        read_all(output, &status, sizeof(status));
+        read_all(output, &response_size, sizeof(response_size));
+        if (response_size > 128u * 1024u * 1024u) throw std::runtime_error("official tokenizer response too large");
+        std::vector<uint8_t> payload(response_size);
+        if (response_size) read_all(output, payload.data(), payload.size());
+        if (status) throw std::runtime_error("official tokenizer failed: " + std::string(payload.begin(), payload.end()));
+        return payload;
+    }
+};
+
+mtl_external_tokenizer::mtl_external_tokenizer(const mtl_external_tokenizer_options & options, const std::string & language)
+    : impl_(std::make_unique<Impl>(options, language)) {}
+mtl_external_tokenizer::~mtl_external_tokenizer() = default;
+
+std::string mtl_external_tokenizer::punctuation(const std::string & text) {
+    auto payload = impl_->request('P', text);
+    return std::string(payload.begin(), payload.end());
+}
+
+mtl_external_tokenizer_result mtl_external_tokenizer::tokenize(const std::string & text) {
+    auto payload = impl_->request('T', text);
+    size_t offset = 0;
+    const uint32_t input_size = take_scalar<uint32_t>(payload, offset);
+    if (offset + input_size > payload.size()) throw std::runtime_error("official tokenizer input response truncated");
     mtl_external_tokenizer_result result;
-    result.tokenizer_input.resize(text_size);
-    f.read(result.tokenizer_input.data(), static_cast<std::streamsize>(text_size));
-    if (!f) throw std::runtime_error("official tokenizer output text");
+    result.tokenizer_input.assign(reinterpret_cast<const char *>(payload.data() + offset), input_size);
+    offset += input_size;
+    const uint32_t count = take_scalar<uint32_t>(payload, offset);
+    if (count > (payload.size() - offset) / sizeof(int32_t)) throw std::runtime_error("official tokenizer ids truncated");
     result.ids.resize(count);
-    if (count) f.read(reinterpret_cast<char *>(result.ids.data()), static_cast<std::streamsize>(count * sizeof(int32_t)));
-    if (!f) throw std::runtime_error("official tokenizer output ids");
-    char extra;
-    if (f.read(&extra, 1)) throw std::runtime_error("official tokenizer output trailing data");
+    if (count) std::memcpy(result.ids.data(), payload.data() + offset, count * sizeof(int32_t));
+    offset += count * sizeof(int32_t);
+    if (offset != payload.size()) throw std::runtime_error("official tokenizer response trailing data");
     return result;
 }

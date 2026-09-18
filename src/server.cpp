@@ -139,7 +139,21 @@ static ServerFlags parse_flags(int argc, char** argv) {
 #endif
         throw std::runtime_error(a);
     }
+    auto require_flag = [&](const char* name) {
+        if (!seen.count(name)) throw std::runtime_error(std::string("missing required flag ") + name);
+    };
+    require_flag("--seed");
+    require_flag("--temperature");
+    require_flag("--top-p");
+    require_flag("--repeat-penalty");
+    require_flag("--n-predict");
+    require_flag("--cfm-steps");
+    require_flag("--trim-fade-samples");
 #if defined(TTS_FAMILY_V3)
+    require_flag("--min-p");
+    require_flag("--cfg-weight");
+    require_flag("--exaggeration");
+    require_flag("--cfm-cfg");
     for (char & c : flags.language) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
     if (flags.language.empty()) throw std::runtime_error("language");
     if (flags.tokenizer_python.empty() || flags.tokenizer_script.empty() || flags.tokenizer_source.empty() || flags.tokenizer_tts_source.empty() || flags.tokenizer_json.empty() || flags.cangjie_json.empty() || flags.dicta_model.empty())
@@ -150,26 +164,10 @@ static ServerFlags parse_flags(int argc, char** argv) {
 #if defined(TTS_FAMILY_V3)
     if(k.min_p<0 || k.min_p>1)throw std::runtime_error("V3 argument out of range");
 #else
+    require_flag("--top-k");
     if(k.top_k<0)throw std::runtime_error("top-k out of range");
 #endif
     return flags;
-}
-
-static std::string knob_list() {
-    const auto& k = tts_cpp::chatterbox::detail::runtime_knobs();
-    char buf[768];
-#if defined(TTS_FAMILY_V3)
-    const int n = std::snprintf(buf, sizeof(buf),
-        "seed=%d temperature=%g top_p=%g repeat_penalty=%g n_predict=%d min_p=%g cfg_weight=%g exaggeration=%g cfm_steps=%d cfm_cfg=%g trim_fade_samples=%d",
-        k.seed, k.temperature, k.top_p, k.repeat_penalty, k.n_predict,
-        k.min_p, k.cfg_weight, k.exaggeration, k.cfm_steps, k.cfm_cfg, k.trim_fade);
-#else
-    const int n = std::snprintf(buf, sizeof(buf),
-        "seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d trim_fade_samples=%d",
-        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict, k.cfm_steps, k.trim_fade);
-#endif
-    if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("knobs");
-    return std::string(buf, (size_t)n);
 }
 
 static std::string knobs_json() {
@@ -202,7 +200,7 @@ static std::string stats_line(const tts_cpp::chatterbox::SynthesizeStats& s) {
         "predicted=%d dropped=%d eos=%d n_past=%d units=%d text_tokens=%d max_unit_predicted=%d ",
         s.predicted_count, s.dropped_count, s.eos, s.n_past, s.units, s.text_tokens, s.max_unit_predicted);
     if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("stats");
-    return std::string(buf, (size_t)n) + knob_list() + "\n";
+    return std::string(buf, (size_t)n) + "\n";
 }
 
 static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOptions& options) {
@@ -224,7 +222,7 @@ static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOption
         if(!read_exact(h,text.data(),DWORD(size)))throw std::runtime_error("truncated text payload");
         validate_utf8(text);
         trace->event("request_start","request",{{"original_text",json_string(text)},{"input_sha256",json_string(sha256_text(text))},
-            {"utf8_bytes",std::to_string(text.size())},{"effective_knobs",json_string(knob_list())},
+            {"utf8_bytes",std::to_string(text.size())},{"effective_knobs",knobs_json()},
             {"language",json_string(options.language_id)},{"output",json_string(path)}});
         stage="model_load";
         if(!tts){auto start=TraceClock::now();trace->event("model_load_start",stage);
@@ -282,7 +280,7 @@ int main(int argc,char** argv) {
     try {
         if(argc<4)throw std::runtime_error("usage: chatterbox-server T3 S3 PIPE [flags]");
         const auto flags=parse_flags(argc,argv);
-        std::fprintf(stderr,"knobs %s\n",knob_list().c_str());std::fflush(stderr);
+        std::fprintf(stderr,"knobs %s\n",knobs_json().c_str());std::fflush(stderr);
         HANDLE h=CreateNamedPipeA(argv[3],PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,4096,4096,0,nullptr);
         if(h==INVALID_HANDLE_VALUE)throw std::runtime_error("pipe create");

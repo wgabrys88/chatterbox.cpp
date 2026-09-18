@@ -1,33 +1,27 @@
 #pragma once
+#include <climits>
+#include <limits>
+namespace tts_cpp::chatterbox::detail {
+struct RuntimeKnobs {
+    float repeat_penalty = std::numeric_limits<float>::quiet_NaN();
+    float temperature = std::numeric_limits<float>::quiet_NaN();
+    float top_p = std::numeric_limits<float>::quiet_NaN();
+    int seed = INT_MIN;
+    int n_predict = INT_MIN;
+    int cfm_steps = INT_MIN;
+    int trim_fade = INT_MIN;
 #if defined(TTS_FAMILY_GPT2)
-#include "tts-cpp/chatterbox/gpt2.h"
+    int top_k = INT_MIN;
 #elif defined(TTS_FAMILY_V3)
-#include "tts-cpp/chatterbox/v3.h"
+    float min_p = std::numeric_limits<float>::quiet_NaN();
+    float cfg_weight = std::numeric_limits<float>::quiet_NaN();
+    float exaggeration = std::numeric_limits<float>::quiet_NaN();
+    float cfm_cfg = std::numeric_limits<float>::quiet_NaN();
 #else
 #error TTS_FAMILY must be gpt2 or v3
 #endif
-namespace tts_cpp::chatterbox::detail {
-struct RuntimeKnobs {
-    float repeat_penalty = REPEAT_PENALTY;
-    float temperature = TEMPERATURE;
-    float top_p = TOP_P;
-    int seed = SEED;
-    int n_predict = N_PREDICT;
-    int cfm_steps = CFM_STEPS;
-    int trim_fade = TRIM_FADE;
-#if defined(TTS_FAMILY_GPT2)
-    int top_k = TOP_K;
-#elif defined(TTS_FAMILY_V3)
-    float min_p = MIN_P;
-    float cfg_weight = CFG_WEIGHT;
-    float exaggeration = EXAGGERATION;
-    float cfm_cfg = CFM_CFG;
-#endif
 };
-inline RuntimeKnobs& runtime_knobs() {
-    static RuntimeKnobs k;
-    return k;
-}
+inline RuntimeKnobs& runtime_knobs() { static RuntimeKnobs k; return k; }
 inline float effective_repeat_penalty() { return runtime_knobs().repeat_penalty; }
 inline float effective_temperature() { return runtime_knobs().temperature; }
 inline float effective_top_p() { return runtime_knobs().top_p; }

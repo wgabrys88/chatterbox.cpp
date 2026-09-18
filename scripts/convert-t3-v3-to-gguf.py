@@ -2,11 +2,12 @@
 import argparse, hashlib, json, math, re, sys
 from pathlib import Path
 import gguf, numpy as np, torch
+from quant_policy import WEIGHT_TYPES, add_weight
 from tokenizers import Tokenizer
 from safetensors.torch import load_file
 SPEECH_VOCAB_SIZE = 8194
 START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, SPEAKER_EMBED_SIZE = 6561, 6562, 256
-N_PREDICT = 4096
+MAX_GENERATION_TOKENS = 4096
 ROPE_THETA, ROPE_ORIG_CTX = 500000.0, 8192
 ROPE_FACTOR, ROPE_HIGH, ROPE_LOW = 8.0, 4.0, 1.0
 LAYER_RE = re.compile(r"^tfmr\.layers\.(\d+)\.(.+)$")
@@ -31,9 +32,11 @@ def llama3_freq_factors(n_dims, base, factor, low_freq_factor, high_freq_factor,
             new_inv = (1.0 - smooth) * inv / factor + smooth * inv
         out[i] = np.float32(inv / new_inv)
     return out
-def add(writer, name, array):
-    dtype = np.float16 if name.startswith("model/h") and name.endswith(("/attn/q/w", "/attn/k/w", "/attn/v/w", "/attn/o/w", "/ffn/gate/w", "/ffn/up/w", "/ffn/down/w")) else np.float32
-    writer.add_tensor(name, np.ascontiguousarray(array.astype(dtype)))
+MATRIX_SUFFIXES = ("/attn/q/w", "/attn/k/w", "/attn/v/w", "/attn/o/w", "/ffn/gate/w", "/ffn/up/w", "/ffn/down/w")
+
+def add(writer, name, array, matrix_type):
+    is_matrix = name.startswith("model/h") and name.endswith(MATRIX_SUFFIXES)
+    add_weight(writer, name, array, matrix_type, force_f32=not is_matrix)
 
 def tokenizer_contract(ckpt_dir, text_vocab_size):
     tokenizer_path = ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"
@@ -113,6 +116,7 @@ def main():
     p.add_argument("ckpt_dir")
     p.add_argument("out")
     p.add_argument("t3_safetensors")
+    p.add_argument("--matrix-type", required=True, choices=WEIGHT_TYPES)
     a = p.parse_args()
     ckpt_dir, out = Path(a.ckpt_dir), Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -139,9 +143,9 @@ def main():
         raise SystemExit(f"v3 expected Llama_520M 1024/30/16/4096, got {n_embd}/{n_layer}/{n_head}/{n_ff}")
     if perceiver_len != 32 or text_pos_len != 2050 or speech_pos_len != 4100:
         raise SystemExit(f"v3 pos tables expected perceiver=32 text=2050 speech=4100, got {perceiver_len}/{text_pos_len}/{speech_pos_len}")
-    if speech_pos_len <= N_PREDICT:
-        raise SystemExit(f"speech_pos {speech_pos_len} must exceed N_PREDICT {N_PREDICT}")
-    n_ctx = 1 + perceiver_len + 1 + text_pos_len + 2 + N_PREDICT
+    if speech_pos_len <= MAX_GENERATION_TOKENS:
+        raise SystemExit(f"speech_pos {speech_pos_len} must exceed MAX_GENERATION_TOKENS {MAX_GENERATION_TOKENS}")
+    n_ctx = 1 + perceiver_len + 1 + text_pos_len + 2 + MAX_GENERATION_TOKENS
     tokenizer = tokenizer_contract(ckpt_dir, text_vocab_size)
     writer = gguf.GGUFWriter(str(out), "chatterbox")
     writer.add_uint32("chatterbox.n_ctx", n_ctx)
@@ -162,6 +166,7 @@ def main():
     writer.add_float32("chatterbox.rope_theta", ROPE_THETA)
     writer.add_uint32("chatterbox.rope_orig_ctx", ROPE_ORIG_CTX)
     writer.add_uint32("chatterbox.text_frontend_version", 4)
+    writer.add_string("chatterbox.conversion.matrix_type", a.matrix_type)
     writer.add_string("chatterbox.tokenizer.source_sha256", tokenizer["sha256"])
     writer.add_string("chatterbox.tokenizer.cangjie_sha256", tokenizer["cangjie_sha256"])
     writer.add_string("chatterbox.tokenizer.official_source_sha256", tokenizer["official_source_sha256"])
@@ -172,7 +177,7 @@ def main():
         mapped = map_name(name)
         if mapped is None: continue
         gguf_name, dtype = mapped
-        add(writer, gguf_name, as_numpy(tensor, dtype=dtype))
+        add(writer, gguf_name, as_numpy(tensor, dtype=dtype), a.matrix_type)
     writer.add_tensor("model/rope_freq_factors", llama3_freq_factors(64, ROPE_THETA, ROPE_FACTOR, ROPE_LOW, ROPE_HIGH, ROPE_ORIG_CTX))
     builtin_tokens = conds["t3"]["cond_prompt_speech_tokens"].reshape(-1).to(torch.int32)
     writer.add_uint32("chatterbox.cond_prompt_max", int(builtin_tokens.numel()))
