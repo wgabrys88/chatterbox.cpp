@@ -144,9 +144,10 @@ static ggml_tensor * build_transformer_core(
     const int n_embd = hp.n_embd, n_head = hp.n_head, n_layer = hp.n_layer, n_ctx = model.kv_rows;
     const int HD = n_embd / n_head;
     const int64_t L = n_past + N;
+    const size_t kv_ts = ggml_type_size(model.memory_k->type);
     const size_t kv_layer_elems  = (size_t) HD * n_ctx * n_head;
-    const size_t kv_head_stride  = (size_t) HD * n_ctx * sizeof(float);
-    const size_t kv_pos_stride   = (size_t) HD * sizeof(float);
+    const size_t kv_head_stride  = (size_t) HD * n_ctx * kv_ts;
+    const size_t kv_pos_stride   = (size_t) HD * kv_ts;
     ggml_tensor * kq_mask = nullptr;
     if (N > 1) {
         kq_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, L, N);
@@ -278,8 +279,8 @@ void eval_prompt(
         model.ctx_kv = ggml_init(kv_params);
         if (!model.ctx_kv) throw std::runtime_error("T3 KV context allocation failed");
         const int64_t n_elements = (int64_t)model.hparams.n_embd * model.hparams.n_layer * rows;
-        model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
-        model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
+        model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F16, n_elements);
+        model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F16, n_elements);
         model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
         if (!model.buffer_kv) throw std::runtime_error("T3 KV buffer allocation failed");
         model.kv_rows = rows;
