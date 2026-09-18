@@ -92,9 +92,12 @@ static float parse_float(const char* s) {
     return x;
 }
 
-static std::string parse_flags(int argc, char** argv) {
+struct ServerFlags {
+    std::string language, tokenizer_python, tokenizer_script, tokenizer_source, tokenizer_tts_source, tokenizer_json, cangjie_json, dicta_model;
+};
+static ServerFlags parse_flags(int argc, char** argv) {
     auto& k = tts_cpp::chatterbox::detail::runtime_knobs();
-    std::string language;
+    ServerFlags flags;
     std::set<std::string> seen;
     int i = 4;
     while (i < argc) {
@@ -104,12 +107,21 @@ static std::string parse_flags(int argc, char** argv) {
         const char* v = argv[i++];
         if (std::strcmp(a, "--language") == 0) {
 #if defined(TTS_FAMILY_V3)
-            language = v;
+            flags.language = v;
             continue;
 #else
             throw std::runtime_error(a);
 #endif
         }
+#if defined(TTS_FAMILY_V3)
+        if (std::strcmp(a, "--tokenizer-python") == 0) { flags.tokenizer_python = v; continue; }
+        if (std::strcmp(a, "--tokenizer-script") == 0) { flags.tokenizer_script = v; continue; }
+        if (std::strcmp(a, "--tokenizer-source") == 0) { flags.tokenizer_source = v; continue; }
+        if (std::strcmp(a, "--tokenizer-tts-source") == 0) { flags.tokenizer_tts_source = v; continue; }
+        if (std::strcmp(a, "--tokenizer-json") == 0) { flags.tokenizer_json = v; continue; }
+        if (std::strcmp(a, "--cangjie-json") == 0) { flags.cangjie_json = v; continue; }
+        if (std::strcmp(a, "--dicta-model") == 0) { flags.dicta_model = v; continue; }
+#endif
         if (std::strcmp(a, "--seed") == 0) { k.seed = parse_int(v); continue; }
         if (std::strcmp(a, "--temperature") == 0) { k.temperature = parse_float(v); continue; }
         if (std::strcmp(a, "--top-p") == 0) { k.top_p = parse_float(v); continue; }
@@ -128,7 +140,10 @@ static std::string parse_flags(int argc, char** argv) {
         throw std::runtime_error(a);
     }
 #if defined(TTS_FAMILY_V3)
-    if (language.empty()) throw std::runtime_error("language");
+    for (char & c : flags.language) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
+    if (flags.language.empty()) throw std::runtime_error("language");
+    if (flags.tokenizer_python.empty() || flags.tokenizer_script.empty() || flags.tokenizer_source.empty() || flags.tokenizer_tts_source.empty() || flags.tokenizer_json.empty() || flags.cangjie_json.empty() || flags.dicta_model.empty())
+        throw std::runtime_error("official tokenizer configuration");
 #endif
     if(k.n_predict<1 || k.cfm_steps<1 || k.trim_fade<0 || k.temperature<0 || k.repeat_penalty<=0 || k.top_p<=0 || k.top_p>1)
         throw std::runtime_error("generation argument out of range");
@@ -137,7 +152,7 @@ static std::string parse_flags(int argc, char** argv) {
 #else
     if(k.top_k<0)throw std::runtime_error("top-k out of range");
 #endif
-    return language;
+    return flags;
 }
 
 static std::string knob_list() {
@@ -266,12 +281,12 @@ static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOption
 int main(int argc,char** argv) {
     try {
         if(argc<4)throw std::runtime_error("usage: chatterbox-server T3 S3 PIPE [flags]");
-        const std::string language=parse_flags(argc,argv);
+        const auto flags=parse_flags(argc,argv);
         std::fprintf(stderr,"knobs %s\n",knob_list().c_str());std::fflush(stderr);
         HANDLE h=CreateNamedPipeA(argv[3],PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,4096,4096,0,nullptr);
         if(h==INVALID_HANDLE_VALUE)throw std::runtime_error("pipe create");
-        std::unique_ptr<Engine> tts;const EngineOptions options{argv[1],argv[2],language};
+        std::unique_ptr<Engine> tts;const EngineOptions options{argv[1],argv[2],flags.language,flags.tokenizer_python,flags.tokenizer_script,flags.tokenizer_source,flags.tokenizer_tts_source,flags.tokenizer_json,flags.cangjie_json,flags.dicta_model};
         try {
             for(;;){
                 if(!ConnectNamedPipe(h,nullptr)&&GetLastError()!=ERROR_PIPE_CONNECTED)throw std::runtime_error("pipe connect");

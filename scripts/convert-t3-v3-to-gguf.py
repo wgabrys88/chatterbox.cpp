@@ -2,9 +2,9 @@
 import argparse, hashlib, json, math, re, sys
 from pathlib import Path
 import gguf, numpy as np, torch
+from tokenizers import Tokenizer
 from safetensors.torch import load_file
-TEXT_VOCAB_SIZE, SPEECH_VOCAB_SIZE = 2454, 8194
-START_TEXT_TOKEN, STOP_TEXT_TOKEN = 255, 0
+SPEECH_VOCAB_SIZE = 8194
 START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, SPEAKER_EMBED_SIZE = 6561, 6562, 256
 N_PREDICT = 4096
 ROPE_THETA, ROPE_ORIG_CTX = 500000.0, 8192
@@ -35,47 +35,39 @@ def add(writer, name, array):
     dtype = np.float16 if name.startswith("model/h") and name.endswith(("/attn/q/w", "/attn/k/w", "/attn/v/w", "/attn/o/w", "/ffn/gate/w", "/ffn/up/w", "/ffn/down/w")) else np.float32
     writer.add_tensor(name, np.ascontiguousarray(array.astype(dtype)))
 
-def tokenizer(ckpt_dir):
+def tokenizer_contract(ckpt_dir, text_vocab_size):
     tokenizer_path = ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"
+    cangjie_path = ckpt_dir / "Cangjie5_TC.json"
     tokenizer_bytes = tokenizer_path.read_bytes()
-    tok = json.loads(tokenizer_bytes.decode("utf-8"))
-    if tok.get("normalizer") is not None:
-        raise SystemExit("tokenizer normalizer contract changed")
-    if tok.get("pre_tokenizer") != {"type": "Whitespace"}:
-        raise SystemExit("tokenizer pre-tokenizer contract changed")
-    model = tok.get("model", {})
-    if model.get("type") != "BPE" or model.get("unk_token") != "[UNK]":
-        raise SystemExit("tokenizer BPE contract changed")
-    if tok.get("post_processor") is not None or tok.get("decoder") is not None:
-        raise SystemExit("tokenizer post-processing contract changed")
-    vocab = model["vocab"]
-    if not isinstance(vocab, dict):
-        raise SystemExit("tokenizer vocab")
-    id_to_tok = {int(i): t for t, i in vocab.items()}
-    added_ids = set()
-    for a in tok.get("added_tokens", []):
-        added_ids.add(int(a["id"]))
-        id_to_tok[int(a["id"])] = a["content"]
-    n = max(id_to_tok) + 1
-    if n != TEXT_VOCAB_SIZE:
-        raise SystemExit(f"tokenizer {n} != {TEXT_VOCAB_SIZE}")
-    tokens, types = [], []
-    for i in range(n):
-        tok_s = id_to_tok[i]
-        tokens.append(tok_s)
-        types.append(int(gguf.TokenType.USER_DEFINED if i in added_ids else gguf.TokenType.NORMAL))
-    merges = []
-    for m in model["merges"]:
-        if isinstance(m, str):
-            merges.append(m)
-        elif isinstance(m, list) and len(m) == 2:
-            merges.append(m[0] + " " + m[1])
-        else:
-            raise SystemExit("merge")
-    language_tokens = sorted(t for t in tokens if re.fullmatch(r"\[[a-z]{2,3}\]", t))
+    tokenizer_json = tokenizer_bytes.decode("utf-8")
+    tokenizer = Tokenizer.from_file(str(tokenizer_path))
+    vocab = tokenizer.get_vocab()
+    if not vocab:
+        raise SystemExit("empty tokenizer vocabulary")
+    ids = list(vocab.values())
+    if min(ids) < 0 or max(ids) + 1 != text_vocab_size:
+        raise SystemExit(f"tokenizer/model vocabulary mismatch: tokenizer max={max(ids)} model={text_vocab_size}")
+    for name in ("[START]", "[STOP]", "[UNK]", "[SPACE]"):
+        if name not in vocab:
+            raise SystemExit(f"tokenizer missing {name}")
+    language_tokens = sorted(t for t in vocab if re.fullmatch(r"\[[a-z]{2,3}\]", t))
     if not language_tokens:
         raise SystemExit("tokenizer has no language tokens")
-    return tokens, types, merges, hashlib.sha256(tokenizer_bytes).hexdigest(), language_tokens
+    cangjie_bytes = cangjie_path.read_bytes()
+    official_source_bytes = (ckpt_dir / "official_mtl_tokenizer.py").read_bytes()
+    official_tts_source_bytes = (ckpt_dir / "official_mtl_tts.py").read_bytes()
+    json.loads(tokenizer_json)
+    json.loads(cangjie_bytes.decode("utf-8"))
+    return {
+        "json": tokenizer_json,
+        "sha256": hashlib.sha256(tokenizer_bytes).hexdigest(),
+        "cangjie_sha256": hashlib.sha256(cangjie_bytes).hexdigest(),
+        "official_source_sha256": hashlib.sha256(official_source_bytes).hexdigest(),
+        "official_tts_source_sha256": hashlib.sha256(official_tts_source_bytes).hexdigest(),
+        "language_tokens": language_tokens,
+        "start": int(vocab["[START]"]),
+        "stop": int(vocab["[STOP]"]),
+    }
 def map_name(name):
     table = {
         "tfmr.norm.weight": ("model/norm/g", torch.float32),
@@ -140,6 +132,7 @@ def main():
     n_ff = int(state["tfmr.layers.0.mlp.gate_proj.weight"].shape[0])
     perceiver_len = int(state["cond_enc.perceiver.pre_attention_query"].shape[1])
     text_pos_len = int(state["text_pos_emb.emb.weight"].shape[0])
+    text_vocab_size = int(state["text_emb.weight"].shape[0])
     speech_pos_len = int(state["speech_pos_emb.emb.weight"].shape[0])
 
     if n_embd != 1024 or n_layer != 30 or n_head != 16 or n_ff != 4096:
@@ -149,7 +142,7 @@ def main():
     if speech_pos_len <= N_PREDICT:
         raise SystemExit(f"speech_pos {speech_pos_len} must exceed N_PREDICT {N_PREDICT}")
     n_ctx = 1 + perceiver_len + 1 + text_pos_len + 2 + N_PREDICT
-    tokens, types, merges, tokenizer_sha256, language_tokens = tokenizer(ckpt_dir)
+    tokenizer = tokenizer_contract(ckpt_dir, text_vocab_size)
     writer = gguf.GGUFWriter(str(out), "chatterbox")
     writer.add_uint32("chatterbox.n_ctx", n_ctx)
     writer.add_uint32("chatterbox.n_embd", n_embd)
@@ -158,23 +151,23 @@ def main():
     writer.add_uint32("chatterbox.n_ff", n_ff)
     writer.add_uint32("chatterbox.n_batch", 2)
     writer.add_uint32("chatterbox.perceiver_len", perceiver_len)
-    writer.add_uint32("chatterbox.text_vocab_size", TEXT_VOCAB_SIZE)
+    writer.add_uint32("chatterbox.text_vocab_size", text_vocab_size)
     writer.add_uint32("chatterbox.speech_vocab_size", SPEECH_VOCAB_SIZE)
-    writer.add_uint32("chatterbox.start_text_token", START_TEXT_TOKEN)
-    writer.add_uint32("chatterbox.stop_text_token", STOP_TEXT_TOKEN)
+    writer.add_uint32("chatterbox.start_text_token", tokenizer["start"])
+    writer.add_uint32("chatterbox.stop_text_token", tokenizer["stop"])
     writer.add_uint32("chatterbox.start_speech_token", START_SPEECH_TOKEN)
     writer.add_uint32("chatterbox.stop_speech_token", STOP_SPEECH_TOKEN)
     writer.add_uint32("chatterbox.speaker_embed_size", SPEAKER_EMBED_SIZE)
     writer.add_float32("chatterbox.layer_norm_eps", 1e-5)
     writer.add_float32("chatterbox.rope_theta", ROPE_THETA)
     writer.add_uint32("chatterbox.rope_orig_ctx", ROPE_ORIG_CTX)
-    writer.add_uint32("chatterbox.text_frontend_version", 2)
-    writer.add_string("chatterbox.tokenizer.source_sha256", tokenizer_sha256)
-    writer.add_string("chatterbox.tokenizer.language_tokens", ",".join(language_tokens))
-    writer.add_tokenizer_model("hf-bpe")
-    writer.add_token_list(tokens)
-    writer.add_token_types(types)
-    writer.add_token_merges(merges)
+    writer.add_uint32("chatterbox.text_frontend_version", 4)
+    writer.add_string("chatterbox.tokenizer.source_sha256", tokenizer["sha256"])
+    writer.add_string("chatterbox.tokenizer.cangjie_sha256", tokenizer["cangjie_sha256"])
+    writer.add_string("chatterbox.tokenizer.official_source_sha256", tokenizer["official_source_sha256"])
+    writer.add_string("chatterbox.tokenizer.official_tts_source_sha256", tokenizer["official_tts_source_sha256"])
+    writer.add_string("chatterbox.tokenizer.language_tokens", ",".join(tokenizer["language_tokens"]))
+    writer.add_string("chatterbox.tokenizer.json", tokenizer["json"])
     for name, tensor in state.items():
         mapped = map_name(name)
         if mapped is None: continue

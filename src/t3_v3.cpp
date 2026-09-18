@@ -60,8 +60,14 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
         hp.perceiver_len = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_PERCEIVER_LEN));
         hp.rope_theta    = gguf_get_val_f32(gguf_ctx, require_key(gguf_ctx, KEY_ROPE_THETA));
         hp.rope_orig_ctx = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_ROPE_ORIG_CTX));
-        if (gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_TEXT_FRONTEND)) != 2)
+        if (gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_TEXT_FRONTEND)) != 4)
             throw std::runtime_error("unsupported text frontend contract");
+        model.tokenizer_sha256 = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_TOKENIZER_SHA));
+        model.tokenizer_json = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_TOKENIZER_JSON));
+        model.cangjie_sha256 = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_CANGJIE_SHA));
+        model.official_tokenizer_sha256 = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_OFFICIAL_TOKENIZER_SHA));
+        model.official_tts_sha256 = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_OFFICIAL_TTS_SHA));
+        model.language_tokens = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_LANGUAGE_TOKENS));
         if (!model.backend) throw std::runtime_error("Vulkan backend required");
         if (hp.n_embd % hp.n_head) throw std::runtime_error("n_head");
         const int64_t num_tensors = gguf_get_n_tensors(gguf_ctx);
@@ -117,26 +123,6 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
             l.gate = require_tensor(model, (p + "/ffn/gate/w").c_str());
             l.up   = require_tensor(model, (p + "/ffn/up/w").c_str());
             l.down = require_tensor(model, (p + "/ffn/down/w").c_str());
-        }
-        {
-            const int64_t tok_kid = require_key(gguf_ctx, "tokenizer.ggml.tokens");
-            const int64_t mer_kid = require_key(gguf_ctx, "tokenizer.ggml.merges");
-            const int64_t typ_kid = require_key(gguf_ctx, "tokenizer.ggml.token_type");
-            const size_t n_tok = gguf_get_arr_n(gguf_ctx, tok_kid);
-            const size_t n_mer = gguf_get_arr_n(gguf_ctx, mer_kid);
-            const size_t n_typ = gguf_get_arr_n(gguf_ctx, typ_kid);
-            if (n_typ != n_tok) throw std::runtime_error("token_type");
-            if (gguf_get_arr_type(gguf_ctx, typ_kid) != GGUF_TYPE_INT32) throw std::runtime_error("token_type dtype");
-            const int32_t * types = (const int32_t *) gguf_get_arr_data(gguf_ctx, typ_kid);
-            model.tok_tokens.reserve(n_tok);
-            model.tok_types.reserve(n_typ);
-            for (size_t i = 0; i < n_tok; ++i) {
-                model.tok_tokens.emplace_back(gguf_get_arr_str(gguf_ctx, tok_kid, i));
-                model.tok_types.push_back(types[i]);
-            }
-            model.tok_merges.reserve(n_mer);
-            for (size_t i = 0; i < n_mer; ++i)
-                model.tok_merges.emplace_back(gguf_get_arr_str(gguf_ctx, mer_kid, i));
         }
     } catch (...) {
         gguf_free(gguf_ctx); if (tmp_ctx) ggml_free(tmp_ctx);

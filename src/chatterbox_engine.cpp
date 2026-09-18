@@ -1,7 +1,8 @@
 #include "tts-cpp/chatterbox/engine.h"
 #if defined(TTS_FAMILY_V3)
 #include "tts-cpp/chatterbox/v3.h"
-#include "mtl_bpe.h"
+#include "mtl_numbers.h"
+#include "mtl_external_tokenizer.h"
 #else
 #include "tts-cpp/chatterbox/gpt2.h"
 #include "gpt2_bpe.h"
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <cmath>
 #include <memory>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -62,6 +64,24 @@ struct Engine::Impl {
         auto load_start=TraceClock::now();
         trace_event(trace,"t3_load_start","model_load",{{"path",json_string(opts.t3_gguf_path)}});
         load_model_gguf(opts.t3_gguf_path, model);
+#if defined(TTS_FAMILY_V3)
+        if (!std::filesystem::is_regular_file(std::filesystem::u8path(opts.tokenizer_python)) ||
+            !std::filesystem::is_regular_file(std::filesystem::u8path(opts.tokenizer_script)) ||
+            !std::filesystem::is_regular_file(std::filesystem::u8path(opts.tokenizer_source)) ||
+            !std::filesystem::is_regular_file(std::filesystem::u8path(opts.tokenizer_tts_source)) ||
+            !std::filesystem::is_regular_file(std::filesystem::u8path(opts.tokenizer_json)) ||
+            !std::filesystem::is_regular_file(std::filesystem::u8path(opts.cangjie_json)) ||
+            !std::filesystem::is_regular_file(std::filesystem::u8path(opts.dicta_model)))
+            throw std::runtime_error("official tokenizer asset missing");
+        if (sha256_text(model.tokenizer_json) != model.tokenizer_sha256) throw std::runtime_error("embedded tokenizer JSON does not match converted model");
+        if (sha256_file(opts.tokenizer_json) != model.tokenizer_sha256) throw std::runtime_error("tokenizer JSON does not match converted model");
+        if (sha256_file(opts.cangjie_json) != model.cangjie_sha256) throw std::runtime_error("Cangjie mapping does not match converted model");
+        if (sha256_file(opts.tokenizer_source) != model.official_tokenizer_sha256) throw std::runtime_error("official tokenizer source does not match converted model");
+        if (sha256_file(opts.tokenizer_tts_source) != model.official_tts_sha256) throw std::runtime_error("official TTS frontend source does not match converted model");
+        trace_event(trace,"tokenizer_contract","model_load",{{"frontend_version","4"},{"tokenizer_sha256",json_string(model.tokenizer_sha256)},
+            {"cangjie_sha256",json_string(model.cangjie_sha256)},{"language_tokens",json_string(model.language_tokens)},
+            {"official_source_sha256",json_string(sha256_file(opts.tokenizer_source))},{"official_tts_source_sha256",json_string(sha256_file(opts.tokenizer_tts_source))},{"adapter_sha256",json_string(sha256_file(opts.tokenizer_script))}});
+#endif
         trace_event(trace,"t3_load_end","model_load",{{"host_wall_s",json_number(elapsed(load_start))}});
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         load_start=TraceClock::now();trace_event(trace,"s3_load_start","model_load",{{"path",json_string(opts.s3gen_gguf_path)}});
@@ -88,24 +108,33 @@ struct Engine::Impl {
             {"heads",std::to_string(model.hparams.n_head)}});
 #if defined(TTS_FAMILY_V3)
         if(opts.language_id.empty()) throw std::runtime_error("language");
-        mtl_bpe bpe;
-        if(!bpe.load_from_arrays(model.tok_tokens,model.tok_types,model.tok_merges)) throw std::runtime_error("tokenizer");
-        const auto numbers = bpe.verbalize_numbers(text, opts.language_id);
+        const std::string language_token = "[" + opts.language_id + "]";
+        const std::string language_list = "," + model.language_tokens + ",";
+        if (language_list.find("," + language_token + ",") == std::string::npos) throw std::runtime_error("language token not present in converted tokenizer");
+        const mtl_external_tokenizer_options tokenizer_opts{opts.tokenizer_python,opts.tokenizer_script,opts.tokenizer_source,opts.tokenizer_tts_source,opts.tokenizer_json,opts.cangjie_json,opts.dicta_model};
+        const std::string punctuated = mtl_external_punc_norm(tokenizer_opts, text);
+        const auto numbers = mtl_numbers{}.verbalize_numbers(punctuated, opts.language_id);
         trace_event(trace, "number_verbalized", "prepare", {
             {"original_text", json_string(text)},
+            {"punctuation_text", json_string(punctuated)},
             {"transport_text", json_string(numbers.text)},
             {"changed", numbers.rewrites.empty() ? "false" : "true"},
             {"changes", json_number_rewrites(numbers.rewrites)},
             {"language_id", json_string(opts.language_id)},
             {"provider", json_string(numbers.provider)},
-            {"policy", json_string("icu_cldr_locale_spellout")},
+            {"policy", json_string("official_punc_then_icu_cldr_spellout")},
         });
+        const auto official = mtl_external_tokenize(tokenizer_opts, numbers.text, opts.language_id);
+        trace_event(trace,"official_tokenizer","encode",{{"language_id",json_string(opts.language_id)},
+            {"source_text",json_string(numbers.text)},{"tokenizer_input",json_string(official.tokenizer_input)},
+            {"token_count",std::to_string(official.ids.size())},{"implementation",json_string("upstream MTLTokenizer + Hugging Face tokenizers")}});
         const EncodeText encode = [&](const std::string& input) {
-            auto ids=bpe.encode(input,opts.language_id);
+            if (input != numbers.text) throw std::runtime_error("unexpected tokenizer input mutation");
+            auto ids=official.ids;
             ids.insert(ids.begin(),model.hparams.start_text_token);
-            ids.push_back(model.hparams.stop_text_token); return ids;
+            ids.push_back(model.hparams.stop_text_token);
+            return ids;
         };
-        validate_utf8(numbers.text);
         PreparedText prepared;
         prepared.text = numbers.text;
         trace_event(trace, "text_prepared", "prepare", {
@@ -115,7 +144,7 @@ struct Engine::Impl {
             {"edits", "[]"},
             {"unhandled_spans", "[]"},
             {"explicit_boundaries", "[]"},
-            {"policy", json_string("icu_then_language_tokenizer")},
+            {"policy", json_string("upstream_multilingual_frontend")},
             {"language_id", json_string(opts.language_id)},
         });
 #else
@@ -133,7 +162,7 @@ struct Engine::Impl {
             {"begin",std::to_string(u.begin)},{"end",std::to_string(u.end)},
             {"text",json_string(u.text)},{"tokenizer_preprocessed",json_string(
 #if defined(TTS_FAMILY_V3)
-                mtl_bpe::prepare_input(u.text,opts.language_id)
+                official.tokenizer_input
 #else
                 gpt2_bpe::punc_norm(u.text)
 #endif

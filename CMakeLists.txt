@@ -16,7 +16,8 @@ if("${TTS_FAMILY}" STREQUAL "v3")
     set(TTS_FAMILY_DEFINE TTS_FAMILY_V3)
     set(TTS_T3_SOURCES
         src/t3_v3.cpp
-        src/mtl_bpe.cpp
+        src/mtl_numbers.cpp
+        src/mtl_external_tokenizer.cpp
         src/chatterbox_s3.cpp
         src/chatterbox_engine.cpp)
     set(TTS_SYSTEM_LIBS icu)

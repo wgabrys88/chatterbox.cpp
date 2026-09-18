@@ -7,6 +7,7 @@ namespace tts_cpp::chatterbox {
 class ExecutionTrace;
 struct EngineOptions {
     std::string t3_gguf_path, s3gen_gguf_path, language_id;
+    std::string tokenizer_python, tokenizer_script, tokenizer_source, tokenizer_tts_source, tokenizer_json, cangjie_json, dicta_model;
 };
 struct SynthesizeStats {
     int predicted_count = 0;
