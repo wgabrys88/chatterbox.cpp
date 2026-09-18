@@ -62,7 +62,6 @@ struct chatterbox_model {
     ggml_tensor * emotion_adv_fc_w = nullptr;
     ggml_tensor * builtin_speaker_emb = nullptr;
     ggml_tensor * builtin_cond_prompt_tokens = nullptr;
-    ggml_tensor * builtin_emotion_adv = nullptr;
     ggml_tensor * rope_freq_factors = nullptr;
     perceiver_w perceiver;
     std::vector<llama_layer> layers;

@@ -132,7 +132,11 @@ struct Engine::Impl {
             auto tokens=generate_t3(u.ids,rng,&unit,trace);
             auto decode_start=TraceClock::now();
             trace_event(trace,"s3_start","s3",{{"index","0"},{"s3_input_ids",json_ids(tokens)},
-                {"cfm_steps",std::to_string(CFM_STEPS)}});
+                {"cfm_steps",std::to_string(effective_cfm_steps())}
+#if defined(TTS_FAMILY_V3)
+                ,{"cfm_cfg",json_number(effective_cfm_cfg())}
+#endif
+            });
             auto wav=s3gen_synthesize(tokens);
             trace_tokens(trace,"s3",tokens);
             const size_t raw=wav.size();
@@ -148,9 +152,10 @@ struct Engine::Impl {
 #endif
             auto assembly_start=TraceClock::now();
             for(float v:wav) if(!std::isfinite(v)) throw std::runtime_error("non-finite S3 sample");
-            std::fill_n(wav.begin(),std::min(wav.size(),size_t(TRIM_FADE)),0.0f);
-            for(size_t j=TRIM_FADE;j<std::min(wav.size(),size_t(2*TRIM_FADE));++j)
-                wav[j]*=0.5f*(1.0f-std::cos(float(M_PI)*float(j-TRIM_FADE)/float(TRIM_FADE-1)));
+            const size_t trim_fade=(size_t)effective_trim_fade();
+            std::fill_n(wav.begin(),std::min(wav.size(),trim_fade),0.0f);
+            for(size_t j=trim_fade;j<std::min(wav.size(),2*trim_fade);++j)
+                wav[j]*=trim_fade>1?0.5f*(1.0f-std::cos(float(M_PI)*float(j-trim_fade)/float(trim_fade-1))):1.0f;
             const size_t offset=pcm.size();
             if(wav.empty() || wav.size()>(size_t(UINT32_MAX)-36)/2 || offset>(size_t(UINT32_MAX)-36)/2-wav.size())
                 throw std::runtime_error("empty audio or RIFF size limit");
@@ -159,8 +164,8 @@ struct Engine::Impl {
             trace_event(trace,"unit_complete","unit",{{"index","0"},
                 {"output_begin_sample",std::to_string(offset)},{"output_end_sample",std::to_string(pcm.size())},
                 {"unit_samples",std::to_string(wav.size())},{"raw_samples",std::to_string(raw)},
-                {"cropped_samples",std::to_string(crop)},{"onset_zero_samples",std::to_string(std::min(wav.size(),size_t(TRIM_FADE)))},
-                {"faded_samples",std::to_string(wav.size()>TRIM_FADE?std::min(wav.size()-TRIM_FADE,size_t(TRIM_FADE)):0)},
+                {"cropped_samples",std::to_string(crop)},{"onset_zero_samples",std::to_string(std::min(wav.size(),trim_fade))},
+                {"faded_samples",std::to_string(wav.size()>trim_fade?std::min(wav.size()-trim_fade,trim_fade):0)},
                 {"assembly_host_wall_s",json_number(elapsed(assembly_start))},{"host_wall_s",json_number(elapsed(unit_start))},
                 {"t3_completed_invocations","1"},{"s3_completed_invocations","1"},{"eos","true"}});
         } catch(const std::exception& e) {

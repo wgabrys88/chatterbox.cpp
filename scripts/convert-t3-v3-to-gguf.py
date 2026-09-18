@@ -169,8 +169,6 @@ def main():
     writer.add_uint32("chatterbox.cond_prompt_length", int(builtin_tokens.numel()))
     writer.add_tensor("chatterbox/builtin/speaker_emb", as_numpy(conds["t3"]["speaker_emb"].reshape(1, SPEAKER_EMBED_SIZE), dtype=torch.float32))
     writer.add_tensor("chatterbox/builtin/cond_prompt_speech_tokens", as_numpy(builtin_tokens))
-    emotion = conds["t3"]["emotion_adv"].reshape(1).to(torch.float32)
-    writer.add_tensor("chatterbox/builtin/emotion_adv", as_numpy(emotion))
     ve = load_file(ckpt_dir / "ve.safetensors")
     writer.add_uint32("voice_encoder.n_mels", 40)
     writer.add_uint32("voice_encoder.hidden_size", 256)

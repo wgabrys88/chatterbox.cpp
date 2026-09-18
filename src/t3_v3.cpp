@@ -89,7 +89,6 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
         model.emotion_adv_fc_w = require_tensor(model, "chatterbox/emotion_adv_fc/w");
         model.builtin_speaker_emb        = require_tensor(model, "chatterbox/builtin/speaker_emb");
         model.builtin_cond_prompt_tokens = require_tensor(model, "chatterbox/builtin/cond_prompt_speech_tokens");
-        model.builtin_emotion_adv        = require_tensor(model, "chatterbox/builtin/emotion_adv");
         model.rope_freq_factors          = require_tensor(model, "model/rope_freq_factors");
         model.perceiver.query   = require_tensor(model, "chatterbox/perceiver/pre_attention_query");
         model.perceiver.norm_g  = require_tensor(model, "chatterbox/perceiver/attn/norm/g");
@@ -279,12 +278,14 @@ static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_te
     ggml_set_name(bos_tok, "bos_tok"); ggml_set_input(bos_tok);
     ggml_tensor * bos_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
     ggml_set_name(bos_pos, "bos_pos"); ggml_set_input(bos_pos);
+    ggml_tensor * emotion_adv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_name(emotion_adv, "emotion_adv"); ggml_set_input(emotion_adv);
     ggml_tensor * spkr = ggml_add(ctx, ggml_mul_mat(ctx, model.cond_spkr_w, model.builtin_speaker_emb), model.cond_spkr_b);
     ggml_tensor * h = ggml_add(ctx,
         ggml_get_rows(ctx, model.speech_emb, model.builtin_cond_prompt_tokens),
         ggml_get_rows(ctx, model.speech_pos_emb, cond_pos));
     ggml_tensor * perc = run_perceiver(ctx, model, h);
-    ggml_tensor * emo = ggml_mul_mat(ctx, model.emotion_adv_fc_w, model.builtin_emotion_adv);
+    ggml_tensor * emo = ggml_mul_mat(ctx, model.emotion_adv_fc_w, emotion_adv);
     ggml_tensor * cond = ggml_concat(ctx, spkr, perc, 1);
     cond = ggml_concat(ctx, cond, emo, 1);
     cond = repeat_batch(ctx, cond, n_embd, cond_len);
@@ -374,6 +375,8 @@ void eval_prompt(
     int32_t bos_p = 0;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "bos_tok"), &bos, 0, sizeof(bos));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "bos_pos"), &bos_p, 0, sizeof(bos_p));
+    const float exaggeration = effective_exaggeration();
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "emotion_adv"), &exaggeration, 0, sizeof(exaggeration));
     std::vector<int32_t> pos((size_t)prompt_len);
     for (int i = 0; i < prompt_len; ++i) pos[i] = i;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), pos.data(), 0, pos.size()*sizeof(int32_t));

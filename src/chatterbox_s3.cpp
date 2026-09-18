@@ -1183,9 +1183,9 @@ std::vector<float> s3gen_synthesize(const std::vector<int32_t>& speech_tokens) {
             const int64_t frame = generated ? t - mel_len1 : t;
             z[m2 * T_mu + t] = positioned_noise(seed + (generated ? 2 : 0), frame * MEL + m2);
         }
-    const int cfm_steps = tts_cpp::chatterbox::CFM_STEPS;
+    const int cfm_steps = tts_cpp::chatterbox::detail::effective_cfm_steps();
 #if defined(TTS_FAMILY_V3)
-    const float cfm_cfg = tts_cpp::chatterbox::CFM_CFG;
+    const float cfm_cfg = tts_cpp::chatterbox::detail::effective_cfm_cfg();
 #endif
     std::vector<float> t_span;
     t_span.reserve(cfm_steps + 1);

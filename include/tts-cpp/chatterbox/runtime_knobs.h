@@ -13,11 +13,15 @@ struct RuntimeKnobs {
     float top_p = TOP_P;
     int seed = SEED;
     int n_predict = N_PREDICT;
+    int cfm_steps = CFM_STEPS;
+    int trim_fade = TRIM_FADE;
 #if defined(TTS_FAMILY_GPT2)
     int top_k = TOP_K;
 #elif defined(TTS_FAMILY_V3)
     float min_p = MIN_P;
     float cfg_weight = CFG_WEIGHT;
+    float exaggeration = EXAGGERATION;
+    float cfm_cfg = CFM_CFG;
 #endif
 };
 inline RuntimeKnobs& runtime_knobs() {
@@ -29,10 +33,14 @@ inline float effective_temperature() { return runtime_knobs().temperature; }
 inline float effective_top_p() { return runtime_knobs().top_p; }
 inline int effective_seed() { return runtime_knobs().seed; }
 inline int effective_n_predict() { return runtime_knobs().n_predict; }
+inline int effective_cfm_steps() { return runtime_knobs().cfm_steps; }
+inline int effective_trim_fade() { return runtime_knobs().trim_fade; }
 #if defined(TTS_FAMILY_GPT2)
 inline int effective_top_k() { return runtime_knobs().top_k; }
 #elif defined(TTS_FAMILY_V3)
 inline float effective_min_p() { return runtime_knobs().min_p; }
 inline float effective_cfg_weight() { return runtime_knobs().cfg_weight; }
+inline float effective_exaggeration() { return runtime_knobs().exaggeration; }
+inline float effective_cfm_cfg() { return runtime_knobs().cfm_cfg; }
 #endif
 }

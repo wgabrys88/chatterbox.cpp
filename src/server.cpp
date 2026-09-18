@@ -115,9 +115,13 @@ static std::string parse_flags(int argc, char** argv) {
         if (std::strcmp(a, "--top-p") == 0) { k.top_p = parse_float(v); continue; }
         if (std::strcmp(a, "--repeat-penalty") == 0) { k.repeat_penalty = parse_float(v); continue; }
         if (std::strcmp(a, "--n-predict") == 0) { k.n_predict = parse_int(v); continue; }
+        if (std::strcmp(a, "--cfm-steps") == 0) { k.cfm_steps = parse_int(v); continue; }
+        if (std::strcmp(a, "--trim-fade-samples") == 0) { k.trim_fade = parse_int(v); continue; }
 #if defined(TTS_FAMILY_V3)
         if (std::strcmp(a, "--min-p") == 0) { k.min_p = parse_float(v); continue; }
         if (std::strcmp(a, "--cfg-weight") == 0) { k.cfg_weight = parse_float(v); continue; }
+        if (std::strcmp(a, "--exaggeration") == 0) { k.exaggeration = parse_float(v); continue; }
+        if (std::strcmp(a, "--cfm-cfg") == 0) { k.cfm_cfg = parse_float(v); continue; }
 #elif defined(TTS_FAMILY_GPT2)
         if (std::strcmp(a, "--top-k") == 0) { k.top_k = parse_int(v); continue; }
 #endif
@@ -126,10 +130,10 @@ static std::string parse_flags(int argc, char** argv) {
 #if defined(TTS_FAMILY_V3)
     if (language.empty()) throw std::runtime_error("language");
 #endif
-    if(k.n_predict<1 || k.temperature<0 || k.repeat_penalty<=0 || k.top_p<=0 || k.top_p>1)
+    if(k.n_predict<1 || k.cfm_steps<1 || k.trim_fade<0 || k.temperature<0 || k.repeat_penalty<=0 || k.top_p<=0 || k.top_p>1)
         throw std::runtime_error("generation argument out of range");
 #if defined(TTS_FAMILY_V3)
-    if(k.min_p<0 || k.min_p>1 || k.cfg_weight<0)throw std::runtime_error("V3 argument out of range");
+    if(k.min_p<0 || k.min_p>1)throw std::runtime_error("V3 argument out of range");
 #else
     if(k.top_k<0)throw std::runtime_error("top-k out of range");
 #endif
@@ -141,13 +145,13 @@ static std::string knob_list() {
     char buf[768];
 #if defined(TTS_FAMILY_V3)
     const int n = std::snprintf(buf, sizeof(buf),
-        "seed=%d temperature=%g top_p=%g repeat_penalty=%g n_predict=%d min_p=%g cfg_weight=%g",
+        "seed=%d temperature=%g top_p=%g repeat_penalty=%g n_predict=%d min_p=%g cfg_weight=%g exaggeration=%g cfm_steps=%d cfm_cfg=%g trim_fade_samples=%d",
         k.seed, k.temperature, k.top_p, k.repeat_penalty, k.n_predict,
-        k.min_p, k.cfg_weight);
+        k.min_p, k.cfg_weight, k.exaggeration, k.cfm_steps, k.cfm_cfg, k.trim_fade);
 #else
     const int n = std::snprintf(buf, sizeof(buf),
-        "seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d",
-        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict);
+        "seed=%d temperature=%g top_k=%d top_p=%g repeat_penalty=%g n_predict=%d cfm_steps=%d trim_fade_samples=%d",
+        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict, k.cfm_steps, k.trim_fade);
 #endif
     if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("knobs");
     return std::string(buf, (size_t)n);
@@ -159,14 +163,15 @@ static std::string knobs_json() {
 #if defined(TTS_FAMILY_V3)
     const int n = std::snprintf(buf, sizeof(buf),
         "{\"seed\":%d,\"temperature\":%.17g,\"top-p\":%.17g,\"repeat-penalty\":%.17g,"
-        "\"n-predict\":%d,\"min-p\":%.17g,\"cfg-weight\":%.17g}",
+        "\"n-predict\":%d,\"min-p\":%.17g,\"cfg-weight\":%.17g,\"exaggeration\":%.17g,"
+        "\"cfm-steps\":%d,\"cfm-cfg\":%.17g,\"trim-fade-samples\":%d}",
         k.seed, k.temperature, k.top_p, k.repeat_penalty, k.n_predict,
-        k.min_p, k.cfg_weight);
+        k.min_p, k.cfg_weight, k.exaggeration, k.cfm_steps, k.cfm_cfg, k.trim_fade);
 #else
     const int n = std::snprintf(buf, sizeof(buf),
         "{\"seed\":%d,\"temperature\":%.17g,\"top-k\":%d,\"top-p\":%.17g,"
-        "\"repeat-penalty\":%.17g,\"n-predict\":%d}",
-        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict);
+        "\"repeat-penalty\":%.17g,\"n-predict\":%d,\"cfm-steps\":%d,\"trim-fade-samples\":%d}",
+        k.seed, k.temperature, k.top_k, k.top_p, k.repeat_penalty, k.n_predict, k.cfm_steps, k.trim_fade);
 #endif
     if (n <= 0 || n >= (int)sizeof(buf)) throw std::runtime_error("knobs json");
     return std::string(buf, (size_t)n);

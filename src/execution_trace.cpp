@@ -81,7 +81,7 @@ ExecutionTrace::ExecutionTrace(const std::string& wav) {
     const auto dir=wav_path.parent_path();
     dir_=dir.u8string();
     id_=dir.filename().u8string();
-    bool valid=id_.size()==32 && id_.find_first_not_of("0123456789abcdef")==std::string::npos;
+    bool valid=!id_.empty();
     if(!valid) id_="engine-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64());
     auto open_table=[&](std::ofstream& f, const char* name){
         f.exceptions(std::ios::badbit|std::ios::failbit);
