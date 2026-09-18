@@ -7,7 +7,7 @@ from safetensors.torch import load_file
 TEXT_VOCAB_SIZE, SPEECH_VOCAB_SIZE = 50276, 6563
 START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, SPEAKER_EMBED_SIZE = 6561, 6562, 256
 LAYER_RE = re.compile(r"^tfmr\.h\.(\d+)\.(.+)$")
-SKIP = {"tfmr.wte.weight"}
+SKIP = {"tfmr.wte.weight", "text_head.weight"}
 def as_numpy(tensor, *, dtype=None, transpose=False):
     if dtype is not None: tensor = tensor.to(dtype)
     array = tensor.detach().cpu().numpy()
