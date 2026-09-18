@@ -3,7 +3,7 @@ import argparse, re, sys
 from pathlib import Path
 import gguf, numpy as np, torch
 from safetensors.torch import load_file
-from quant_policy import WEIGHT_TYPES, add_weight
+from quant_policy import WEIGHT_TYPES, add_weight, s3_force_f32
 def as_numpy(tensor, *, dtype=None):
     if dtype is not None: tensor = tensor.to(dtype)
     return np.ascontiguousarray(tensor.detach().cpu().numpy())
@@ -31,13 +31,8 @@ class TrackingState(dict):
     def mark(self, key):
         if key in self:
             self.used.add(key)
-def must_f32(name):
-    return any(s in name for s in (
-        "flow/input_embedding", "flow/spk_embed_affine/", "/builtin/", "s3gen/mel_fb/",
-        "campplus/", "s3tokv2/", "cfm/", "hift/",
-    ))
 def add(writer, name, arr, weight_type):
-    return add_weight(writer, name, arr, weight_type, force_f32=must_f32(name) or arr.ndim <= 1)
+    return add_weight(writer, name, arr, weight_type, force_f32=s3_force_f32(name, arr))
 def export_conformer_block(writer, state, prefix, gguf_prefix, weight_type):
     mapping = {
         "norm_mha.weight": "norm_mha/w", "norm_mha.bias": "norm_mha/b",
