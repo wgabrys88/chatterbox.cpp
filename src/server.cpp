@@ -136,8 +136,6 @@ static std::string parse_flags(int argc, char** argv) {
     return language;
 }
 
-// Resolved knobs, one key=value list shared by the stderr banner and the
-// stats trailer so the client sees exactly what the engine ran with.
 static std::string knob_list() {
     const auto& k = tts_cpp::chatterbox::detail::runtime_knobs();
     char buf[768];
@@ -187,7 +185,6 @@ static std::string stats_line(const tts_cpp::chatterbox::SynthesizeStats& s) {
     return std::string(buf, (size_t)n) + knob_list() + "\n";
 }
 
-// request: "<path>\n<nbytes>\n" + UTF-8 text. No mode or streaming fields.
 static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOptions& options) {
     std::unique_ptr<ExecutionTrace> trace;
     std::string stage="transport",path;
@@ -245,7 +242,7 @@ static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOption
         if(!FlushFileBuffers(h))throw std::runtime_error("acknowledgement flush failed");
     } catch(const std::exception& e) {
         std::fprintf(stderr,"request failed stage=%s error=%s\n",stage.c_str(),e.what());std::fflush(stderr);
-        // Preserve a completed WAV on transport-only failure; the client marks it unknown.
+
         if(published&&stage!="acknowledgement") {std::error_code ec;std::filesystem::remove(std::filesystem::u8path(path),ec);}
         if(trace){
             const auto& rk=tts_cpp::chatterbox::detail::runtime_knobs();

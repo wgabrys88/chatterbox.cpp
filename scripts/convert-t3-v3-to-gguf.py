@@ -127,9 +127,7 @@ def main():
     perceiver_len = int(state["cond_enc.perceiver.pre_attention_query"].shape[1])
     text_pos_len = int(state["text_pos_emb.emb.weight"].shape[0])
     speech_pos_len = int(state["speech_pos_emb.emb.weight"].shape[0])
-    # Official Llama_520M + max_speech_tokens=4096. Nano analog: generate cap follows
-    # the model's speech_pos table (4100), not internet max_new_tokens=1000.
-    # Keep N_PREDICT at 4096 (documented ceiling) so speech_pos index i+1 stays in 0..4099.
+
     if n_embd != 1024 or n_layer != 30 or n_head != 16 or n_ff != 4096:
         raise SystemExit(f"v3 expected Llama_520M 1024/30/16/4096, got {n_embd}/{n_layer}/{n_head}/{n_ff}")
     if perceiver_len != 32 or text_pos_len != 2050 or speech_pos_len != 4100:

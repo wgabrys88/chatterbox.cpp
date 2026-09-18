@@ -61,7 +61,7 @@ PreparedText prepare_text(const std::string& s,bool english,ExecutionTrace* trac
         size_t used=0;std::string replacement,rule;std::smatch m;
         const bool start=i==0 || !word(static_cast<unsigned char>(s[i-1]));
         auto end_ok=[&](size_t n){return i+n==s.size() || (!word(static_cast<unsigned char>(s[i+n])) && s[i+n]!='.' && s[i+n]!='-' && s[i+n]!=':') || (s[i+n]=='.' && (i+n+1==s.size()||space(s[i+n+1])));};
-        // Protect the whole whitespace-delimited URL/email/mixed identifier.
+
         if(start) {
             size_t j=i;while(j<s.size()&&!space(s[j]))++j;
             std::string atom=s.substr(i,j-i); bool alpha=false,num=false;
@@ -69,7 +69,7 @@ PreparedText prepare_text(const std::string& s,bool english,ExecutionTrace* trac
             const bool seat_context=i>=5 && lower(s.substr(i-5,5))=="seat ";
             const bool suffix_ordinal=match(s,i,ord,m) && end_ok(size_t(m.length()));
             bool protected_atom=atom.find("://")!=std::string::npos || atom.find('@')!=std::string::npos || atom.find('_')!=std::string::npos || (alpha&&num&&!seat_context&&!suffix_ordinal&&atom.find(':')==std::string::npos);
-            // Month names are not mixed identifiers; clock tokens are parsed below.
+
             if(protected_atom) {size_t b=p.text.size();p.text+=atom;p.atoms.push_back({b,p.text.size()});if(num)p.unhandled.push_back({b,p.text.size()});i=j;continue;}
         }
         if(english&&start) {

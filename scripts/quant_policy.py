@@ -1,6 +1,5 @@
 import gguf
-# Substring denylist. Do not put "/b" here: it is a prefix of "block" and
-# would skip every conformer block weight. Biases use DENY_SUFFIX instead.
+
 DENY = (
     "flow/input_embedding", "flow/spk_embed_affine/w", "/builtin/",
     "text_emb", "speech_emb", "wte", "wpe", "stft_basis", "mel_filterbank",

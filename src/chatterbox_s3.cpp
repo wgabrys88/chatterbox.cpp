@@ -189,10 +189,9 @@ static ggml_tensor * conv1d_f32(ggml_context * ctx, ggml_tensor * kernel, ggml_t
                                 int stride, int padding, int dilation) {
     ggml_tensor * im2col = ggml_im2col(ctx, kernel, input, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
 #if defined(TTS_FAMILY_V3)
-    // im2col is [K*Cin, T, B]. Preserve B through matmul; flattening T*B
-    // before reshaping to [T, Cout, B] interleaves CFG batches and channels.
+
     ggml_tensor * k_flat = ggml_reshape_2d(ctx, kernel, kernel->ne[0] * kernel->ne[1], kernel->ne[2]);
-    ggml_tensor * result = ggml_mul_mat(ctx, k_flat, im2col); // [Cout, T, B]
+    ggml_tensor * result = ggml_mul_mat(ctx, k_flat, im2col);
     return ggml_cont(ctx, ggml_permute(ctx, result, 1, 0, 2, 3));
 #else
     ggml_tensor * result = ggml_mul_mat(ctx,

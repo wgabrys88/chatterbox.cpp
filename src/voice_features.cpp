@@ -59,9 +59,6 @@ static double sinc_pi(double x) {
     return std::sin(M_PI * x) / (M_PI * x);
 }
 
-// Type-I linear-phase lowpass, scipy.signal.firls with fs=2 (Nyquist=1).
-// Passband/stopband edges are fractions of that Nyquist. Matches official
-// soxr_hq cond tokens on 24 kHz -> 16 kHz when n_taps=641, f_pass=0.305, f_stop=1/3.
 static std::vector<double> firls_lowpass(int n_taps, double f_pass, double f_stop)
 {
     if (n_taps < 3 || (n_taps % 2) == 0) throw std::runtime_error("resample firls taps");
@@ -114,7 +111,7 @@ static std::vector<double> firls_lowpass(int n_taps, double f_pass, double f_sto
             a[(size_t)i] = s / Lat(i, i);
         }
     } else {
-        // Gaussian elimination with partial pivot (Q is overwritten).
+
         std::vector<int> piv((size_t)nq);
         for (int i = 0; i < nq; ++i) piv[(size_t)i] = i;
         for (int k = 0; k < nq; ++k) {
@@ -168,8 +165,7 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
     const int up = sr_out / g;
     const int down = sr_in / g;
     if (up == 1 && down == 1) return in;
-    // Least-squares FIR (not Kaiser). 641 taps / 0.915 of output Nyquist is the
-    // MIT family that matches soxr_hq cond tokens on 24 kHz -> 16 kHz (2/3).
+
     const int n_taps = 641;
     const int th = (n_taps - 1) / 2;
     const double f_stop = 1.0 / (double)down;
@@ -210,8 +206,7 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
 std::vector<float> trim_silence(const std::vector<float> & wav, float top_db,
                                 int frame_length, int hop_length)
 {
-    // librosa.effects.trim defaults: top_db=20 (VE), frame_length=2048, hop_length=512,
-    // centered RMS, amplitude_to_db amin=1e-5, ref=np.max.
+
     if (wav.empty()) return {};
     if (frame_length <= 0 || hop_length <= 0) throw std::runtime_error("trim");
     const int n = (int)wav.size();
