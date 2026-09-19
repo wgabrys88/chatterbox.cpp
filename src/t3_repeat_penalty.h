@@ -8,7 +8,7 @@ namespace tts_cpp::chatterbox::detail {
 inline void apply_speech_repeat_penalty(float * scores, int vocab,
                                         const std::vector<int32_t> & generated) {
     if (generated.empty() || vocab <= 0) return;
-    const float penalty = effective_repeat_penalty();
+    const float penalty = runtime_knobs().repeat_penalty;
     thread_local std::vector<uint32_t> marks;
     thread_local uint32_t epoch = 0;
     if (marks.size() < (size_t)vocab) marks.resize((size_t)vocab, 0);

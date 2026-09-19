@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, re, sys
+import argparse, json, re
 from pathlib import Path
 import gguf, numpy as np, torch
 from quant_policy import WEIGHT_TYPES, add_weight
@@ -8,11 +8,8 @@ TEXT_VOCAB_SIZE, SPEECH_VOCAB_SIZE = 50276, 6563
 START_SPEECH_TOKEN, STOP_SPEECH_TOKEN, SPEAKER_EMBED_SIZE = 6561, 6562, 256
 LAYER_RE = re.compile(r"^tfmr\.h\.(\d+)\.(.+)$")
 SKIP = {"tfmr.wte.weight", "text_head.weight"}
-def as_numpy(tensor, *, dtype=None, transpose=False):
-    if dtype is not None: tensor = tensor.to(dtype)
-    array = tensor.detach().cpu().numpy()
-    if transpose: array = array.T
-    return np.ascontiguousarray(array)
+from convert_common import as_numpy, finish_t3
+
 MATRIX_SUFFIXES = ("/attn/c_attn/w", "/attn/c_proj/w", "/mlp/c_fc/w", "/mlp/c_proj/w")
 def add(writer, name, array, matrix_type):
     is_matrix = name.startswith("model/h") and name.endswith(MATRIX_SUFFIXES)
@@ -73,19 +70,11 @@ def main():
     ckpt_dir, out = Path(a.ckpt_dir), Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     state = load_file(ckpt_dir / a.t3_safetensors)
-    unknown = [name for name in state if name not in SKIP and map_name(name) is None]
-    if unknown:
-        print("STOP unknown GPT2 T3 keys:", file=sys.stderr)
-        for name in unknown:
-            print(f"  {name}\t{tuple(state[name].shape)}", file=sys.stderr)
-        raise SystemExit("GPT2 T3 conversion incomplete")
     conds = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)
     n_embd = int(state["tfmr.ln_f.weight"].shape[0])
     n_ctx = int(state["tfmr.wpe.weight"].shape[0])
     n_layer = max(int(m.group(1)) for name in state if (m := LAYER_RE.match(name))) + 1
     n_head = n_embd // 64
-    if (n_embd, n_layer, n_head) not in {(768, 12, 12), (1024, 24, 16)} or n_ctx != 8196:
-        raise SystemExit(f"expected GPT2_small 768/12/12 or GPT2_medium 1024/24/16 with n_ctx 8196, got {n_embd}/{n_layer}/{n_head} n_ctx={n_ctx}")
     writer = gguf.GGUFWriter(str(out), "chatterbox")
     writer.add_string("chatterbox.conversion.matrix_type", a.matrix_type)
     writer.add_uint32("chatterbox.n_ctx", n_ctx)
@@ -108,32 +97,6 @@ def main():
         if mapped is None: continue
         gguf_name, dtype, transpose = mapped
         add(writer, gguf_name, as_numpy(tensor, dtype=dtype, transpose=transpose), a.matrix_type)
-    builtin_tokens = conds["t3"]["cond_prompt_speech_tokens"].reshape(-1).to(torch.int32)
-    writer.add_uint32("chatterbox.cond_prompt_max", int(builtin_tokens.numel()))
-    writer.add_uint32("chatterbox.cond_prompt_length", int(builtin_tokens.numel()))
-    writer.add_tensor("chatterbox/builtin/speaker_emb", as_numpy(conds["t3"]["speaker_emb"].reshape(1, SPEAKER_EMBED_SIZE), dtype=torch.float32))
-    writer.add_tensor("chatterbox/builtin/cond_prompt_speech_tokens", as_numpy(builtin_tokens))
-    ve = load_file(ckpt_dir / "ve.safetensors")
-    writer.add_uint32("voice_encoder.n_mels", 40)
-    writer.add_uint32("voice_encoder.hidden_size", 256)
-    writer.add_uint32("voice_encoder.num_layers", 3)
-    writer.add_uint32("voice_encoder.embedding_size", 256)
-    writer.add_uint32("voice_encoder.partial_frames", 160)
-    writer.add_uint32("voice_encoder.sample_rate", 16000)
-    writer.add_uint32("voice_encoder.n_fft", 400)
-    writer.add_uint32("voice_encoder.hop_size", 160)
-    writer.add_uint32("voice_encoder.win_size", 400)
-    writer.add_float32("voice_encoder.overlap", 0.5)
-    writer.add_float32("voice_encoder.rate", 1.3)
-    writer.add_float32("voice_encoder.min_coverage", 0.8)
-    for k, t in ve.items():
-        if not k.startswith("similarity_"):
-            writer.add_tensor(f"voice_encoder/{k.replace('.', '/')}", as_numpy(t, dtype=torch.float32))
-    import librosa
-    writer.add_tensor("voice_encoder/mel_fb", np.ascontiguousarray(librosa.filters.mel(sr=16000, n_fft=400, n_mels=40, fmin=0, fmax=8000).astype(np.float32)))
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
+    finish_t3(writer, ckpt_dir, conds)
 if __name__ == "__main__":
     main()

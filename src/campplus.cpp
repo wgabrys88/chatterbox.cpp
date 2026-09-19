@@ -2,7 +2,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "gguf.h"
+#include "gguf_weights.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -10,19 +10,10 @@
 #include <string>
 #include <vector>
 static ggml_backend_t g_vk = nullptr;
-static bool copy_f32(ggml_context * ctx, const char * name,
-                     std::vector<float> & out)
-{
-    ggml_tensor * t = ggml_get_tensor(ctx, name);
-    if (!t) throw std::runtime_error(name);
-    out.resize(ggml_nelements(t));
-    std::memcpy(out.data(), ggml_get_data(t), ggml_nbytes(t));
-    return true;
-}
 static bool load_bn(ggml_context * ctx, const std::string & base, campplus_bn & bn)
 {
-    if (!copy_f32(ctx, (base + "/s").c_str(), bn.scale)) return false;
-    if (!copy_f32(ctx, (base + "/b").c_str(), bn.shift)) return false;
+    GgufWeights::copy_tensor(ctx, (base + "/s").c_str(), bn.scale);
+    GgufWeights::copy_tensor(ctx, (base + "/b").c_str(), bn.shift);
     return true;
 }
 static bool load_conv1d(ggml_context * ctx,
@@ -32,12 +23,9 @@ static bool load_conv1d(ggml_context * ctx,
                         int stride, int pad, int dilation,
                         campplus_conv & conv)
 {
-    if (!copy_f32(ctx, w_name.c_str(), conv.w)) return false;
-    if ((int64_t)conv.w.size() != (int64_t)k * C_in * C_out) {
-        throw std::runtime_error(w_name);
-    }
+    GgufWeights::copy_tensor(ctx, w_name.c_str(), conv.w);
     if (!b_name_or_empty.empty()) {
-        if (!copy_f32(ctx, b_name_or_empty.c_str(), conv.b)) return false;
+        GgufWeights::copy_tensor(ctx, b_name_or_empty.c_str(), conv.b);
     }
     conv.C_out = C_out;
     conv.C_in  = C_in;
@@ -54,10 +42,7 @@ static bool load_conv2d(ggml_context * ctx,
                         int sH, int sW, int pH, int pW,
                         campplus_conv & conv)
 {
-    if (!copy_f32(ctx, w_name.c_str(), conv.w)) return false;
-    if ((int64_t)conv.w.size() != (int64_t)kH * kW * C_in * C_out) {
-        throw std::runtime_error(w_name);
-    }
+    GgufWeights::copy_tensor(ctx, w_name.c_str(), conv.w);
     conv.C_out = C_out;
     conv.C_in  = C_in;
     conv.kH = kH; conv.kW = kW;
@@ -73,13 +58,13 @@ static bool load_res_block(ggml_context * ctx,
                            int in_planes, int planes, int stride,
                            campplus_res_block & blk)
 {
-    if (!load_conv2d(ctx, base + "/conv1/weight", 3, 3, in_planes, planes, stride, 1, 1, 1, blk.conv1)) return false;
-    if (!load_bn    (ctx, base + "/bn1", blk.bn1)) return false;
-    if (!load_conv2d(ctx, base + "/conv2/weight", 3, 3, planes,    planes, 1,      1, 1, 1, blk.conv2)) return false;
-    if (!load_bn    (ctx, base + "/bn2", blk.bn2)) return false;
+    load_conv2d(ctx, base + "/conv1/weight", 3, 3, in_planes, planes, stride, 1, 1, 1, blk.conv1);
+    load_bn(ctx, base + "/bn1", blk.bn1);
+    load_conv2d(ctx, base + "/conv2/weight", 3, 3, planes,    planes, 1,      1, 1, 1, blk.conv2);
+    load_bn(ctx, base + "/bn2", blk.bn2);
     if (has_shortcut) {
-        if (!load_conv2d(ctx, base + "/shortcut/0/weight", 1, 1, in_planes, planes, stride, 1, 0, 0, blk.shortcut_conv)) return false;
-        if (!load_bn    (ctx, base + "/shortcut/1", blk.shortcut_bn)) return false;
+        load_conv2d(ctx, base + "/shortcut/0/weight", 1, 1, in_planes, planes, stride, 1, 0, 0, blk.shortcut_conv);
+        load_bn(ctx, base + "/shortcut/1", blk.shortcut_bn);
     }
     blk.stride_h = stride;
     return true;
@@ -99,98 +84,85 @@ static bool load_cam_block(ggml_context * ctx,
         const int C_in = init_C_in + i * growth_rate;
         const std::string p = base + "/tdnnd" + std::to_string(i + 1);
         auto & L = blk.layers[i];
-        if (!load_bn(ctx, p + "/nonlinear1/batchnorm", L.bn1)) return false;
-        if (!load_conv1d(ctx, p + "/linear1/weight", "",
+        load_bn(ctx, p + "/nonlinear1/batchnorm", L.bn1);
+        load_conv1d(ctx, p + "/linear1/weight", "",
                          1, C_in, bn_channels,
-                         1, 0, 1, L.linear1)) return false;
-        if (!load_bn(ctx, p + "/nonlinear2/batchnorm", L.bn2)) return false;
+                         1, 0, 1, L.linear1);
+        load_bn(ctx, p + "/nonlinear2/batchnorm", L.bn2);
         const int pad = (kernel_size - 1) / 2 * dilation;
-        if (!load_conv1d(ctx, p + "/cam_layer/linear_local/weight", "",
+        load_conv1d(ctx, p + "/cam_layer/linear_local/weight", "",
                          kernel_size, bn_channels, growth_rate,
-                         1, pad, dilation, L.cam_linear_local)) return false;
-        if (!load_conv1d(ctx, p + "/cam_layer/linear1/weight",
+                         1, pad, dilation, L.cam_linear_local);
+        load_conv1d(ctx, p + "/cam_layer/linear1/weight",
                          p + "/cam_layer/linear1/bias",
-                         1, bn_channels, bn_channels / 2, 1, 0, 1, L.cam_linear1)) return false;
-        if (!load_conv1d(ctx, p + "/cam_layer/linear2/weight",
+                         1, bn_channels, bn_channels / 2, 1, 0, 1, L.cam_linear1);
+        load_conv1d(ctx, p + "/cam_layer/linear2/weight",
                          p + "/cam_layer/linear2/bias",
-                         1, bn_channels / 2, growth_rate, 1, 0, 1, L.cam_linear2)) return false;
+                         1, bn_channels / 2, growth_rate, 1, 0, 1, L.cam_linear2);
     }
     return true;
 }
 bool campplus_load(const std::string & path, campplus_weights & w)
 {
-    ggml_context * tmp = nullptr;
-    gguf_init_params gp = {  false,  &tmp };
-    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
-    if (!g) throw std::runtime_error(path);
-    auto u32 = [&](const char * k) {
-        int64_t id = gguf_find_key(g, k);
-        if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
-        return gguf_get_val_u32(g, id);
-    };
+    GgufWeights weights(path);
+    auto* tmp = weights.ctx;
     int init_channels = 0, growth_rate = 0, bn_size = 0, bn_channels = 0;
     int b1_layers = 0, b2_layers = 0, b3_layers = 0, b1_dil = 0, b2_dil = 0, b3_dil = 0, k_size = 0;
-    try {
-        w.feat_dim       = (int)u32("campplus.feat_dim");
-        w.embedding_size = (int)u32("campplus.embedding_size");
-        w.seg_pool_len   = (int)u32("campplus.seg_pool_len");
-        w.sample_rate    = (int)u32("campplus.sample_rate");
-        init_channels = (int)u32("campplus.init_channels");
-        growth_rate   = (int)u32("campplus.growth_rate");
-        bn_size       = (int)u32("campplus.bn_size");
+        w.feat_dim       = (int)weights.u32("campplus.feat_dim");
+        w.embedding_size = (int)weights.u32("campplus.embedding_size");
+        w.seg_pool_len   = (int)weights.u32("campplus.seg_pool_len");
+        w.sample_rate    = (int)weights.u32("campplus.sample_rate");
+        init_channels = (int)weights.u32("campplus.init_channels");
+        growth_rate   = (int)weights.u32("campplus.growth_rate");
+        bn_size       = (int)weights.u32("campplus.bn_size");
         bn_channels   = bn_size * growth_rate;
-        b1_layers     = (int)u32("campplus.block1_layers");
-        b2_layers     = (int)u32("campplus.block2_layers");
-        b3_layers     = (int)u32("campplus.block3_layers");
-        b1_dil        = (int)u32("campplus.block1_dilation");
-        b2_dil        = (int)u32("campplus.block2_dilation");
-        b3_dil        = (int)u32("campplus.block3_dilation");
-        k_size        = (int)u32("campplus.kernel_size");
-    } catch (...) {
-        gguf_free(g); if (tmp) ggml_free(tmp); throw;
-    }
-    bool ok = true;
-    ok &= load_conv2d(tmp, "campplus/head/conv1/weight", 3, 3, 1, 32, 1, 1, 1, 1, w.head.conv1);
-    ok &= load_bn    (tmp, "campplus/head/bn1", w.head.bn1);
+        b1_layers     = (int)weights.u32("campplus.block1_layers");
+        b2_layers     = (int)weights.u32("campplus.block2_layers");
+        b3_layers     = (int)weights.u32("campplus.block3_layers");
+        b1_dil        = (int)weights.u32("campplus.block1_dilation");
+        b2_dil        = (int)weights.u32("campplus.block2_dilation");
+        b3_dil        = (int)weights.u32("campplus.block3_dilation");
+        k_size        = (int)weights.u32("campplus.kernel_size");
+    load_conv2d(tmp, "campplus/head/conv1/weight", 3, 3, 1, 32, 1, 1, 1, 1, w.head.conv1);
+    load_bn    (tmp, "campplus/head/bn1", w.head.bn1);
     w.head.layer1.resize(2);
-    ok &= load_res_block(tmp, "campplus/head/layer1/0", true,  32, 32, 2, w.head.layer1[0]);
-    ok &= load_res_block(tmp, "campplus/head/layer1/1", false, 32, 32, 1, w.head.layer1[1]);
+    load_res_block(tmp, "campplus/head/layer1/0", true,  32, 32, 2, w.head.layer1[0]);
+    load_res_block(tmp, "campplus/head/layer1/1", false, 32, 32, 1, w.head.layer1[1]);
     w.head.layer2.resize(2);
-    ok &= load_res_block(tmp, "campplus/head/layer2/0", true,  32, 32, 2, w.head.layer2[0]);
-    ok &= load_res_block(tmp, "campplus/head/layer2/1", false, 32, 32, 1, w.head.layer2[1]);
-    ok &= load_conv2d(tmp, "campplus/head/conv2/weight", 3, 3, 32, 32, 2, 1, 1, 1, w.head.conv2);
-    ok &= load_bn    (tmp, "campplus/head/bn2", w.head.bn2);
+    load_res_block(tmp, "campplus/head/layer2/0", true,  32, 32, 2, w.head.layer2[0]);
+    load_res_block(tmp, "campplus/head/layer2/1", false, 32, 32, 1, w.head.layer2[1]);
+    load_conv2d(tmp, "campplus/head/conv2/weight", 3, 3, 32, 32, 2, 1, 1, 1, w.head.conv2);
+    load_bn    (tmp, "campplus/head/bn2", w.head.bn2);
     const int fcm_out_ch = 32 * (w.feat_dim / 8);
-    ok &= load_conv1d(tmp, "campplus/xvector/tdnn/linear/weight", "",
+    load_conv1d(tmp, "campplus/xvector/tdnn/linear/weight", "",
                       5, fcm_out_ch, init_channels, 2, 2, 1, w.tdnn_linear);
-    ok &= load_bn(tmp, "campplus/xvector/tdnn/nonlinear/batchnorm", w.tdnn_bn);
-    ok &= load_cam_block(tmp, "campplus/xvector/block1", b1_layers, k_size, b1_dil,
+    load_bn(tmp, "campplus/xvector/tdnn/nonlinear/batchnorm", w.tdnn_bn);
+    load_cam_block(tmp, "campplus/xvector/block1", b1_layers, k_size, b1_dil,
                          init_channels, growth_rate, bn_channels, w.block1);
     const int after_b1_ch = init_channels + b1_layers * growth_rate;
-    ok &= load_bn(tmp, "campplus/xvector/transit1/nonlinear/batchnorm", w.transit1.bn);
-    ok &= load_conv1d(tmp, "campplus/xvector/transit1/linear/weight", "",
+    load_bn(tmp, "campplus/xvector/transit1/nonlinear/batchnorm", w.transit1.bn);
+    load_conv1d(tmp, "campplus/xvector/transit1/linear/weight", "",
                       1, after_b1_ch, after_b1_ch / 2, 1, 0, 1, w.transit1.linear);
     const int b2_in_ch = after_b1_ch / 2;
-    ok &= load_cam_block(tmp, "campplus/xvector/block2", b2_layers, k_size, b2_dil,
+    load_cam_block(tmp, "campplus/xvector/block2", b2_layers, k_size, b2_dil,
                          b2_in_ch, growth_rate, bn_channels, w.block2);
     const int after_b2_ch = b2_in_ch + b2_layers * growth_rate;
-    ok &= load_bn(tmp, "campplus/xvector/transit2/nonlinear/batchnorm", w.transit2.bn);
-    ok &= load_conv1d(tmp, "campplus/xvector/transit2/linear/weight", "",
+    load_bn(tmp, "campplus/xvector/transit2/nonlinear/batchnorm", w.transit2.bn);
+    load_conv1d(tmp, "campplus/xvector/transit2/linear/weight", "",
                       1, after_b2_ch, after_b2_ch / 2, 1, 0, 1, w.transit2.linear);
     const int b3_in_ch = after_b2_ch / 2;
-    ok &= load_cam_block(tmp, "campplus/xvector/block3", b3_layers, k_size, b3_dil,
+    load_cam_block(tmp, "campplus/xvector/block3", b3_layers, k_size, b3_dil,
                          b3_in_ch, growth_rate, bn_channels, w.block3);
     const int after_b3_ch = b3_in_ch + b3_layers * growth_rate;
-    ok &= load_bn(tmp, "campplus/xvector/transit3/nonlinear/batchnorm", w.transit3.bn);
-    ok &= load_conv1d(tmp, "campplus/xvector/transit3/linear/weight", "",
+    load_bn(tmp, "campplus/xvector/transit3/nonlinear/batchnorm", w.transit3.bn);
+    load_conv1d(tmp, "campplus/xvector/transit3/linear/weight", "",
                       1, after_b3_ch, after_b3_ch / 2, 1, 0, 1, w.transit3.linear);
     const int final_ch = after_b3_ch / 2;
-    ok &= load_bn(tmp, "campplus/xvector/out_nonlinear/batchnorm", w.out_nonlinear_bn);
-    ok &= load_conv1d(tmp, "campplus/xvector/dense/linear/weight", "",
+    load_bn(tmp, "campplus/xvector/out_nonlinear/batchnorm", w.out_nonlinear_bn);
+    load_conv1d(tmp, "campplus/xvector/dense/linear/weight", "",
                       1, final_ch * 2, w.embedding_size, 1, 0, 1, w.dense_linear);
-    ok &= load_bn(tmp, "campplus/xvector/dense/nonlinear/batchnorm", w.dense_bn);
-    gguf_free(g); if (tmp) ggml_free(tmp);
-    return ok;
+    load_bn(tmp, "campplus/xvector/dense/nonlinear/batchnorm", w.dense_bn);
+    return true;
 }
 static inline void bn_apply(float * x, const float * scale, const float * shift,
                             int C, int T)

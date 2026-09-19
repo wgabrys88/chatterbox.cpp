@@ -14,7 +14,6 @@
 #include <vector>
 #include <windows.h>
 #include <filesystem>
-#include <set>
 
 namespace {
 struct repl {
@@ -27,7 +26,6 @@ struct repl {
 
 uint32_t require_u32(const gguf_context * g, const char * key) {
     const int64_t id = gguf_find_key(g, key);
-    if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + key);
     return gguf_get_val_u32(g, id);
 }
 
@@ -42,41 +40,30 @@ void rewrite_gguf(const std::string & path, const std::vector<repl> & reps,
     ggml_context * src_ctx = nullptr;
     gguf_init_params gp = { false, &src_ctx };
     gguf_context * gin = gguf_init_from_file(path.c_str(), gp);
-    if (!gin || !src_ctx) throw std::runtime_error("GGUF open failed: " + path);
     std::unordered_map<std::string, const repl *> by_name;
     for (const auto & r : reps) by_name[r.name] = &r;
     ggml_init_params rp = { ggml_tensor_overhead() * (reps.size() + 4), nullptr, true };
     ggml_context * rctx = ggml_init(rp);
-    if (!rctx) throw std::runtime_error("ggml_init");
     gguf_context * gout = gguf_init_empty();
     gguf_set_kv(gout, gin);
     for (const auto & kv : kv_u32) gguf_set_val_u32(gout, kv.first, kv.second);
-    std::set<std::string> replaced;
-    for(const auto& r:reps) {
-        auto* old=ggml_get_tensor(src_ctx,r.name.c_str());
-        if(!old || old->type!=r.type)throw std::runtime_error("missing or wrong-type bake tensor: "+r.name);
-    }
     const int64_t n = gguf_get_n_tensors(gin);
     for (int64_t i = 0; i < n; ++i) {
         const char * name = gguf_get_tensor_name(gin, i);
         auto it = by_name.find(name);
         if (it == by_name.end()) {
             ggml_tensor * src = ggml_get_tensor(src_ctx, name);
-            if (!src) throw std::runtime_error(std::string("tensor missing in ctx: ") + name);
             gguf_add_tensor(gout, src);
             continue;
         }
         const repl & r = *it->second;
-        replaced.insert(r.name);
         int64_t ne[4] = { 1, 1, 1, 1 };
         for (size_t d = 0; d < r.ne.size() && d < 4; ++d) ne[d] = r.ne[d];
         ggml_tensor * t = ggml_new_tensor(rctx, r.type, (int)r.ne.size(), ne);
         ggml_set_name(t, name);
         gguf_add_tensor(gout, t);
         gguf_set_tensor_data(gout, name, r.data);
-        if (ggml_nbytes(t) != r.bytes) throw std::runtime_error(std::string("tensor size mismatch: ") + name);
     }
-    if(replaced.size()!=reps.size())throw std::runtime_error("incomplete bake replacements");
     const std::string tmp = path + ".tmp";
     if (!gguf_write_to_file(gout, tmp.c_str(), false)) throw std::runtime_error("GGUF write failed: " + path);
     gguf_free(gout);
@@ -88,7 +75,6 @@ void rewrite_gguf(const std::string & path, const std::vector<repl> & reps,
 }
 
 int main(int argc, char ** argv) {
-    if(argc!=4)throw std::runtime_error("usage: chatterbox-bake T3 S3 reference.wav");
     const char * t3 = argv[1];
     const char * s3 = argv[2];
     const char * ref = argv[3];
@@ -96,15 +82,10 @@ int main(int argc, char ** argv) {
     try {
     ggml_log_set([](ggml_log_level level, const char* message, void*) {if(level>=GGML_LOG_LEVEL_WARN&&message){fputs(message,stderr);fflush(stderr);}}, nullptr);
     ggml_backend_t backend = ggml_backend_vk_init(0);
-    if (!backend) throw std::runtime_error("Vulkan backend init failed");
 
     gguf_init_params meta = { true, nullptr };
     gguf_context * t3meta = gguf_init_from_file(t3, meta);
-    if (!t3meta) throw std::runtime_error("T3 GGUF open failed");
-    uint32_t max_cond = 0;
-    const int64_t max_id = gguf_find_key(t3meta, "chatterbox.cond_prompt_max");
-    if (max_id >= 0) max_cond = gguf_get_val_u32(t3meta, max_id);
-    else max_cond = require_u32(t3meta, "chatterbox.cond_prompt_length");
+    const uint32_t max_cond = require_u32(t3meta, "chatterbox.cond_prompt_max");
     gguf_free(t3meta);
 
     voice_encoder_weights ve;
@@ -115,10 +96,8 @@ int main(int argc, char ** argv) {
     normalise_lufs(wav, sr, -27.0);
     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
     wav = trim_silence(wav);
-    if (wav.empty()) throw std::runtime_error("reference wav");
     if (wav.size() > 30u * 16000u) wav.resize(30u * 16000u);
     if (!voice_encoder_embed(wav, ve, backend, speaker)) throw std::runtime_error("VE embed");
-    if (speaker.size() != 256) throw std::runtime_error("speaker_emb size");
 
     std::vector<int32_t> prompt_token, cond;
     tts_cpp::chatterbox::detail::compute_speech_tokens_native(ref, s3, (int)max_cond, prompt_token, cond, backend);
@@ -126,9 +105,6 @@ int main(int argc, char ** argv) {
     int prompt_rows = 0;
     tts_cpp::chatterbox::detail::compute_prompt_feat_native(ref, s3, prompt_feat, prompt_rows, backend);
     tts_cpp::chatterbox::detail::compute_embedding_native(ref, s3, embedding, backend);
-    if (prompt_rows <= 0 || (int)prompt_feat.size() != prompt_rows * 80) throw std::runtime_error("prompt_feat");
-    if (embedding.size() != 192) throw std::runtime_error("embedding size");
-    if (cond.empty() || prompt_token.empty()) throw std::runtime_error("speech tokens");
 
     std::vector<int64_t> speaker_ne = { 256, 1 };
     std::vector<int64_t> cond_ne = { (int64_t)cond.size() };

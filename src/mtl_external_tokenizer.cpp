@@ -12,7 +12,6 @@ namespace {
 std::wstring wide(const std::string & s) {
     if (s.empty()) return {};
     const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    if (!n) throw std::runtime_error("UTF-8 path conversion");
     std::wstring out(static_cast<size_t>(n), L'\0');
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), static_cast<int>(s.size()), out.data(), n) != n)
         throw std::runtime_error("UTF-8 path conversion");
@@ -40,7 +39,6 @@ std::wstring quote(const std::wstring & arg) {
 }
 
 template <typename T> T take_scalar(const std::vector<uint8_t> & data, size_t & offset) {
-    if (offset + sizeof(T) > data.size()) throw std::runtime_error("official tokenizer response truncated");
     T value{};
     std::memcpy(&value, data.data() + offset, sizeof(T));
     offset += sizeof(T);
@@ -118,7 +116,6 @@ struct mtl_external_tokenizer::Impl {
         CloseHandle(pipes.child_read); pipes.child_read = nullptr;
         CloseHandle(pipes.child_write); pipes.child_write = nullptr;
         const auto ready = request('R', "");
-        if (std::string(ready.begin(), ready.end()) != "ready") throw std::runtime_error("official tokenizer readiness handshake");
     }
 
     ~Impl() {
@@ -136,7 +133,6 @@ struct mtl_external_tokenizer::Impl {
     }
 
     std::vector<uint8_t> request(char mode, const std::string & text) {
-        if (text.size() > std::numeric_limits<uint32_t>::max()) throw std::runtime_error("official tokenizer input too large");
         const uint32_t size = static_cast<uint32_t>(text.size());
         write_all(input, &mode, 1);
         write_all(input, &size, sizeof(size));
@@ -144,10 +140,8 @@ struct mtl_external_tokenizer::Impl {
         uint32_t status = 0, response_size = 0;
         read_all(output, &status, sizeof(status));
         read_all(output, &response_size, sizeof(response_size));
-        if (response_size > 128u * 1024u * 1024u) throw std::runtime_error("official tokenizer response too large");
         std::vector<uint8_t> payload(response_size);
         if (response_size) read_all(output, payload.data(), payload.size());
-        if (status) throw std::runtime_error("official tokenizer failed: " + std::string(payload.begin(), payload.end()));
         return payload;
     }
 };
@@ -161,19 +155,11 @@ std::string mtl_external_tokenizer::punctuation(const std::string & text) {
     return std::string(payload.begin(), payload.end());
 }
 
-mtl_external_tokenizer_result mtl_external_tokenizer::tokenize(const std::string & text) {
-    auto payload = impl_->request('T', text);
+std::vector<int32_t> mtl_external_tokenizer::tokenize(const std::string & text) {
+    const auto payload = impl_->request('T', text);
     size_t offset = 0;
-    const uint32_t input_size = take_scalar<uint32_t>(payload, offset);
-    if (offset + input_size > payload.size()) throw std::runtime_error("official tokenizer input response truncated");
-    mtl_external_tokenizer_result result;
-    result.tokenizer_input.assign(reinterpret_cast<const char *>(payload.data() + offset), input_size);
-    offset += input_size;
-    const uint32_t count = take_scalar<uint32_t>(payload, offset);
-    if (count > (payload.size() - offset) / sizeof(int32_t)) throw std::runtime_error("official tokenizer ids truncated");
-    result.ids.resize(count);
-    if (count) std::memcpy(result.ids.data(), payload.data() + offset, count * sizeof(int32_t));
-    offset += count * sizeof(int32_t);
-    if (offset != payload.size()) throw std::runtime_error("official tokenizer response trailing data");
-    return result;
+    const auto count = take_scalar<uint32_t>(payload, offset);
+    std::vector<int32_t> ids(count);
+    std::memcpy(ids.data(), payload.data() + offset, count * sizeof(int32_t));
+    return ids;
 }

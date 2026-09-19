@@ -14,11 +14,6 @@ struct mtl_external_tokenizer_options {
     std::string dicta_model;
 };
 
-struct mtl_external_tokenizer_result {
-    std::string tokenizer_input;
-    std::vector<int32_t> ids;
-};
-
 class mtl_external_tokenizer {
 public:
     mtl_external_tokenizer(const mtl_external_tokenizer_options &, const std::string & language);
@@ -26,7 +21,7 @@ public:
     mtl_external_tokenizer(const mtl_external_tokenizer &) = delete;
     mtl_external_tokenizer & operator=(const mtl_external_tokenizer &) = delete;
     std::string punctuation(const std::string & text);
-    mtl_external_tokenizer_result tokenize(const std::string & text);
+    std::vector<int32_t> tokenize(const std::string & text);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

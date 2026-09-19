@@ -1,11 +1,8 @@
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "gguf.h"
+#include "gguf_weights.h"
 #include <algorithm>
-#include <cstring>
 #include <stdexcept>
-#include <string>
-#include <vector>
 #include "bake_native.h"
 #include "voice_features.h"
 #include "campplus.h"
@@ -20,16 +17,8 @@ void compute_prompt_feat_native(const std::string & wav_path, const std::string 
     if (sr != 24000) wav = resample_sinc(wav, sr, 24000);
     normalise_lufs(wav, 24000, -27.0);
     if ((int)wav.size() > 10 * 24000) wav.resize(10 * 24000);
-    ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = { false, &tmp_ctx };
-    gguf_context * g = gguf_init_from_file(s3gen_gguf_path.c_str(), gp);
-    if(!g||!tmp_ctx)throw std::runtime_error("S3 feature GGUF load");
-    ggml_tensor * fb = ggml_get_tensor(tmp_ctx, "s3gen/mel_fb/24k_80");
-    if(!fb || fb->type!=GGML_TYPE_F32)throw std::runtime_error("S3 mel filterbank");
-    std::vector<float> mel_fb(ggml_nelements(fb));
-    std::memcpy(mel_fb.data(), ggml_get_data(fb), ggml_nbytes(fb));
-    gguf_free(g);
-    ggml_free(tmp_ctx);
+    std::vector<float> mel_fb;
+    GgufWeights(s3gen_gguf_path).copy("s3gen/mel_fb/24k_80", mel_fb);
     out_feat = mel_extract_24k_80(wav, mel_fb, backend);
     out_rows = (int)(out_feat.size() / 80);
 }
@@ -37,16 +26,8 @@ void compute_embedding_native(const std::string & wav_path, const std::string & 
                               std::vector<float> & out_emb, ggml_backend_t backend) {
     campplus_weights w;
     if(!campplus_load(s3gen_gguf_path, w))throw std::runtime_error("CampPlus load");
-    ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = { false, &tmp_ctx };
-    gguf_context * g = gguf_init_from_file(s3gen_gguf_path.c_str(), gp);
-    if(!g||!tmp_ctx)throw std::runtime_error("CampPlus feature GGUF load");
-    ggml_tensor * fb_t = ggml_get_tensor(tmp_ctx, "campplus/mel_fb_kaldi_80");
-    if(!fb_t || fb_t->type!=GGML_TYPE_F32)throw std::runtime_error("CampPlus mel filterbank");
-    std::vector<float> mel_fb(ggml_nelements(fb_t));
-    std::memcpy(mel_fb.data(), ggml_get_data(fb_t), ggml_nbytes(fb_t));
-    gguf_free(g);
-    ggml_free(tmp_ctx);
+    std::vector<float> mel_fb;
+    GgufWeights(s3gen_gguf_path).copy("campplus/mel_fb_kaldi_80", mel_fb);
     std::vector<float> wav;
     int sr = 0;
     wav_load(wav_path, wav, sr);
@@ -55,7 +36,6 @@ void compute_embedding_native(const std::string & wav_path, const std::string & 
     if ((int)wav.size() > 10 * 16000) wav.resize(10 * 16000);
     std::vector<float> fbank = fbank_kaldi_80(wav, mel_fb, backend);
     const int T = (int)(fbank.size() / 80);
-    if(T<1)throw std::runtime_error("empty reference fbank");
     std::vector<float> col_mean(80, 0.0f);
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < 80; ++c) col_mean[c] += fbank[(size_t)t * 80 + c];

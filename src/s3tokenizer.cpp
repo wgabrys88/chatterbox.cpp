@@ -3,7 +3,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "gguf.h"
+#include "gguf_weights.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -13,82 +13,54 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-static bool copy_f32(ggml_context * ctx, const char * name,
-                     std::vector<float> & out)
-{
-    ggml_tensor * t = ggml_get_tensor(ctx, name);
-    if (!t) throw std::runtime_error(name);
-    out.resize(ggml_nelements(t));
-    std::memcpy(out.data(), ggml_get_data(t), ggml_nbytes(t));
-    return true;
-}
 bool s3tokv2_load(const std::string & path, s3tokv2_weights & w)
 {
-    ggml_context * tmp = nullptr;
-    gguf_init_params gp = {  false,  &tmp };
-    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
-    if (!g) throw std::runtime_error(path);
-    auto u32 = [&](const char * k) {
-        int64_t id = gguf_find_key(g, k);
-        if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
-        return gguf_get_val_u32(g, id);
-    };
-    auto f32 = [&](const char * k) {
-        int64_t id = gguf_find_key(g, k);
-        if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
-        return gguf_get_val_f32(g, id);
-    };
-    try {
-        w.n_mels       = (int)u32("s3tokv2.n_mels");
-        w.n_state      = (int)u32("s3tokv2.n_audio_state");
-        w.n_head       = (int)u32("s3tokv2.n_audio_head");
-        w.n_layer      = (int)u32("s3tokv2.n_audio_layer");
-        w.head_dim     = (int)u32("s3tokv2.head_dim");
-        w.mlp_ratio    = (int)u32("s3tokv2.mlp_ratio");
-        w.fsmn_kernel  = (int)u32("s3tokv2.fsmn_kernel");
-        w.fsq_levels   = (int)u32("s3tokv2.fsq_levels");
-        w.fsq_dim      = (int)u32("s3tokv2.fsq_dim");
-        w.codebook_size= (int)u32("s3tokv2.codebook_size");
-        w.conv_stride  = (int)u32("s3tokv2.conv_stride");
-        w.n_fft        = (int)u32("s3tokv2.n_fft");
-        w.hop          = (int)u32("s3tokv2.hop");
-        w.sample_rate  = (int)u32("s3tokv2.sample_rate");
-        w.rope_theta   = f32("s3tokv2.rope_theta");
-        w.rope_max_pos = (int)u32("s3tokv2.rope_max_pos");
-    } catch (const std::exception & e) {
-        gguf_free(g); if (tmp) ggml_free(tmp); throw;
-    }
-    bool ok = true;
-    ok &= copy_f32(tmp, "s3tokv2/mel_fb",              w.mel_fb);
-    ok &= copy_f32(tmp, "s3tokv2/encoder/conv1/weight", w.conv1_w);
-    ok &= copy_f32(tmp, "s3tokv2/encoder/conv1/bias",   w.conv1_b);
-    ok &= copy_f32(tmp, "s3tokv2/encoder/conv2/weight", w.conv2_w);
-    ok &= copy_f32(tmp, "s3tokv2/encoder/conv2/bias",   w.conv2_b);
+    GgufWeights weights(path);
+        w.n_mels       = (int)weights.u32("s3tokv2.n_mels");
+        w.n_state      = (int)weights.u32("s3tokv2.n_audio_state");
+        w.n_head       = (int)weights.u32("s3tokv2.n_audio_head");
+        w.n_layer      = (int)weights.u32("s3tokv2.n_audio_layer");
+        w.head_dim     = (int)weights.u32("s3tokv2.head_dim");
+        w.mlp_ratio    = (int)weights.u32("s3tokv2.mlp_ratio");
+        w.fsmn_kernel  = (int)weights.u32("s3tokv2.fsmn_kernel");
+        w.fsq_levels   = (int)weights.u32("s3tokv2.fsq_levels");
+        w.fsq_dim      = (int)weights.u32("s3tokv2.fsq_dim");
+        w.codebook_size= (int)weights.u32("s3tokv2.codebook_size");
+        w.conv_stride  = (int)weights.u32("s3tokv2.conv_stride");
+        w.n_fft        = (int)weights.u32("s3tokv2.n_fft");
+        w.hop          = (int)weights.u32("s3tokv2.hop");
+        w.sample_rate  = (int)weights.u32("s3tokv2.sample_rate");
+        w.rope_theta   = weights.f32("s3tokv2.rope_theta");
+        w.rope_max_pos = (int)weights.u32("s3tokv2.rope_max_pos");
+    weights.copy( "s3tokv2/mel_fb",              w.mel_fb);
+    weights.copy( "s3tokv2/encoder/conv1/weight", w.conv1_w);
+    weights.copy( "s3tokv2/encoder/conv1/bias",   w.conv1_b);
+    weights.copy( "s3tokv2/encoder/conv2/weight", w.conv2_w);
+    weights.copy( "s3tokv2/encoder/conv2/bias",   w.conv2_b);
     w.blocks.clear(); w.blocks.resize(w.n_layer);
     for (int i = 0; i < w.n_layer; ++i) {
         auto & b = w.blocks[i];
         const std::string p = "s3tokv2/encoder/blocks/" + std::to_string(i);
-        ok &= copy_f32(tmp, (p + "/attn_ln/weight").c_str(), b.attn_ln_w);
-        ok &= copy_f32(tmp, (p + "/attn_ln/bias").c_str(),   b.attn_ln_b);
-        ok &= copy_f32(tmp, (p + "/attn/query/weight").c_str(), b.q_w);
-        ok &= copy_f32(tmp, (p + "/attn/query/bias").c_str(),   b.q_b);
-        ok &= copy_f32(tmp, (p + "/attn/key/weight").c_str(),   b.k_w);
-        ok &= copy_f32(tmp, (p + "/attn/value/weight").c_str(), b.v_w);
-        ok &= copy_f32(tmp, (p + "/attn/value/bias").c_str(),   b.v_b);
-        ok &= copy_f32(tmp, (p + "/attn/out/weight").c_str(),   b.out_w);
-        ok &= copy_f32(tmp, (p + "/attn/out/bias").c_str(),     b.out_b);
-        ok &= copy_f32(tmp, (p + "/attn/fsmn_block/weight").c_str(), b.fsmn_w);
-        ok &= copy_f32(tmp, (p + "/mlp_ln/weight").c_str(), b.mlp_ln_w);
-        ok &= copy_f32(tmp, (p + "/mlp_ln/bias").c_str(),   b.mlp_ln_b);
-        ok &= copy_f32(tmp, (p + "/mlp/0/weight").c_str(), b.mlp0_w);
-        ok &= copy_f32(tmp, (p + "/mlp/0/bias").c_str(),   b.mlp0_b);
-        ok &= copy_f32(tmp, (p + "/mlp/2/weight").c_str(), b.mlp2_w);
-        ok &= copy_f32(tmp, (p + "/mlp/2/bias").c_str(),   b.mlp2_b);
+        weights.copy( (p + "/attn_ln/weight").c_str(), b.attn_ln_w);
+        weights.copy( (p + "/attn_ln/bias").c_str(),   b.attn_ln_b);
+        weights.copy( (p + "/attn/query/weight").c_str(), b.q_w);
+        weights.copy( (p + "/attn/query/bias").c_str(),   b.q_b);
+        weights.copy( (p + "/attn/key/weight").c_str(),   b.k_w);
+        weights.copy( (p + "/attn/value/weight").c_str(), b.v_w);
+        weights.copy( (p + "/attn/value/bias").c_str(),   b.v_b);
+        weights.copy( (p + "/attn/out/weight").c_str(),   b.out_w);
+        weights.copy( (p + "/attn/out/bias").c_str(),     b.out_b);
+        weights.copy( (p + "/attn/fsmn_block/weight").c_str(), b.fsmn_w);
+        weights.copy( (p + "/mlp_ln/weight").c_str(), b.mlp_ln_w);
+        weights.copy( (p + "/mlp_ln/bias").c_str(),   b.mlp_ln_b);
+        weights.copy( (p + "/mlp/0/weight").c_str(), b.mlp0_w);
+        weights.copy( (p + "/mlp/0/bias").c_str(),   b.mlp0_b);
+        weights.copy( (p + "/mlp/2/weight").c_str(), b.mlp2_w);
+        weights.copy( (p + "/mlp/2/bias").c_str(),   b.mlp2_b);
     }
-    ok &= copy_f32(tmp, "s3tokv2/quantizer/_codebook/project_down/weight", w.fsq_w);
-    ok &= copy_f32(tmp, "s3tokv2/quantizer/_codebook/project_down/bias",   w.fsq_b);
-    gguf_free(g); if (tmp) ggml_free(tmp);
-    return ok;
+    weights.copy( "s3tokv2/quantizer/_codebook/project_down/weight", w.fsq_w);
+    weights.copy( "s3tokv2/quantizer/_codebook/project_down/bias",   w.fsq_b);
+    return true;
 }
 static void reflect_pad(const float * in, int L, int left, int right,
                         std::vector<float> & out)
@@ -207,32 +179,11 @@ static ggml_tensor * layer_norm(ggml_context * ctx, ggml_tensor * x,
     y = ggml_add(ctx, y, beta);
     return y;
 }
-static ggml_tensor * add_weight_f32_1d(ggml_context * ctx, int64_t n,
-                                       const char * name)
-{
-    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
-    ggml_set_name(t, name);
-    return t;
-}
-static ggml_tensor * add_weight_f32_2d(ggml_context * ctx, int64_t a, int64_t b,
-                                       const char * name)
-{
-    ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a, b);
-    ggml_set_name(t, name);
-    return t;
-}
-static ggml_tensor * add_weight_f32_3d(ggml_context * ctx, int64_t a, int64_t b, int64_t c,
-                                       const char * name)
-{
-    ggml_tensor * t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, a, b, c);
-    ggml_set_name(t, name);
-    return t;
-}
+
 }
 static bool build_encoder_ctx(encoder_ctx & ec, const s3tokv2_weights & w,
                                ggml_backend_t backend)
 {
-    if (!backend) throw std::runtime_error("Vulkan");
     ec.backend = backend;
     const int n_tensors = 4 + 16 * w.n_layer + 8;
     ggml_init_params ip = {
@@ -241,65 +192,57 @@ static bool build_encoder_ctx(encoder_ctx & ec, const s3tokv2_weights & w,
          true,
     };
     ec.ctx = ggml_init(ip);
-    if (!ec.ctx) throw std::runtime_error("ggml_init");
-    ec.conv1_w = add_weight_f32_3d(ec.ctx, 3, w.n_mels, w.n_state, "s3tokv2/conv1_w");
-    ec.conv1_b = add_weight_f32_1d(ec.ctx, w.n_state, "s3tokv2/conv1_b");
-    ec.conv2_w = add_weight_f32_3d(ec.ctx, 3, w.n_state, w.n_state, "s3tokv2/conv2_w");
-    ec.conv2_b = add_weight_f32_1d(ec.ctx, w.n_state, "s3tokv2/conv2_b");
+    ec.conv1_w = ggml_new_tensor_3d(ec.ctx, GGML_TYPE_F32, 3, w.n_mels, w.n_state);
+    ec.conv1_b = ggml_new_tensor_1d(ec.ctx, GGML_TYPE_F32, w.n_state);
+    ec.conv2_w = ggml_new_tensor_3d(ec.ctx, GGML_TYPE_F32, 3, w.n_state, w.n_state);
+    ec.conv2_b = ggml_new_tensor_1d(ec.ctx, GGML_TYPE_F32, w.n_state);
     ec.blocks.resize(w.n_layer);
     for (int i = 0; i < w.n_layer; ++i) {
         auto & B = ec.blocks[i];
-        std::string prefix = "s3tokv2/blk" + std::to_string(i);
-        B.attn_ln_w = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/attn_ln_w").c_str());
-        B.attn_ln_b = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/attn_ln_b").c_str());
-        B.q_w       = add_weight_f32_2d(ec.ctx, w.n_state, w.n_state, (prefix + "/q_w").c_str());
-        B.q_b       = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/q_b").c_str());
-        B.k_w       = add_weight_f32_2d(ec.ctx, w.n_state, w.n_state, (prefix + "/k_w").c_str());
-        B.v_w       = add_weight_f32_2d(ec.ctx, w.n_state, w.n_state, (prefix + "/v_w").c_str());
-        B.v_b       = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/v_b").c_str());
-        B.out_w     = add_weight_f32_2d(ec.ctx, w.n_state, w.n_state, (prefix + "/out_w").c_str());
-        B.out_b     = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/out_b").c_str());
-        B.fsmn_w    = add_weight_f32_3d(ec.ctx, w.fsmn_kernel, 1, w.n_state,
-                                        (prefix + "/fsmn_w").c_str());
-        B.mlp_ln_w  = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/mlp_ln_w").c_str());
-        B.mlp_ln_b  = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/mlp_ln_b").c_str());
+        B.attn_ln_w = ggml_new_tensor_1d(ec.ctx, GGML_TYPE_F32, w.n_state);
+        B.attn_ln_b = ggml_new_tensor_1d(ec.ctx, GGML_TYPE_F32, w.n_state);
+        B.q_w       = ggml_new_tensor_2d(ec.ctx, GGML_TYPE_F32, w.n_state, w.n_state);
+        B.q_b       = ggml_new_tensor_1d(ec.ctx, GGML_TYPE_F32, w.n_state);
+        B.k_w       = ggml_new_tensor_2d(ec.ctx, GGML_TYPE_F32, w.n_state, w.n_state);
+        B.v_w       = ggml_new_tensor_2d(ec.ctx, GGML_TYPE_F32, w.n_state, w.n_state);
+        B.v_b       = ggml_new_tensor_1d(ec.ctx, GGML_TYPE_F32, w.n_state);
+        B.out_w     = ggml_new_tensor_2d(ec.ctx, GGML_TYPE_F32, w.n_state, w.n_state);
+        B.out_b     = ggml_new_tensor_1d(ec.ctx, GGML_TYPE_F32, w.n_state);
+        B.fsmn_w    = ggml_new_tensor_3d(ec.ctx, GGML_TYPE_F32, w.fsmn_kernel, 1, w.n_state);
+        B.mlp_ln_w  = ggml_new_tensor_1d(ec.ctx, GGML_TYPE_F32, w.n_state);
+        B.mlp_ln_b  = ggml_new_tensor_1d(ec.ctx, GGML_TYPE_F32, w.n_state);
         const int mlp_hidden = w.n_state * w.mlp_ratio;
-        B.mlp0_w    = add_weight_f32_2d(ec.ctx, w.n_state, mlp_hidden,(prefix + "/mlp0_w").c_str());
-        B.mlp0_b    = add_weight_f32_1d(ec.ctx, mlp_hidden,           (prefix + "/mlp0_b").c_str());
-        B.mlp2_w    = add_weight_f32_2d(ec.ctx, mlp_hidden, w.n_state,(prefix + "/mlp2_w").c_str());
-        B.mlp2_b    = add_weight_f32_1d(ec.ctx, w.n_state,            (prefix + "/mlp2_b").c_str());
+        B.mlp0_w    = ggml_new_tensor_2d(ec.ctx, GGML_TYPE_F32, w.n_state, mlp_hidden);
+        B.mlp0_b    = ggml_new_tensor_1d(ec.ctx, GGML_TYPE_F32, mlp_hidden);
+        B.mlp2_w    = ggml_new_tensor_2d(ec.ctx, GGML_TYPE_F32, mlp_hidden, w.n_state);
+        B.mlp2_b    = ggml_new_tensor_1d(ec.ctx, GGML_TYPE_F32, w.n_state);
     }
     ec.buffer = ggml_backend_alloc_ctx_tensors(ec.ctx, ec.backend);
-    if (!ec.buffer) throw std::runtime_error("s3tokv2 buffer");
     auto set = [&](ggml_tensor * t, const std::vector<float> & src) {
         size_t bytes = src.size() * sizeof(float);
-        if (bytes != ggml_nbytes(t)) {
-            throw std::runtime_error(ggml_get_name(t));
-        }
         ggml_backend_tensor_set(t, src.data(), 0, bytes);
         return true;
     };
-    bool ok = true;
-    ok &= set(ec.conv1_w, w.conv1_w);
-    ok &= set(ec.conv1_b, w.conv1_b);
-    ok &= set(ec.conv2_w, w.conv2_w);
-    ok &= set(ec.conv2_b, w.conv2_b);
+    set(ec.conv1_w, w.conv1_w);
+    set(ec.conv1_b, w.conv1_b);
+    set(ec.conv2_w, w.conv2_w);
+    set(ec.conv2_b, w.conv2_b);
     for (int i = 0; i < w.n_layer; ++i) {
         auto & B = ec.blocks[i];
         const auto & src = w.blocks[i];
-        ok &= set(B.attn_ln_w, src.attn_ln_w);
-        ok &= set(B.attn_ln_b, src.attn_ln_b);
-        ok &= set(B.q_w, src.q_w); ok &= set(B.q_b, src.q_b);
-        ok &= set(B.k_w, src.k_w);
-        ok &= set(B.v_w, src.v_w); ok &= set(B.v_b, src.v_b);
-        ok &= set(B.out_w, src.out_w); ok &= set(B.out_b, src.out_b);
-        ok &= set(B.fsmn_w, src.fsmn_w);
-        ok &= set(B.mlp_ln_w, src.mlp_ln_w);
-        ok &= set(B.mlp_ln_b, src.mlp_ln_b);
-        ok &= set(B.mlp0_w, src.mlp0_w); ok &= set(B.mlp0_b, src.mlp0_b);
-        ok &= set(B.mlp2_w, src.mlp2_w); ok &= set(B.mlp2_b, src.mlp2_b);
+        set(B.attn_ln_w, src.attn_ln_w);
+        set(B.attn_ln_b, src.attn_ln_b);
+        set(B.q_w, src.q_w); set(B.q_b, src.q_b);
+        set(B.k_w, src.k_w);
+        set(B.v_w, src.v_w); set(B.v_b, src.v_b);
+        set(B.out_w, src.out_w); set(B.out_b, src.out_b);
+        set(B.fsmn_w, src.fsmn_w);
+        set(B.mlp_ln_w, src.mlp_ln_w);
+        set(B.mlp_ln_b, src.mlp_ln_b);
+        set(B.mlp0_w, src.mlp0_w); set(B.mlp0_b, src.mlp0_b);
+        set(B.mlp2_w, src.mlp2_w); set(B.mlp2_b, src.mlp2_b);
     }
-    return ok;
+    return true;
 }
 static void free_encoder_ctx(encoder_ctx & ec) {
     if (ec.alloc)  { ggml_gallocr_free(ec.alloc);  ec.alloc = nullptr; }
@@ -407,11 +350,7 @@ bool s3tokv2_tokenize(const std::vector<float> & wav,
             throw std::runtime_error("s3tokv2 run_ctx");
         }
     }
-    std::vector<float> mel_time_major((size_t)T_mel * w.n_mels);
-    for (int m = 0; m < w.n_mels; ++m)
-        for (int t = 0; t < T_mel; ++t)
-            mel_time_major[(size_t)m * T_mel + t] = mel[(size_t)m * T_mel + t];
-    ggml_backend_tensor_set(ec.mel_in, mel_time_major.data(), 0, mel_time_major.size() * sizeof(float));
+    ggml_backend_tensor_set(ec.mel_in, mel.data(), 0, mel.size() * sizeof(float));
     std::vector<int32_t> pos(T2);
     for (int i = 0; i < T2; ++i) pos[i] = i;
     ggml_backend_tensor_set(ec.pos, pos.data(), 0, pos.size() * sizeof(int32_t));

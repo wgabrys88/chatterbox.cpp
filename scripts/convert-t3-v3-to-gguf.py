@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, math, re, sys
+import argparse, json, math, re
 from pathlib import Path
 import gguf, numpy as np, torch
 from quant_policy import WEIGHT_TYPES, add_weight
@@ -12,9 +12,8 @@ ROPE_THETA, ROPE_ORIG_CTX = 500000.0, 8192
 ROPE_FACTOR, ROPE_HIGH, ROPE_LOW = 8.0, 4.0, 1.0
 LAYER_RE = re.compile(r"^tfmr\.layers\.(\d+)\.(.+)$")
 SKIP = {"tfmr.embed_tokens.weight", "text_head.weight"}
-def as_numpy(tensor, *, dtype=None):
-    if dtype is not None: tensor = tensor.to(dtype)
-    return np.ascontiguousarray(tensor.detach().cpu().numpy())
+from convert_common import as_numpy, finish_t3
+
 def llama3_freq_factors(n_dims, base, factor, low_freq_factor, high_freq_factor, old_context_len):
     n = n_dims // 2
     out = np.zeros(n, dtype=np.float32)
@@ -42,18 +41,7 @@ def tokenizer_contract(ckpt_dir, text_vocab_size):
     tokenizer_path = ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     vocab = tokenizer.get_vocab()
-    if not vocab:
-        raise SystemExit("empty tokenizer vocabulary")
-    ids = list(vocab.values())
-    if min(ids) < 0 or max(ids) + 1 != text_vocab_size:
-        raise SystemExit(f"tokenizer/model vocabulary mismatch: tokenizer max={max(ids)} model={text_vocab_size}")
-    for name in ("[START]", "[STOP]", "[UNK]", "[SPACE]"):
-        if name not in vocab:
-            raise SystemExit(f"tokenizer missing {name}")
     language_tokens = sorted(t for t in vocab if re.fullmatch(r"\[[a-z]{2,3}\]", t))
-    if not language_tokens:
-        raise SystemExit("tokenizer has no language tokens")
-    json.loads((ckpt_dir / "Cangjie5_TC.json").read_text(encoding="utf-8"))
     return {
         "language_tokens": language_tokens,
         "start": int(vocab["[START]"]),
@@ -109,30 +97,16 @@ def main():
     ckpt_dir, out = Path(a.ckpt_dir), Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     state = load_file(ckpt_dir / a.t3_safetensors)
-    unknown = [name for name in state if name not in SKIP and map_name(name) is None]
-    if unknown:
-        print("STOP unknown keys:", file=sys.stderr)
-        for name in unknown:
-            print(f"  {name}\t{tuple(state[name].shape)}", file=sys.stderr)
-        raise SystemExit("v3 t3 keys differ")
     conds = torch.load(ckpt_dir / "conds.pt", map_location="cpu", weights_only=True)
     n_embd = int(state["tfmr.norm.weight"].shape[0])
     n_layer = max(int(m.group(1)) for name in state if (m := LAYER_RE.match(name))) + 1
     n_head = n_embd // 64
-    if n_embd % 64:
-        raise SystemExit(f"n_head {n_embd}//64")
     n_ff = int(state["tfmr.layers.0.mlp.gate_proj.weight"].shape[0])
     perceiver_len = int(state["cond_enc.perceiver.pre_attention_query"].shape[1])
     text_pos_len = int(state["text_pos_emb.emb.weight"].shape[0])
     text_vocab_size = int(state["text_emb.weight"].shape[0])
     speech_pos_len = int(state["speech_pos_emb.emb.weight"].shape[0])
 
-    if n_embd != 1024 or n_layer != 30 or n_head != 16 or n_ff != 4096:
-        raise SystemExit(f"v3 expected Llama_520M 1024/30/16/4096, got {n_embd}/{n_layer}/{n_head}/{n_ff}")
-    if perceiver_len != 32 or text_pos_len != 2050 or speech_pos_len != 4100:
-        raise SystemExit(f"v3 pos tables expected perceiver=32 text=2050 speech=4100, got {perceiver_len}/{text_pos_len}/{speech_pos_len}")
-    if speech_pos_len <= MAX_GENERATION_TOKENS:
-        raise SystemExit(f"speech_pos {speech_pos_len} must exceed MAX_GENERATION_TOKENS {MAX_GENERATION_TOKENS}")
     n_ctx = 1 + perceiver_len + 1 + text_pos_len + 2 + MAX_GENERATION_TOKENS
     tokenizer = tokenizer_contract(ckpt_dir, text_vocab_size)
     writer = gguf.GGUFWriter(str(out), "chatterbox")
@@ -162,32 +136,6 @@ def main():
         gguf_name, dtype = mapped
         add(writer, gguf_name, as_numpy(tensor, dtype=dtype), a.matrix_type)
     writer.add_tensor("model/rope_freq_factors", llama3_freq_factors(64, ROPE_THETA, ROPE_FACTOR, ROPE_LOW, ROPE_HIGH, ROPE_ORIG_CTX))
-    builtin_tokens = conds["t3"]["cond_prompt_speech_tokens"].reshape(-1).to(torch.int32)
-    writer.add_uint32("chatterbox.cond_prompt_max", int(builtin_tokens.numel()))
-    writer.add_uint32("chatterbox.cond_prompt_length", int(builtin_tokens.numel()))
-    writer.add_tensor("chatterbox/builtin/speaker_emb", as_numpy(conds["t3"]["speaker_emb"].reshape(1, SPEAKER_EMBED_SIZE), dtype=torch.float32))
-    writer.add_tensor("chatterbox/builtin/cond_prompt_speech_tokens", as_numpy(builtin_tokens))
-    ve = load_file(ckpt_dir / "ve.safetensors")
-    writer.add_uint32("voice_encoder.n_mels", 40)
-    writer.add_uint32("voice_encoder.hidden_size", 256)
-    writer.add_uint32("voice_encoder.num_layers", 3)
-    writer.add_uint32("voice_encoder.embedding_size", 256)
-    writer.add_uint32("voice_encoder.partial_frames", 160)
-    writer.add_uint32("voice_encoder.sample_rate", 16000)
-    writer.add_uint32("voice_encoder.n_fft", 400)
-    writer.add_uint32("voice_encoder.hop_size", 160)
-    writer.add_uint32("voice_encoder.win_size", 400)
-    writer.add_float32("voice_encoder.overlap", 0.5)
-    writer.add_float32("voice_encoder.rate", 1.3)
-    writer.add_float32("voice_encoder.min_coverage", 0.8)
-    for k, t in ve.items():
-        if not k.startswith("similarity_"):
-            writer.add_tensor(f"voice_encoder/{k.replace('.', '/')}", as_numpy(t, dtype=torch.float32))
-    import librosa
-    writer.add_tensor("voice_encoder/mel_fb", np.ascontiguousarray(librosa.filters.mel(sr=16000, n_fft=400, n_mels=40, fmin=0, fmax=8000).astype(np.float32)))
-    writer.write_header_to_file()
-    writer.write_kv_data_to_file()
-    writer.write_tensors_to_file()
-    writer.close()
+    finish_t3(writer, ckpt_dir, conds)
 if __name__ == "__main__":
     main()

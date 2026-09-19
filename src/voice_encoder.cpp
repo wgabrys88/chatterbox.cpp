@@ -3,61 +3,24 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "gguf.h"
+#include "gguf_weights.h"
+#include <cstdio>
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
-#include <cstring>
 #include <stdexcept>
-#include <string>
-#include <vector>
-static bool copy_tensor_f32(ggml_context * ctx, const char * name,
-                            std::vector<float> & out)
-{
-    ggml_tensor * t = ggml_get_tensor(ctx, name);
-    if (!t) return false;
-    out.resize(ggml_nelements(t));
-    std::memcpy(out.data(), ggml_get_data(t), ggml_nbytes(t));
-    return true;
-}
 bool voice_encoder_load(const std::string & t3_gguf_path,
                         voice_encoder_weights & out)
 {
-    ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gp = {  false,  &tmp_ctx };
-    gguf_context * g = gguf_init_from_file(t3_gguf_path.c_str(), gp);
-    if (!g) throw std::runtime_error(t3_gguf_path);
-    auto cleanup = [&](bool ok) {
-        gguf_free(g);
-        if (tmp_ctx) ggml_free(tmp_ctx);
-        return ok;
-    };
-    if (gguf_find_key(g, "voice_encoder.hidden_size") < 0) {
-        throw std::runtime_error("voice_encoder.hidden_size");
-    }
-    auto get_u32 = [&](const char * k) -> uint32_t {
-        int64_t id = gguf_find_key(g, k);
-        if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
-        return gguf_get_val_u32(g, id);
-    };
-    auto get_f32 = [&](const char * k) -> float {
-        int64_t id = gguf_find_key(g, k);
-        if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + k);
-        return gguf_get_val_f32(g, id);
-    };
-    out.n_layers       = (int)get_u32("voice_encoder.num_layers");
-    out.n_mels         = (int)get_u32("voice_encoder.n_mels");
-    out.hidden         = (int)get_u32("voice_encoder.hidden_size");
-    out.embedding      = (int)get_u32("voice_encoder.embedding_size");
-    out.partial_frames = (int)get_u32("voice_encoder.partial_frames");
-    out.sample_rate    = (int)get_u32("voice_encoder.sample_rate");
-    out.overlap        = get_f32("voice_encoder.overlap");
-    out.rate           = get_f32("voice_encoder.rate");
-    out.min_coverage   = get_f32("voice_encoder.min_coverage");
-    auto load_or_fail = [&](const char * name, std::vector<float> & dst) {
-        if (copy_tensor_f32(tmp_ctx, name, dst)) return true;
-        throw std::runtime_error(name);
-    };
+    GgufWeights weights(t3_gguf_path);
+    out.n_layers       = (int)weights.u32("voice_encoder.num_layers");
+    out.n_mels         = (int)weights.u32("voice_encoder.n_mels");
+    out.hidden         = (int)weights.u32("voice_encoder.hidden_size");
+    out.embedding      = (int)weights.u32("voice_encoder.embedding_size");
+    out.partial_frames = (int)weights.u32("voice_encoder.partial_frames");
+    out.sample_rate    = (int)weights.u32("voice_encoder.sample_rate");
+    out.overlap        = weights.f32("voice_encoder.overlap");
+    out.rate           = weights.f32("voice_encoder.rate");
+    out.min_coverage   = weights.f32("voice_encoder.min_coverage");
     out.lstm.clear();
     out.lstm.resize(out.n_layers);
     for (int l = 0; l < out.n_layers; ++l) {
@@ -66,28 +29,25 @@ bool voice_encoder_load(const std::string & t3_gguf_path,
         L.I = (l == 0) ? out.n_mels : out.hidden;
         char name[128];
         std::snprintf(name, sizeof(name), "voice_encoder/lstm/weight_ih_l%d", l);
-        if (!load_or_fail(name, L.w_ih)) return cleanup(false);
+        weights.copy(name, L.w_ih);
         std::snprintf(name, sizeof(name), "voice_encoder/lstm/weight_hh_l%d", l);
-        if (!load_or_fail(name, L.w_hh)) return cleanup(false);
+        weights.copy(name, L.w_hh);
         std::snprintf(name, sizeof(name), "voice_encoder/lstm/bias_ih_l%d", l);
-        if (!load_or_fail(name, L.b_ih)) return cleanup(false);
+        weights.copy(name, L.b_ih);
         std::snprintf(name, sizeof(name), "voice_encoder/lstm/bias_hh_l%d", l);
-        if (!load_or_fail(name, L.b_hh)) return cleanup(false);
+        weights.copy(name, L.b_hh);
     }
-    if (!load_or_fail("voice_encoder/proj/weight", out.proj_w)) return cleanup(false);
-    if (!load_or_fail("voice_encoder/proj/bias",   out.proj_b)) return cleanup(false);
-    if (!load_or_fail("voice_encoder/mel_fb",      out.mel_fb)) return cleanup(false);
-    return cleanup(true);
+    weights.copy("voice_encoder/proj/weight", out.proj_w);
+    weights.copy("voice_encoder/proj/bias",   out.proj_b);
+    weights.copy("voice_encoder/mel_fb",      out.mel_fb);
+    return true;
 }
 static void compute_partials(int n_frames, int partial, float rate,
                              int sample_rate_hz,
                              float min_coverage,
                              int & n_wins, int & step, int & target_n)
 {
-    if (rate <= 0.0f) throw std::runtime_error("voice encoder rate must be positive");
     step = (int)std::lround(((double)sample_rate_hz / (double)rate) / (double)partial);
-    if (step <= 0) throw std::runtime_error("voice encoder window step is not positive");
-    if (step > partial) throw std::runtime_error("voice encoder window step exceeds partial frames");
     int a = std::max(n_frames - partial + step, 0);
     int nw = a / step;
     int remainder = a - nw * step;
@@ -142,46 +102,30 @@ static bool ve_graph_init_weights(ve_graph & G, const voice_encoder_weights & w)
          true,
     };
     G.weights_ctx = ggml_init(ip);
-    if (!G.weights_ctx) throw std::runtime_error("ve ggml_init");
     const int G4 = 4 * H;
     for (int l = 0; l < n_layers; ++l) {
         const int I_l = (l == 0) ? w.n_mels : H;
-        char name[64];
-        std::snprintf(name, sizeof(name), "ve/l%d/w_ih", l);
         G.w_ih[l] = ggml_new_tensor_2d(G.weights_ctx, GGML_TYPE_F32, I_l, G4);
-        ggml_set_name(G.w_ih[l], name);
-        std::snprintf(name, sizeof(name), "ve/l%d/w_hh", l);
         G.w_hh[l] = ggml_new_tensor_2d(G.weights_ctx, GGML_TYPE_F32, H, G4);
-        ggml_set_name(G.w_hh[l], name);
-        std::snprintf(name, sizeof(name), "ve/l%d/b_ih", l);
         G.b_ih[l] = ggml_new_tensor_1d(G.weights_ctx, GGML_TYPE_F32, G4);
-        ggml_set_name(G.b_ih[l], name);
-        std::snprintf(name, sizeof(name), "ve/l%d/b_hh", l);
         G.b_hh[l] = ggml_new_tensor_1d(G.weights_ctx, GGML_TYPE_F32, G4);
-        ggml_set_name(G.b_hh[l], name);
     }
     G.proj_w = ggml_new_tensor_2d(G.weights_ctx, GGML_TYPE_F32, H, E);
-    ggml_set_name(G.proj_w, "ve/proj_w");
     G.proj_b = ggml_new_tensor_1d(G.weights_ctx, GGML_TYPE_F32, E);
-    ggml_set_name(G.proj_b, "ve/proj_b");
     G.weights_buf = ggml_backend_alloc_ctx_tensors(G.weights_ctx, G.backend);
-    if (!G.weights_buf) throw std::runtime_error("ve alloc");
     auto set_tensor = [](ggml_tensor * t, const std::vector<float> & src) -> bool {
         const size_t bytes = src.size() * sizeof(float);
-        if (bytes != ggml_nbytes(t)) {
-            throw std::runtime_error(ggml_get_name(t));
-        }
         ggml_backend_tensor_set(t, src.data(), 0, bytes);
         return true;
     };
     for (int l = 0; l < n_layers; ++l) {
-        if (!set_tensor(G.w_ih[l], w.lstm[l].w_ih)) return false;
-        if (!set_tensor(G.w_hh[l], w.lstm[l].w_hh)) return false;
-        if (!set_tensor(G.b_ih[l], w.lstm[l].b_ih)) return false;
-        if (!set_tensor(G.b_hh[l], w.lstm[l].b_hh)) return false;
+        set_tensor(G.w_ih[l], w.lstm[l].w_ih);
+        set_tensor(G.w_hh[l], w.lstm[l].w_hh);
+        set_tensor(G.b_ih[l], w.lstm[l].b_ih);
+        set_tensor(G.b_hh[l], w.lstm[l].b_hh);
     }
-    if (!set_tensor(G.proj_w, w.proj_w)) return false;
-    if (!set_tensor(G.proj_b, w.proj_b)) return false;
+    set_tensor(G.proj_w, w.proj_w);
+    set_tensor(G.proj_b, w.proj_b);
     return true;
 }
 static ggml_cgraph * build_ve_batched_graph(const ve_graph & G) {
@@ -271,9 +215,7 @@ bool voice_encoder_embed(const std::vector<float> & wav_16k,
                          ggml_backend_t backend,
                          std::vector<float> & out)
 {
-    if (w.mel_fb.empty() || w.lstm.size() != (size_t)w.n_layers) throw std::runtime_error("VE weights");
     std::vector<float> mel = mel_extract_16k_40(wav_16k, w.mel_fb, backend);
-    if (mel.empty()) throw std::runtime_error("VE mel");
     const int T_mel = (int)(mel.size() / w.n_mels);
     int n_wins, step, target_n;
     compute_partials(T_mel, w.partial_frames, w.rate, w.sample_rate,
@@ -282,7 +224,6 @@ bool voice_encoder_embed(const std::vector<float> & wav_16k,
     else if (target_n < T_mel) mel.resize((size_t) target_n * w.n_mels);
     ve_graph G;
     G.backend = backend;
-    if (!G.backend) throw std::runtime_error("VoiceEncoder backend required");
     if (!ve_graph_init_weights(G, w)) {
         ve_graph_free(G);
         return false;

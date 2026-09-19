@@ -1,17 +1,6 @@
-#include "ggml.h"
-#include "ggml-alloc.h"
-#include "ggml-backend.h"
-#include "gguf.h"
+#include "gguf_weights.h"
 #include "ggml-vulkan.h"
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <map>
-#include <random>
 #include <stdexcept>
-#include <string>
-#include <vector>
 #include "chatterbox_t3_internal.h"
 #if !defined(TTS_FAMILY_GPT2)
 #error t3_gpt2.cpp is the GPT-2 T3 backend; configure -DTTS_FAMILY=gpt2
@@ -20,105 +9,64 @@
 using namespace tts_cpp::chatterbox::detail;
 namespace tts_cpp::chatterbox::detail {
 
-static int64_t require_key(const gguf_context * ctx, const char * key) {
-    int64_t id = gguf_find_key(ctx, key);
-    if (id < 0) throw std::runtime_error(std::string("missing GGUF key: ") + key);
-    return id;
-}
-static ggml_tensor * require_tensor(const chatterbox_model & m, const char * name) {
-    auto it = m.tensors.find(name);
-    if (it == m.tensors.end() || !it->second) throw std::runtime_error(std::string("missing tensor: ") + name);
-    return it->second;
-}
-ggml_backend_t init_backend() {
-    auto * b = ggml_backend_vk_init(0);
-    if (!b) throw std::runtime_error("Vulkan backend init failed");
-    return b;
-}
+ggml_backend_t init_backend() { return ggml_backend_vk_init(0); }
 void load_model_gguf(const std::string & path, chatterbox_model & model) {
-    ggml_context * tmp_ctx = nullptr;
-    gguf_init_params gguf_params = {  false,  &tmp_ctx };
-    gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
-    if (!gguf_ctx) throw std::runtime_error("T3 GGUF open failed");
-    try {
-        auto & hp = model.hparams;
-        hp.n_text_vocab       = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_TEXT_VOCAB_SIZE));
-        hp.n_speech_vocab     = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_SPEECH_VOCAB_SIZE));
-        hp.start_speech_token = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_START_SPEECH));
-        hp.stop_speech_token  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_STOP_SPEECH));
-        require_key(gguf_ctx, KEY_SPEAKER_EMBED);
-        hp.cond_prompt_len    = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_COND_PROMPT_LEN));
-        hp.eps                = gguf_get_val_f32(gguf_ctx, require_key(gguf_ctx, KEY_LAYER_NORM_EPS));
-        hp.n_embd  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_EMBD));
-        hp.n_head  = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_HEAD));
-        hp.n_layer = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_N_LAYER));
-        if (!model.backend) throw std::runtime_error("Vulkan backend required");
-        const int64_t num_tensors = gguf_get_n_tensors(gguf_ctx);
-        ggml_init_params params = { ggml_tensor_overhead() * (size_t) num_tensors, nullptr, true };
-        model.ctx_w = ggml_init(params);
-        if (!model.ctx_w) throw std::runtime_error("ggml_init() failed");
-        for (int64_t i = 0; i < num_tensors; ++i) {
-            const char * name = gguf_get_tensor_name(gguf_ctx, i);
-            ggml_tensor * src = ggml_get_tensor(tmp_ctx, name);
-            ggml_tensor * dst = ggml_dup_tensor(model.ctx_w, src);
-            ggml_set_name(dst, name);
-            model.tensors[name] = dst;
-        }
-        model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
-        for (ggml_tensor * cur = ggml_get_first_tensor(model.ctx_w); cur; cur = ggml_get_next_tensor(model.ctx_w, cur)) {
-            ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
-            ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
-        }
-        model.wpe              = require_tensor(model, "model/wpe");
-        if (model.wpe->ne[0] != hp.n_embd) throw std::runtime_error("wpe n_embd mismatch");
-        hp.n_ctx = (int32_t) model.wpe->ne[1];
-        if (hp.n_ctx <= 0) throw std::runtime_error("wpe context is empty");
-        model.ln_f_g           = require_tensor(model, "model/ln_f/g");
-        model.ln_f_b           = require_tensor(model, "model/ln_f/b");
-        model.text_emb         = require_tensor(model, "chatterbox/text_emb");
-        model.speech_emb       = require_tensor(model, "chatterbox/speech_emb");
-        model.speech_head      = require_tensor(model, "chatterbox/speech_head");
-        model.speech_head_bias = require_tensor(model, "chatterbox/speech_head_bias");
-        model.cond_spkr_w      = require_tensor(model, "chatterbox/cond_spkr/w");
-        model.cond_spkr_b      = require_tensor(model, "chatterbox/cond_spkr/b");
-        model.builtin_speaker_emb        = require_tensor(model, "chatterbox/builtin/speaker_emb");
-        model.builtin_cond_prompt_tokens = require_tensor(model, "chatterbox/builtin/cond_prompt_speech_tokens");
-        hp.cond_prompt_len = (int32_t) ggml_nelements(model.builtin_cond_prompt_tokens);
-        model.layers.resize(hp.n_layer);
-        for (int i = 0; i < hp.n_layer; ++i) {
-            auto & l = model.layers[i];
-            std::string p = "model/h" + std::to_string(i);
-            l.ln_1_g        = require_tensor(model, (p + "/ln_1/g").c_str());
-            l.ln_1_b        = require_tensor(model, (p + "/ln_1/b").c_str());
-            l.ln_2_g        = require_tensor(model, (p + "/ln_2/g").c_str());
-            l.ln_2_b        = require_tensor(model, (p + "/ln_2/b").c_str());
-            l.c_attn_attn_w = require_tensor(model, (p + "/attn/c_attn/w").c_str());
-            l.c_attn_attn_b = require_tensor(model, (p + "/attn/c_attn/b").c_str());
-            l.c_attn_proj_w = require_tensor(model, (p + "/attn/c_proj/w").c_str());
-            l.c_attn_proj_b = require_tensor(model, (p + "/attn/c_proj/b").c_str());
-            l.c_mlp_fc_w    = require_tensor(model, (p + "/mlp/c_fc/w").c_str());
-            l.c_mlp_fc_b    = require_tensor(model, (p + "/mlp/c_fc/b").c_str());
-            l.c_mlp_proj_w  = require_tensor(model, (p + "/mlp/c_proj/w").c_str());
-            l.c_mlp_proj_b  = require_tensor(model, (p + "/mlp/c_proj/b").c_str());
-        }
-        {
-            const int64_t tok_kid = require_key(gguf_ctx, "tokenizer.ggml.tokens");
-            const int64_t mer_kid = require_key(gguf_ctx, "tokenizer.ggml.merges");
-            const size_t n_tok = gguf_get_arr_n(gguf_ctx, tok_kid);
-            const size_t n_mer = gguf_get_arr_n(gguf_ctx, mer_kid);
-            model.tok_tokens.reserve(n_tok);
-            for (size_t i = 0; i < n_tok; ++i)
-                model.tok_tokens.emplace_back(gguf_get_arr_str(gguf_ctx, tok_kid, i));
-            model.tok_merges.reserve(n_mer);
-            for (size_t i = 0; i < n_mer; ++i)
-                model.tok_merges.emplace_back(gguf_get_arr_str(gguf_ctx, mer_kid, i));
-        }
-    } catch (...) {
-        gguf_free(gguf_ctx); if (tmp_ctx) ggml_free(tmp_ctx);
-        throw;
+    GgufWeights weights(path);
+    auto* gguf_ctx = weights.file;
+    auto & hp = model.hparams;
+    hp.n_text_vocab       = (int32_t) gguf_get_val_u32(gguf_ctx, gguf_find_key(gguf_ctx, "chatterbox.text_vocab_size"));
+    hp.n_speech_vocab     = (int32_t) gguf_get_val_u32(gguf_ctx, gguf_find_key(gguf_ctx, "chatterbox.speech_vocab_size"));
+    hp.start_speech_token = (int32_t) gguf_get_val_u32(gguf_ctx, gguf_find_key(gguf_ctx, "chatterbox.start_speech_token"));
+    hp.stop_speech_token  = (int32_t) gguf_get_val_u32(gguf_ctx, gguf_find_key(gguf_ctx, "chatterbox.stop_speech_token"));
+    hp.cond_prompt_len    = (int32_t) gguf_get_val_u32(gguf_ctx, gguf_find_key(gguf_ctx, "chatterbox.cond_prompt_length"));
+    hp.eps                = gguf_get_val_f32(gguf_ctx, gguf_find_key(gguf_ctx, "chatterbox.layer_norm_eps"));
+    hp.n_embd  = (int32_t) gguf_get_val_u32(gguf_ctx, gguf_find_key(gguf_ctx, "chatterbox.n_embd"));
+    hp.n_head  = (int32_t) gguf_get_val_u32(gguf_ctx, gguf_find_key(gguf_ctx, "chatterbox.n_head"));
+    hp.n_layer = (int32_t) gguf_get_val_u32(gguf_ctx, gguf_find_key(gguf_ctx, "chatterbox.n_layer"));
+    weights.upload(model);
+    model.wpe              = model.tensors["model/wpe"];
+    hp.n_ctx = (int32_t) model.wpe->ne[1];
+    model.ln_f_g           = model.tensors["model/ln_f/g"];
+    model.ln_f_b           = model.tensors["model/ln_f/b"];
+    model.text_emb         = model.tensors["chatterbox/text_emb"];
+    model.speech_emb       = model.tensors["chatterbox/speech_emb"];
+    model.speech_head      = model.tensors["chatterbox/speech_head"];
+    model.speech_head_bias = model.tensors["chatterbox/speech_head_bias"];
+    model.cond_spkr_w      = model.tensors["chatterbox/cond_spkr/w"];
+    model.cond_spkr_b      = model.tensors["chatterbox/cond_spkr/b"];
+    model.builtin_speaker_emb        = model.tensors["chatterbox/builtin/speaker_emb"];
+    model.builtin_cond_prompt_tokens = model.tensors["chatterbox/builtin/cond_prompt_speech_tokens"];
+    hp.cond_prompt_len = (int32_t) ggml_nelements(model.builtin_cond_prompt_tokens);
+    model.layers.resize(hp.n_layer);
+    for (int i = 0; i < hp.n_layer; ++i) {
+        auto & l = model.layers[i];
+        std::string p = "model/h" + std::to_string(i);
+        l.ln_1_g        = model.tensors[(p + "/ln_1/g").c_str()];
+        l.ln_1_b        = model.tensors[(p + "/ln_1/b").c_str()];
+        l.ln_2_g        = model.tensors[(p + "/ln_2/g").c_str()];
+        l.ln_2_b        = model.tensors[(p + "/ln_2/b").c_str()];
+        l.c_attn_attn_w = model.tensors[(p + "/attn/c_attn/w").c_str()];
+        l.c_attn_attn_b = model.tensors[(p + "/attn/c_attn/b").c_str()];
+        l.c_attn_proj_w = model.tensors[(p + "/attn/c_proj/w").c_str()];
+        l.c_attn_proj_b = model.tensors[(p + "/attn/c_proj/b").c_str()];
+        l.c_mlp_fc_w    = model.tensors[(p + "/mlp/c_fc/w").c_str()];
+        l.c_mlp_fc_b    = model.tensors[(p + "/mlp/c_fc/b").c_str()];
+        l.c_mlp_proj_w  = model.tensors[(p + "/mlp/c_proj/w").c_str()];
+        l.c_mlp_proj_b  = model.tensors[(p + "/mlp/c_proj/b").c_str()];
     }
-    gguf_free(gguf_ctx);
-    ggml_free(tmp_ctx);
+    {
+        const int64_t tok_kid = gguf_find_key(gguf_ctx, "tokenizer.ggml.tokens");
+        const int64_t mer_kid = gguf_find_key(gguf_ctx, "tokenizer.ggml.merges");
+        const size_t n_tok = gguf_get_arr_n(gguf_ctx, tok_kid);
+        const size_t n_mer = gguf_get_arr_n(gguf_ctx, mer_kid);
+        model.tok_tokens.reserve(n_tok);
+        for (size_t i = 0; i < n_tok; ++i)
+            model.tok_tokens.emplace_back(gguf_get_arr_str(gguf_ctx, tok_kid, i));
+        model.tok_merges.reserve(n_mer);
+        for (size_t i = 0; i < n_mer; ++i)
+            model.tok_merges.emplace_back(gguf_get_arr_str(gguf_ctx, mer_kid, i));
+    }
+
 }
 static ggml_tensor * build_transformer_core(
     ggml_context * ctx, ggml_cgraph * gf,
@@ -246,29 +194,8 @@ static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past
 void eval_prompt(
     chatterbox_model & model, ggml_gallocr_t allocr,
     const std::vector<int32_t> & text_tokens, std::vector<float> & logits_out, int & prompt_len) {
-    if(text_tokens.empty() || text_tokens.size()>size_t(model.hparams.n_ctx) || model.hparams.cond_prompt_len<1) throw std::runtime_error("T3 prompt size");
     prompt_len = 1 + model.hparams.cond_prompt_len + (int)text_tokens.size() + 1;
-    if (prompt_len > model.hparams.n_ctx) throw std::runtime_error("T3 prompt exceeds context");
-    const int rows = (int)std::min<int64_t>((int64_t)prompt_len + effective_n_predict() + 1, model.hparams.n_ctx);
-    if (rows > model.kv_rows) {
-        if (model.buffer_kv) ggml_backend_buffer_free(model.buffer_kv);
-        model.buffer_kv = nullptr;
-        if (model.ctx_kv) ggml_free(model.ctx_kv);
-        model.ctx_kv = nullptr;
-        model.memory_k = nullptr;
-        model.memory_v = nullptr;
-        model.kv_rows = 0;
-        ggml_init_params kv_params = { ggml_tensor_overhead() * 2, nullptr, true };
-        model.ctx_kv = ggml_init(kv_params);
-        if (!model.ctx_kv) throw std::runtime_error("T3 KV context allocation failed");
-        const int64_t n_elements = (int64_t)model.hparams.n_embd * model.hparams.n_layer * rows;
-        model.memory_k = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
-        model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
-        model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
-        if (!model.buffer_kv) throw std::runtime_error("T3 KV buffer allocation failed");
-        model.kv_rows = rows;
-        ggml_backend_buffer_clear(model.buffer_kv, 0);
-    }
+    prepare_kv(model, prompt_len, 1);
     ggml_cgraph * gf = build_prompt_graph(model, (int)text_tokens.size());
     ggml_gallocr_reserve(allocr, gf);
     ggml_gallocr_alloc_graph(allocr, gf);
@@ -278,18 +205,7 @@ void eval_prompt(
     std::vector<int32_t> pos(prompt_len);
     for (int i = 0; i < prompt_len; ++i) pos[i] = i;
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "position"), pos.data(), 0, pos.size()*sizeof(int32_t));
-    {
-        const int N = prompt_len;
-        ggml_tensor * kq_mask = ggml_graph_get_tensor(gf, "kq_mask");
-        if (!kq_mask) throw std::runtime_error("T3 kq_mask missing");
-        const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
-        const ggml_fp16_t ninf_h = ggml_fp32_to_fp16(-INFINITY);
-        std::vector<ggml_fp16_t> mask((size_t)N * N, zero_h);
-        for (int q = 0; q < N; ++q)
-            for (int k = 0; k < N; ++k)
-                if (k > q) mask[(size_t)q * N + k] = ninf_h;
-        ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size()*sizeof(ggml_fp16_t));
-    }
+    set_causal_mask(gf, prompt_len);
     if (ggml_backend_graph_compute(model.backend, gf) != GGML_STATUS_SUCCESS) throw std::runtime_error("T3 prompt failed");
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
     logits_out.resize(model.hparams.n_speech_vocab);
@@ -316,9 +232,9 @@ int32_t sample_next_token_ex(
     const std::vector<int32_t> & generated,
     std::mt19937 & rng) {
     const int n = (int)logits.size();
-    const float temperature = effective_temperature();
-    const int top_k = effective_top_k();
-    const float top_p = effective_top_p();
+    const float temperature = runtime_knobs().temperature;
+    const int top_k = runtime_knobs().top_k;
+    const float top_p = runtime_knobs().top_p;
     std::vector<float> scores(logits.begin(), logits.end());
     if (temperature > 0.0f && temperature != 1.0f) {
         float inv_t = 1.0f / temperature;
@@ -349,16 +265,7 @@ int32_t sample_next_token_ex(
         }
     }
     apply_speech_repeat_penalty(scores.data(), n, generated);
-    float mx = -INFINITY;
-    for (float s : scores) if (s != -INFINITY) mx = std::max(mx, s);
-    std::vector<float> probs(n);
-    float psum = 0;
-    for (int i = 0; i < n; ++i) {
-        probs[i] = (scores[i] == -INFINITY) ? 0.0f : std::exp(scores[i] - mx);
-        psum += probs[i];
-    }
-    if (psum == 0.0f) throw std::runtime_error("sampler produced empty distribution");
-    for (float & p : probs) p /= psum;
+    auto probs = probabilities(scores);
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
     int32_t chosen = (int32_t)dist(rng);
     return chosen;

@@ -17,14 +17,11 @@ static uint32_t u32(const unsigned char* p) { return (uint32_t)p[0] | (uint32_t)
 void wav_load(const std::string& path, std::vector<float>& out, int& sr) {
     std::ifstream f(path, std::ios::binary);
     std::vector<unsigned char> b((std::istreambuf_iterator<char>(f)), {});
-    if (b.size() < 44 || std::memcmp(b.data(), "RIFF", 4) || std::memcmp(b.data() + 8, "WAVE", 4))
-        throw std::runtime_error("WAV");
     uint16_t format = 0, channels = 0, bits = 0, block = 0;
     const unsigned char* data = nullptr;
     size_t bytes = 0;
     for (size_t p = 12; p + 8 <= b.size();) {
         const uint32_t n = u32(b.data() + p + 4);
-        if (p + 8ull + n > b.size()) throw std::runtime_error("WAV");
         const unsigned char* q = b.data() + p + 8;
         if (!std::memcmp(b.data() + p, "fmt ", 4) && n >= 16) {
             format = u16(q); channels = u16(q + 2); sr = (int)u32(q + 4); block = u16(q + 12); bits = u16(q + 14);
@@ -33,11 +30,9 @@ void wav_load(const std::string& path, std::vector<float>& out, int& sr) {
         if (!std::memcmp(b.data() + p, "data", 4)) { data = q; bytes = n; }
         p += 8 + n + (n & 1u);
     }
-    if (!data || !channels || !sr || !block || !bits || bytes % block) throw std::runtime_error("WAV");
     const size_t frames = bytes / block;
     out.assign(frames, 0.f);
     const size_t sample_bytes = bits / 8;
-    if (!sample_bytes || sample_bytes * channels > block) throw std::runtime_error("WAV");
     for (size_t i = 0; i < frames; ++i) {
         float sum = 0.f;
         for (uint16_t c = 0; c < channels; ++c) {
@@ -61,8 +56,6 @@ static double sinc_pi(double x) {
 
 static std::vector<double> firls_lowpass(int n_taps, double f_pass, double f_stop)
 {
-    if (n_taps < 3 || (n_taps % 2) == 0) throw std::runtime_error("resample firls taps");
-    if (!(f_pass > 0.0) || !(f_stop > f_pass) || !(f_stop <= 1.0)) throw std::runtime_error("resample firls bands");
     const int M = (n_taps - 1) / 2;
     const int nq = M + 1;
     std::vector<double> q((size_t)n_taps, 0.0);
@@ -121,7 +114,6 @@ static std::vector<double> firls_lowpass(int n_taps, double f_pass, double f_sto
                 const double v = std::fabs(at(i, k));
                 if (v > bestv) { bestv = v; best = i; }
             }
-            if (!(bestv > 1e-18)) throw std::runtime_error("resample firls solve");
             if (best != k) {
                 for (int j = 0; j < nq; ++j) std::swap(at(k, j), at(best, j));
                 std::swap(b[(size_t)k], b[(size_t)best]);
@@ -160,7 +152,6 @@ std::vector<float> resample_sinc(const std::vector<float> & in,
     (void)taps_half;
     if (sr_in == sr_out) return in;
     if (in.empty()) return {};
-    if (sr_in <= 0 || sr_out <= 0) throw std::runtime_error("resample");
     const int g = std::gcd(sr_in, sr_out);
     const int up = sr_out / g;
     const int down = sr_in / g;
@@ -208,7 +199,6 @@ std::vector<float> trim_silence(const std::vector<float> & wav, float top_db,
 {
 
     if (wav.empty()) return {};
-    if (frame_length <= 0 || hop_length <= 0) throw std::runtime_error("trim");
     const int n = (int)wav.size();
     const int pad = frame_length / 2;
     const int n_padded = n + 2 * pad;

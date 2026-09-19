@@ -4,20 +4,6 @@
 #include <regex>
 #include <stdexcept>
 namespace tts_cpp::chatterbox {
-void validate_utf8(const std::string& s) {
-    for(size_t i=0;i<s.size();) {
-        const unsigned char c=s[i++];
-        if(c==0 || (c<32 && c!='\t' && c!='\r' && c!='\n')) throw std::runtime_error("invalid text control");
-        if(c<128) continue;
-        int n; uint32_t cp, minimum;
-        if(c>=0xc2 && c<=0xdf) {n=1;cp=c&31;minimum=0x80;}
-        else if(c>=0xe0 && c<=0xef) {n=2;cp=c&15;minimum=0x800;}
-        else if(c>=0xf0 && c<=0xf4) {n=3;cp=c&7;minimum=0x10000;}
-        else throw std::runtime_error("invalid UTF-8 lead");
-        while(n--) { if(i==s.size() || (static_cast<unsigned char>(s[i])&0xc0)!=0x80) throw std::runtime_error("invalid UTF-8 continuation"); cp=(cp<<6)|(s[i++]&63); }
-        if(cp<minimum || cp>0x10ffff || (cp>=0xd800 && cp<=0xdfff)) throw std::runtime_error("invalid UTF-8 scalar");
-    }
-}
 namespace {
 const char* small[]={"zero","one","two","three","four","five","six","seven","eight","nine","ten","eleven","twelve","thirteen","fourteen","fifteen","sixteen","seventeen","eighteen","nineteen"};
 std::string cardinal(unsigned n) {
@@ -44,7 +30,7 @@ bool match(const std::string& s,size_t i,const std::regex& re,std::smatch& m) {
 }
 }
 PreparedText prepare_text(const std::string& s) {
-    validate_utf8(s); PreparedText p;
+    PreparedText p;
     static const std::regex date(R"((January|February|March|April|May|June|July|August|September|October|November|December) ([0-9]{1,2}), ([0-9]{4}))",std::regex::icase);
     static const std::regex currency(R"(\$([0-9]{1,6})(\.([0-9]{2}))?)");
     static const std::regex clock(R"(([0-9]{1,2}):([0-9]{2}) ([ap])\.m\.)",std::regex::icase);
@@ -106,7 +92,6 @@ PreparedText prepare_text(const std::string& s) {
         if(used) {p.text+=replacement;i+=used;}
         else {p.text+=s[i];++i;}
     }
-    if(p.text.find_first_not_of(' ')==std::string::npos)throw std::runtime_error("empty text");
     return p;
 }
 }

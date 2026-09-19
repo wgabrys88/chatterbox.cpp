@@ -10,22 +10,18 @@ UChars utf8_to_u16(const std::string & s) {
     UErrorCode status = U_ZERO_ERROR;
     int32_t n = 0;
     u_strFromUTF8(nullptr, 0, &n, s.data(), static_cast<int32_t>(s.size()), &status);
-    if (status != U_BUFFER_OVERFLOW_ERROR && U_FAILURE(status)) throw std::runtime_error("ICU UTF-8 decode");
     status = U_ZERO_ERROR;
     UChars out(static_cast<size_t>(n));
     u_strFromUTF8(out.data(), n, nullptr, s.data(), static_cast<int32_t>(s.size()), &status);
-    if (U_FAILURE(status)) throw std::runtime_error("ICU UTF-8 decode");
     return out;
 }
 std::string u16_to_utf8(const UChar * s, int32_t n) {
     UErrorCode status = U_ZERO_ERROR;
     int32_t bytes = 0;
     u_strToUTF8(nullptr, 0, &bytes, s, n, &status);
-    if (status != U_BUFFER_OVERFLOW_ERROR && U_FAILURE(status)) throw std::runtime_error("ICU UTF-8 encode");
     status = U_ZERO_ERROR;
     std::string out(static_cast<size_t>(bytes), '\0');
     u_strToUTF8(out.data(), bytes, nullptr, s, n, &status);
-    if (U_FAILURE(status)) throw std::runtime_error("ICU UTF-8 encode");
     return out;
 }
 std::string u16_to_utf8(const UChars & s) { return u16_to_utf8(s.data(), static_cast<int32_t>(s.size())); }
@@ -45,13 +41,6 @@ bool edge_word(const UChars & s, bool first) {
 }
 struct NumberFormatCloser { void operator()(UNumberFormat * p) const { if (p) unum_close(p); } };
 using NumberFormatPtr = std::unique_ptr<UNumberFormat, NumberFormatCloser>;
-std::string icu_version() {
-    UVersionInfo v{};
-    char text[U_MAX_VERSION_STRING_LENGTH]{};
-    u_getVersion(v);
-    u_versionToString(v, text);
-    return text;
-}
 UChars remove_format_chars(const UChars & input) {
     UChars out;
     out.reserve(input.size());
@@ -76,26 +65,22 @@ bool contains_decimal_digit(const UChars & s) {
 UChars format_decimal(const UNumberFormat * format, const std::string & value) {
     UErrorCode status = U_ZERO_ERROR;
     int32_t n = unum_formatDecimal(format, value.data(), static_cast<int32_t>(value.size()), nullptr, 0, nullptr, &status);
-    if (status != U_BUFFER_OVERFLOW_ERROR && U_FAILURE(status)) throw std::runtime_error("ICU spellout");
     status = U_ZERO_ERROR;
     UChars out(static_cast<size_t>(n));
     unum_formatDecimal(format, value.data(), static_cast<int32_t>(value.size()), out.data(), n, nullptr, &status);
-    if (U_FAILURE(status)) throw std::runtime_error("ICU spellout");
     return remove_format_chars(out);
 }
 UChars format_digits(const UNumberFormat * format, const std::string & digits) {
     UChars out;
     for (char digit : digits) {
         auto word = format_decimal(format, std::string(1, digit));
-        if (contains_decimal_digit(word)) throw std::runtime_error("ICU locale has no number spellout data");
         if (!out.empty()) out.push_back(static_cast<UChar>(' '));
         out.insert(out.end(), word.begin(), word.end());
     }
     return out;
 }
 }
-mtl_number_result mtl_numbers::verbalize_numbers(const std::string & text, const std::string & language_id) const {
-    if (language_id.empty()) throw std::runtime_error("language");
+std::string mtl_numbers::verbalize_numbers(const std::string & text, const std::string & language_id) const {
     const auto input = utf8_to_u16(text);
     bool has_digit = false;
     for (int32_t i = 0; i < static_cast<int32_t>(input.size());) {
@@ -103,11 +88,9 @@ mtl_number_result mtl_numbers::verbalize_numbers(const std::string & text, const
         U16_NEXT(input.data(), i, static_cast<int32_t>(input.size()), c);
         if (u_charDigitValue(c) >= 0) { has_digit = true; break; }
     }
-    mtl_number_result result{text, {}, "ICU " + icu_version() + " / CLDR RBNF"};
-    if (!has_digit) return result;
+    if (!has_digit) return text;
     UErrorCode status = U_ZERO_ERROR;
     NumberFormatPtr spell(unum_open(UNUM_SPELLOUT, nullptr, 0, language_id.c_str(), nullptr, &status));
-    if (U_FAILURE(status) || !spell) throw std::runtime_error("ICU spellout locale");
     UChars output;
     int32_t cursor = 0;
     int32_t i = 0;
@@ -137,10 +120,8 @@ mtl_number_result mtl_numbers::verbalize_numbers(const std::string & text, const
             U16_NEXT(input.data(), q, static_cast<int32_t>(input.size()), next);
             if (word_codepoint(next) && edge_word(spoken, false)) output.push_back(static_cast<UChar>(' '));
         }
-        result.rewrites.push_back({u16_to_utf8(input.data() + begin, i - begin), u16_to_utf8(spoken)});
         cursor = i;
     }
     output.insert(output.end(), input.begin() + cursor, input.end());
-    result.text = u16_to_utf8(output);
-    return result;
+    return u16_to_utf8(output);
 }
