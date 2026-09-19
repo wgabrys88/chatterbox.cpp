@@ -6,16 +6,13 @@
 #include <vector>
 #include "tts-cpp/chatterbox/engine.h"
 #include "text_prepare.h"
-#include "execution_trace.h"
 namespace tts_cpp::chatterbox::detail {
 struct UtteranceUnit { size_t begin,end; std::string text; std::vector<int32_t> ids; };
 using EncodeText = std::function<std::vector<int32_t>(const std::string&)>;
-inline UtteranceUnit encode_utterance(const PreparedText& p,const EncodeText& encode,ExecutionTrace* trace) {
+inline UtteranceUnit encode_utterance(const PreparedText& p,const EncodeText& encode) {
     if(p.text.find_first_not_of(' ')==std::string::npos)throw std::runtime_error("empty text");
     UtteranceUnit u{0,p.text.size(),p.text,encode(p.text)};
     if(u.ids.empty())throw std::runtime_error("empty tokenizer output");
-    const std::string units="[{\"index\":0,\"begin\":"+std::to_string(u.begin)+",\"end\":"+std::to_string(u.end)+",\"tokenizer_input\":"+json_string(u.text)+",\"text_tokens\":"+std::to_string(u.ids.size())+"}]";
-    trace_event(trace,"encode_complete","encode",{{"units",units},{"coverage","true"},{"offset_units",json_string("prepared_utf8_bytes")},{"policy",json_string("one_utterance")}});
     return u;
 }
 inline void accumulate_unit(SynthesizeStats* total, const SynthesizeStats& unit, int index, int n, const std::string& text) {

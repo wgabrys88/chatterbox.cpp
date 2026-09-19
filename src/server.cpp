@@ -16,7 +16,6 @@
 #include <set>
 #include <cerrno>
 #include <cmath>
-#include "execution_trace.h"
 #include "text_prepare.h"
 using namespace tts_cpp::chatterbox;
 
@@ -190,10 +189,6 @@ static std::string knobs_json() {
     return std::string(buf, (size_t)n);
 }
 
-static std::string language_json(const std::string& language) {
-    return language.empty() ? std::string("null") : json_string(language);
-}
-
 static std::string stats_line(const tts_cpp::chatterbox::SynthesizeStats& s) {
     char buf[256];
     const int n = std::snprintf(buf, sizeof(buf),
@@ -204,7 +199,6 @@ static std::string stats_line(const tts_cpp::chatterbox::SynthesizeStats& s) {
 }
 
 static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOptions& options) {
-    std::unique_ptr<ExecutionTrace> trace;
     std::string stage="transport",path;
     bool published=false;
     try {
@@ -212,7 +206,6 @@ static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOption
         if(path.empty())throw std::runtime_error("empty output path");
         const auto dest=std::filesystem::u8path(path);
         if(!dest.is_absolute() || std::filesystem::exists(dest))throw std::runtime_error("output path must be absolute and unused");
-        trace=std::make_unique<ExecutionTrace>(path);
         const std::string length=read_line(h);
         if(length.empty()||length.find_first_not_of("0123456789")!=std::string::npos)throw std::runtime_error("invalid payload length");
         size_t size=0;
@@ -221,56 +214,23 @@ static void serve_one(HANDLE h, std::unique_ptr<Engine>& tts, const EngineOption
         std::string text(size,'\0');
         if(!read_exact(h,text.data(),DWORD(size)))throw std::runtime_error("truncated text payload");
         validate_utf8(text);
-        trace->event("request_start","request",{{"original_text",json_string(text)},{"input_sha256",json_string(sha256_text(text))},
-            {"utf8_bytes",std::to_string(text.size())},{"effective_knobs",knobs_json()},
-            {"language",json_string(options.language_id)},{"output",json_string(path)}});
         stage="model_load";
-        if(!tts){auto start=TraceClock::now();trace->event("model_load_start",stage);
-            tts=std::make_unique<Engine>(options,trace.get());
-            record_runtime_identity(trace.get());
-            trace->event("model_load_end",stage,{{"host_wall_s",json_number(elapsed(start))},{"reused","false"}});
-        }else trace->event("model_load_end",stage,{{"reused","true"}});
+        if(!tts) tts=std::make_unique<Engine>(options);
         stage="synthesis";SynthesizeStats stats;std::vector<float> pcm;
-        tts->synthesize(text,pcm,&stats,trace.get());
-        stage="output";trace->event("output_write_start",stage);
-        const auto start=TraceClock::now();size_t clipped=0;std::vector<int16_t> samples(pcm.size());
+        tts->synthesize(text,pcm,&stats);
+        stage="output";
+        std::vector<int16_t> samples(pcm.size());
         for(size_t i=0;i<pcm.size();++i){
             if(!std::isfinite(pcm[i]))throw std::runtime_error("non-finite output sample");
-            if(pcm[i]<-1.f||pcm[i]>1.f)++clipped;
             samples[i]=int16_t(std::clamp(pcm[i],-1.f,1.f)*32767.f);
         }
         write_wav(path,samples);published=true;
-        const std::string wav_sha=sha256_file(path);
-        const std::string duration=json_number(double(samples.size())/24000);
-        const auto& rk=tts_cpp::chatterbox::detail::runtime_knobs();
-        trace->event("output_write_end",stage,{{"samples",std::to_string(samples.size())},{"sample_rate","24000"},
-            {"channels","1"},{"clipping_count",std::to_string(clipped)},{"finite_samples","true"},
-            {"duration_s",duration},{"wav_sha256",json_string(wav_sha)},
-            {"host_wall_s",json_number(elapsed(start))},{"published","true"}});
-        trace->event("request_complete","request",{{"stats",json_string(stats_line(stats))}});
-        trace->write_meta("execution_complete",{
-            {"seed",json_string(std::to_string(rk.seed))},
-            {"knobs",knobs_json()},
-            {"language_id",language_json(options.language_id)},
-            {"wav_sha256",json_string(wav_sha)},
-            {"duration_s",duration},
-            {"sr","24000"}});
         stage="acknowledgement";
         const std::string line="ok "+stats_line(stats);write_exact(h,line.data(),DWORD(line.size()));
         if(!FlushFileBuffers(h))throw std::runtime_error("acknowledgement flush failed");
     } catch(const std::exception& e) {
         std::fprintf(stderr,"request failed stage=%s error=%s\n",stage.c_str(),e.what());std::fflush(stderr);
-
         if(published&&stage!="acknowledgement") {std::error_code ec;std::filesystem::remove(std::filesystem::u8path(path),ec);}
-        if(trace){
-            const auto& rk=tts_cpp::chatterbox::detail::runtime_knobs();
-            trace->event("request_failed",stage,{{"error",json_string(e.what())},{"completed_wav_preserved",published&&stage=="acknowledgement"?"true":"false"}});
-            trace->write_meta("failed",{
-                {"seed",json_string(std::to_string(rk.seed))},
-                {"knobs",knobs_json()},
-                {"language_id",language_json(options.language_id)},
-                {"sr","24000"}});
-        }
         const std::string line="err "+one_line(e.what())+"\n";
         write_exact(h,line.data(),DWORD(line.size()));
         FlushFileBuffers(h);

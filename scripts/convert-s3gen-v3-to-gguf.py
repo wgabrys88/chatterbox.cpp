@@ -69,8 +69,6 @@ def main():
         raise SystemExit(f"tokenizer {n_tok} != {TEXT_VOCAB_SIZE}")
     raw = load_file(ckpt_dir / "s3gen.safetensors")
     allowed = ("flow.", "mel2wav.", "speaker_encoder.", "tokenizer.")
-    for name in sorted(raw):
-        print(f"{name}\t{tuple(raw[name].shape)}", flush=True)
     unknown = [name for name in raw if not name.startswith(allowed)]
     if unknown:
         print("STOP unknown s3gen keys:", file=sys.stderr)

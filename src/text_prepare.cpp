@@ -1,5 +1,4 @@
 #include "text_prepare.h"
-#include "execution_trace.h"
 #include <algorithm>
 #include <cctype>
 #include <regex>
@@ -44,7 +43,7 @@ bool match(const std::string& s,size_t i,const std::regex& re,std::smatch& m) {
     return std::regex_search(s.begin()+std::ptrdiff_t(i),s.end(),m,re,std::regex_constants::match_continuous);
 }
 }
-PreparedText prepare_text(const std::string& s,bool english,ExecutionTrace* trace) {
+PreparedText prepare_text(const std::string& s) {
     validate_utf8(s); PreparedText p;
     static const std::regex date(R"((January|February|March|April|May|June|July|August|September|October|November|December) ([0-9]{1,2}), ([0-9]{4}))",std::regex::icase);
     static const std::regex currency(R"(\$([0-9]{1,6})(\.([0-9]{2}))?)");
@@ -57,11 +56,10 @@ PreparedText prepare_text(const std::string& s,bool english,ExecutionTrace* trac
     static const std::regex phone_context(R"((call|phone|telephone)\b[^.!?\n]*$)",std::regex::icase);
     for(size_t i=0;i<s.size();) {
         if(space(s[i])) {size_t j=i+1;while(j<s.size()&&space(s[j]))++j;
-            size_t b=p.text.size();p.text+=' '; if(s.substr(i,j-i)!=" ")p.edits.push_back({i,j,b,b+1," ","whitespace"});i=j;continue;}
-        size_t used=0;std::string replacement,rule;std::smatch m;
+            p.text+=' '; i=j;continue;}
+        size_t used=0;std::string replacement;std::smatch m;
         const bool start=i==0 || !word(static_cast<unsigned char>(s[i-1]));
         auto end_ok=[&](size_t n){return i+n==s.size() || (!word(static_cast<unsigned char>(s[i+n])) && s[i+n]!='.' && s[i+n]!='-' && s[i+n]!=':') || (s[i+n]=='.' && (i+n+1==s.size()||space(s[i+n+1])));};
-
         if(start) {
             size_t j=i;while(j<s.size()&&!space(s[j]))++j;
             std::string atom=s.substr(i,j-i); bool alpha=false,num=false;
@@ -69,10 +67,7 @@ PreparedText prepare_text(const std::string& s,bool english,ExecutionTrace* trac
             const bool seat_context=i>=5 && lower(s.substr(i-5,5))=="seat ";
             const bool suffix_ordinal=match(s,i,ord,m) && end_ok(size_t(m.length()));
             bool protected_atom=atom.find("://")!=std::string::npos || atom.find('@')!=std::string::npos || atom.find('_')!=std::string::npos || (alpha&&num&&!seat_context&&!suffix_ordinal&&atom.find(':')==std::string::npos);
-
-            if(protected_atom) {size_t b=p.text.size();p.text+=atom;p.atoms.push_back({b,p.text.size()});if(num)p.unhandled.push_back({b,p.text.size()});i=j;continue;}
-        }
-        if(english&&start) {
+            if(protected_atom) {p.text+=atom;i=j;continue;}
             if(match(s,i,date,m)&&end_ok(m.length())) {
                 unsigned day=std::stoul(m[2]),year=std::stoul(m[3]);
                 std::string month=lower(m[1]);
@@ -80,43 +75,38 @@ PreparedText prepare_text(const std::string& s,bool english,ExecutionTrace* trac
                 size_t mi=std::find(std::begin(months),std::end(months),month)-std::begin(months);
                 const int lengths[]={31,28,31,30,31,30,31,31,30,31,30,31};
                 int maxday=lengths[mi]+(mi==1&&(year%400==0||(year%4==0&&year%100!=0)));
-                if(day>=1&&day<=unsigned(maxday)) {used=m.length();replacement=m[1].str()+" "+ordinal(day)+", "+cardinal(year);rule="en_date";}
+                if(day>=1&&day<=unsigned(maxday)) {used=m.length();replacement=m[1].str()+" "+ordinal(day)+", "+cardinal(year);}
             }
             if(!used&&match(s,i,currency,m)&&end_ok(m.length())) {
                 unsigned dollars=std::stoul(m[1]),cents=m[3].matched?std::stoul(m[3]):0;
                 used=m.length();replacement=cardinal(dollars)+(dollars==1?" dollar":" dollars");
-                if(cents)replacement+=" and "+cardinal(cents)+(cents==1?" cent":" cents");rule="en_usd";
+                if(cents)replacement+=" and "+cardinal(cents)+(cents==1?" cent":" cents");
             }
             if(!used&&match(s,i,clock,m)&&end_ok(m.length())) {
                 unsigned h=std::stoul(m[1]),minute=std::stoul(m[2]);
-                if(h>=1&&h<=12&&minute<60){used=m.length();replacement=cardinal(h)+(minute==0?" o clock":minute<10?" oh "+cardinal(minute):" "+cardinal(minute))+" "+lower(m[3])+" m";rule="en_clock";}
+                if(h>=1&&h<=12&&minute<60){used=m.length();replacement=cardinal(h)+(minute==0?" o clock":minute<10?" oh "+cardinal(minute):" "+cardinal(minute))+" "+lower(m[3])+" m";}
             }
             if(!used&&match(s,i,phone,m)&&end_ok(m.length())&&std::regex_search(s.substr(0,i),phone_context)) {
-                used=m.length();replacement=digits(m[1])+", "+digits(m[2]);rule="en_phone";
+                used=m.length();replacement=digits(m[1])+", "+digits(m[2]);
             }
             if(!used&&match(s,i,ord,m)&&end_ok(m.length())) {
                 unsigned n=std::stoul(m[1]);std::string suffix=(n%100>=11&&n%100<=13)?"th":n%10==1?"st":n%10==2?"nd":n%10==3?"rd":"th";
-                if(n>=1&&n<=31&&lower(m[2])==suffix){used=m.length();replacement=ordinal(n);rule="en_ordinal";}
+                if(n>=1&&n<=31&&lower(m[2])==suffix){used=m.length();replacement=ordinal(n);}
             }
             if(!used&&match(s,i,seat,m)&&end_ok(m.length())&&i>=5&&lower(s.substr(i-5,5))=="seat ") {
-                used=m.length();replacement=cardinal(std::stoul(m[1]))+" "+m[2].str();rule="en_seat";
+                used=m.length();replacement=cardinal(std::stoul(m[1]))+" "+m[2].str();
             }
             if(!used&&match(s,i,decimal,m)&&end_ok(m.length())) {
-                used=m.length();replacement=cardinal(m[1].length()?std::stoul(m[1]):0)+" point "+digits(m[2]);rule="en_decimal";
+                used=m.length();replacement=cardinal(m[1].length()?std::stoul(m[1]):0)+" point "+digits(m[2]);
             }
             if(!used&&match(s,i,integer,m)&&end_ok(m.length())&&(i==0||(s[i-1]!='-'&&s[i-1]!='.'&&s[i-1]!='$'&&s[i-1]!=':'))) {
-                used=m.length();replacement=cardinal(std::stoul(m[0]));rule="en_integer";
+                used=m.length();replacement=cardinal(std::stoul(m[0]));
             }
         }
-        if(used) {size_t b=p.text.size();p.text+=replacement;p.edits.push_back({i,i+used,b,p.text.size(),replacement,rule});p.atoms.push_back({b,p.text.size()});i+=used;}
-        else {size_t b=p.text.size();p.text+=s[i];if(s[i]>='0'&&s[i]<='9')p.unhandled.push_back({b,b+1});++i;}
+        if(used) {p.text+=replacement;i+=used;}
+        else {p.text+=s[i];++i;}
     }
     if(p.text.find_first_not_of(' ')==std::string::npos)throw std::runtime_error("empty text");
-    std::string edits="[",unhandled="[",boundaries="[";
-    for(size_t i=0;i<p.edits.size();++i){const auto&e=p.edits[i];if(i)edits+=',';edits+="{\"original_begin\":"+std::to_string(e.original_begin)+",\"original_end\":"+std::to_string(e.original_end)+",\"prepared_begin\":"+std::to_string(e.prepared_begin)+",\"prepared_end\":"+std::to_string(e.prepared_end)+",\"replacement\":"+json_string(e.replacement)+",\"rule\":"+json_string(e.rule)+"}";}
-    for(size_t i=0;i<p.unhandled.size();++i){if(i)unhandled+=',';unhandled+="["+std::to_string(p.unhandled[i].begin)+","+std::to_string(p.unhandled[i].end)+"]";}
-    for(size_t i=0;i<p.boundaries.size();++i){if(i)boundaries+=',';boundaries+=std::to_string(p.boundaries[i]);}
-    trace_event(trace,"text_prepared","prepare",{{"original_sha256",json_string(sha256_text(s))},{"prepared_sha256",json_string(sha256_text(p.text))},{"text",json_string(p.text)},{"edits",edits+"]"},{"unhandled_spans",unhandled+"]"},{"explicit_boundaries",boundaries+"]"},{"policy",json_string(english?"english_bounded_v1":"language_tokenizer_only")}});
     return p;
 }
 }
