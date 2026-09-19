@@ -125,7 +125,7 @@ struct Engine::Impl {
         if(wav.empty() || wav.size()>(size_t(UINT32_MAX)-36)/2 || offset>(size_t(UINT32_MAX)-36)/2-wav.size())
             throw std::runtime_error("empty audio or RIFF size limit");
         pcm.insert(pcm.end(),wav.begin(),wav.end());
-        accumulate_unit(stats,unit,0,1,u.text);
+        accumulate_unit(stats,unit);
     }
     std::vector<int32_t> generate_t3(const std::vector<int32_t>& text_tokens, std::mt19937& rng, SynthesizeStats* stats) {
         const int n_predict=effective_n_predict();

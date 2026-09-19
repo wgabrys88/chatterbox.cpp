@@ -1,5 +1,4 @@
 #pragma once
-#include <cstdio>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -15,10 +14,7 @@ inline UtteranceUnit encode_utterance(const PreparedText& p,const EncodeText& en
     if(u.ids.empty())throw std::runtime_error("empty tokenizer output");
     return u;
 }
-inline void accumulate_unit(SynthesizeStats* total, const SynthesizeStats& unit, int index, int n, const std::string& text) {
-    std::fprintf(stderr, "unit %d/%d text_tokens=%d predicted=%d dropped=%d eos=%d n_past=%d text=\"%s\"\n",
-        index + 1, n, unit.text_tokens, unit.predicted_count, unit.dropped_count, unit.eos, unit.n_past, text.c_str());
-    std::fflush(stderr);
+inline void accumulate_unit(SynthesizeStats* total, const SynthesizeStats& unit) {
     if (!total) return;
     total->predicted_count += unit.predicted_count;
     total->dropped_count += unit.dropped_count;

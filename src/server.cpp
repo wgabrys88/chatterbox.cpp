@@ -158,13 +158,8 @@ static ServerFlags parse_flags(int argc, char** argv) {
     if (flags.tokenizer_python.empty() || flags.tokenizer_script.empty() || flags.tokenizer_source.empty() || flags.tokenizer_tts_source.empty() || flags.tokenizer_json.empty() || flags.cangjie_json.empty() || flags.dicta_model.empty())
         throw std::runtime_error("official tokenizer configuration");
 #endif
-    if(k.n_predict<1 || k.cfm_steps<1 || k.trim_fade<0 || k.temperature<0 || k.repeat_penalty<=0 || k.top_p<=0 || k.top_p>1)
-        throw std::runtime_error("generation argument out of range");
-#if defined(TTS_FAMILY_V3)
-    if(k.min_p<0 || k.min_p>1)throw std::runtime_error("V3 argument out of range");
-#else
+#if defined(TTS_FAMILY_GPT2)
     require_flag("--top-k");
-    if(k.top_k<0)throw std::runtime_error("top-k out of range");
 #endif
     return flags;
 }
