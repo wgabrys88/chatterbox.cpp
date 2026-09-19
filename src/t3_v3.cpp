@@ -62,11 +62,6 @@ void load_model_gguf(const std::string & path, chatterbox_model & model) {
         hp.rope_orig_ctx = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_ROPE_ORIG_CTX));
         if (gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_TEXT_FRONTEND)) != 4)
             throw std::runtime_error("unsupported text frontend contract");
-        model.tokenizer_sha256 = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_TOKENIZER_SHA));
-        model.tokenizer_json = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_TOKENIZER_JSON));
-        model.cangjie_sha256 = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_CANGJIE_SHA));
-        model.official_tokenizer_sha256 = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_OFFICIAL_TOKENIZER_SHA));
-        model.official_tts_sha256 = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_OFFICIAL_TTS_SHA));
         model.language_tokens = gguf_get_val_str(gguf_ctx, require_key(gguf_ctx, KEY_LANGUAGE_TOKENS));
         if (!model.backend) throw std::runtime_error("Vulkan backend required");
         if (hp.n_embd % hp.n_head) throw std::runtime_error("n_head");

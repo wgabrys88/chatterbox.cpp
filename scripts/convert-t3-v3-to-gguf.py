@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, hashlib, json, math, re, sys
+import argparse, json, math, re, sys
 from pathlib import Path
 import gguf, numpy as np, torch
 from quant_policy import WEIGHT_TYPES, add_weight
@@ -40,9 +40,6 @@ def add(writer, name, array, matrix_type):
 
 def tokenizer_contract(ckpt_dir, text_vocab_size):
     tokenizer_path = ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"
-    cangjie_path = ckpt_dir / "Cangjie5_TC.json"
-    tokenizer_bytes = tokenizer_path.read_bytes()
-    tokenizer_json = tokenizer_bytes.decode("utf-8")
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     vocab = tokenizer.get_vocab()
     if not vocab:
@@ -56,17 +53,8 @@ def tokenizer_contract(ckpt_dir, text_vocab_size):
     language_tokens = sorted(t for t in vocab if re.fullmatch(r"\[[a-z]{2,3}\]", t))
     if not language_tokens:
         raise SystemExit("tokenizer has no language tokens")
-    cangjie_bytes = cangjie_path.read_bytes()
-    official_source_bytes = (ckpt_dir / "official_mtl_tokenizer.py").read_bytes()
-    official_tts_source_bytes = (ckpt_dir / "official_mtl_tts.py").read_bytes()
-    json.loads(tokenizer_json)
-    json.loads(cangjie_bytes.decode("utf-8"))
+    json.loads((ckpt_dir / "Cangjie5_TC.json").read_text(encoding="utf-8"))
     return {
-        "json": tokenizer_json,
-        "sha256": hashlib.sha256(tokenizer_bytes).hexdigest(),
-        "cangjie_sha256": hashlib.sha256(cangjie_bytes).hexdigest(),
-        "official_source_sha256": hashlib.sha256(official_source_bytes).hexdigest(),
-        "official_tts_source_sha256": hashlib.sha256(official_tts_source_bytes).hexdigest(),
         "language_tokens": language_tokens,
         "start": int(vocab["[START]"]),
         "stop": int(vocab["[STOP]"]),
@@ -167,12 +155,7 @@ def main():
     writer.add_uint32("chatterbox.rope_orig_ctx", ROPE_ORIG_CTX)
     writer.add_uint32("chatterbox.text_frontend_version", 4)
     writer.add_string("chatterbox.conversion.matrix_type", a.matrix_type)
-    writer.add_string("chatterbox.tokenizer.source_sha256", tokenizer["sha256"])
-    writer.add_string("chatterbox.tokenizer.cangjie_sha256", tokenizer["cangjie_sha256"])
-    writer.add_string("chatterbox.tokenizer.official_source_sha256", tokenizer["official_source_sha256"])
-    writer.add_string("chatterbox.tokenizer.official_tts_source_sha256", tokenizer["official_tts_source_sha256"])
     writer.add_string("chatterbox.tokenizer.language_tokens", ",".join(tokenizer["language_tokens"]))
-    writer.add_string("chatterbox.tokenizer.json", tokenizer["json"])
     for name, tensor in state.items():
         mapped = map_name(name)
         if mapped is None: continue

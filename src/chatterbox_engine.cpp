@@ -18,7 +18,6 @@
 #include "chatterbox_t3_internal.h"
 #include "s3gen_pipeline.h"
 #include "utterance_split.h"
-#include "sha256.h"
 #include "text_prepare.h"
 #include <limits>
 #include "ggml.h"
@@ -62,11 +61,6 @@ struct Engine::Impl {
             !std::filesystem::is_regular_file(std::filesystem::u8path(opts.cangjie_json)) ||
             !std::filesystem::is_regular_file(std::filesystem::u8path(opts.dicta_model)))
             throw std::runtime_error("official tokenizer asset missing");
-        if (sha256_text(model.tokenizer_json) != model.tokenizer_sha256) throw std::runtime_error("embedded tokenizer JSON does not match converted model");
-        if (sha256_file(opts.tokenizer_json) != model.tokenizer_sha256) throw std::runtime_error("tokenizer JSON does not match converted model");
-        if (sha256_file(opts.cangjie_json) != model.cangjie_sha256) throw std::runtime_error("Cangjie mapping does not match converted model");
-        if (sha256_file(opts.tokenizer_source) != model.official_tokenizer_sha256) throw std::runtime_error("official tokenizer source does not match converted model");
-        if (sha256_file(opts.tokenizer_tts_source) != model.official_tts_sha256) throw std::runtime_error("official TTS frontend source does not match converted model");
         tokenizer=std::make_unique<mtl_external_tokenizer>(mtl_external_tokenizer_options{opts.tokenizer_python,opts.tokenizer_script,opts.tokenizer_source,opts.tokenizer_tts_source,opts.tokenizer_json,opts.cangjie_json,opts.dicta_model},opts.language_id);
 #endif
         allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));

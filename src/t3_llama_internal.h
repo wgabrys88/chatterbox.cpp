@@ -32,11 +32,6 @@ constexpr const char * KEY_PERCEIVER_LEN     = "chatterbox.perceiver_len";
 constexpr const char * KEY_ROPE_THETA        = "chatterbox.rope_theta";
 constexpr const char * KEY_ROPE_ORIG_CTX     = "chatterbox.rope_orig_ctx";
 constexpr const char * KEY_TEXT_FRONTEND     = "chatterbox.text_frontend_version";
-constexpr const char * KEY_TOKENIZER_SHA      = "chatterbox.tokenizer.source_sha256";
-constexpr const char * KEY_TOKENIZER_JSON     = "chatterbox.tokenizer.json";
-constexpr const char * KEY_CANGJIE_SHA        = "chatterbox.tokenizer.cangjie_sha256";
-constexpr const char * KEY_OFFICIAL_TOKENIZER_SHA = "chatterbox.tokenizer.official_source_sha256";
-constexpr const char * KEY_OFFICIAL_TTS_SHA   = "chatterbox.tokenizer.official_tts_source_sha256";
 constexpr const char * KEY_LANGUAGE_TOKENS    = "chatterbox.tokenizer.language_tokens";
 struct chatterbox_hparams {
     int32_t n_text_vocab = 0, n_speech_vocab = 0;
@@ -78,7 +73,7 @@ struct chatterbox_model {
     ggml_backend_t backend = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr, buffer_kv = nullptr;
     std::map<std::string, ggml_tensor *> tensors;
-    std::string tokenizer_sha256, tokenizer_json, cangjie_sha256, official_tokenizer_sha256, official_tts_sha256, language_tokens;
+    std::string language_tokens;
 };
 ggml_backend_t init_backend();
 void load_model_gguf(const std::string & path, chatterbox_model & model);
